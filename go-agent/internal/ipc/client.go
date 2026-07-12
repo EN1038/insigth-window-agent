@@ -1,0 +1,167 @@
+package ipc
+
+import (
+	"bytes"
+	"context"
+	"encoding/json"
+	"fmt"
+	"io"
+	"net/http"
+	"time"
+)
+
+type Client struct {
+	base   string
+	client *http.Client
+}
+
+func NewClient(addr string) *Client {
+	if addr == "" {
+		addr = DefaultAddr
+	}
+	return &Client{
+		base: "http://" + addr,
+		client: &http.Client{
+			Timeout: 30 * time.Second,
+		},
+	}
+}
+
+func (c *Client) Health(ctx context.Context) error {
+	var out OKResponse
+	return c.get(ctx, "/v1/health", &out)
+}
+
+func (c *Client) Status(ctx context.Context) (StatusResponse, error) {
+	var out StatusResponse
+	err := c.get(ctx, "/v1/status", &out)
+	return out, err
+}
+
+func (c *Client) GetConfig(ctx context.Context) (ConfigView, error) {
+	var out ConfigView
+	err := c.get(ctx, "/v1/config", &out)
+	return out, err
+}
+
+func (c *Client) SaveConfig(ctx context.Context, req SaveConfigRequest) (OKResponse, error) {
+	var out OKResponse
+	err := c.post(ctx, "/v1/config", req, &out)
+	return out, err
+}
+
+func (c *Client) TestConnection(ctx context.Context) (bool, error) {
+	var out OKResponse
+	if err := c.post(ctx, "/v1/connection/test", map[string]any{}, &out); err != nil {
+		return false, err
+	}
+	return out.OK, nil
+}
+
+func (c *Client) Login(ctx context.Context, email, password string) (LoginResponse, error) {
+	var out LoginResponse
+	err := c.post(ctx, "/v1/login", LoginRequest{Email: email, Password: password}, &out)
+	return out, err
+}
+
+func (c *Client) Logout(ctx context.Context) error {
+	var out OKResponse
+	return c.post(ctx, "/v1/logout", map[string]any{}, &out)
+}
+
+func (c *Client) GetSettings(ctx context.Context) (SettingsView, error) {
+	var out SettingsView
+	err := c.get(ctx, "/v1/settings", &out)
+	return out, err
+}
+
+func (c *Client) UpdateSettings(ctx context.Context, req UpdateSettingsRequest) error {
+	var out OKResponse
+	return c.post(ctx, "/v1/settings", req, &out)
+}
+
+func (c *Client) StartScan(ctx context.Context, scanType, path string) (OKResponse, error) {
+	var out OKResponse
+	err := c.post(ctx, "/v1/scan/start", ScanStartRequest{Type: scanType, Path: path}, &out)
+	return out, err
+}
+
+func (c *Client) StopScan(ctx context.Context) error {
+	var out OKResponse
+	return c.post(ctx, "/v1/scan/stop", map[string]any{}, &out)
+}
+
+func (c *Client) ScanStatus(ctx context.Context) (ScanStatusResponse, error) {
+	var out ScanStatusResponse
+	err := c.get(ctx, "/v1/scan/status", &out)
+	return out, err
+}
+
+func (c *Client) SyncRules(ctx context.Context) error {
+	var out OKResponse
+	return c.post(ctx, "/v1/rules/sync", map[string]any{}, &out)
+}
+
+func (c *Client) InstallService(ctx context.Context) (OKResponse, error) {
+	var out OKResponse
+	err := c.post(ctx, "/v1/service/install", map[string]any{}, &out)
+	return out, err
+}
+
+func (c *Client) RulesInfo(ctx context.Context) (RulesInfoResponse, error) {
+	var out RulesInfoResponse
+	err := c.get(ctx, "/v1/rules/info", &out)
+	return out, err
+}
+
+func (c *Client) Quarantine(ctx context.Context) ([]QuarantineItem, error) {
+	var out []QuarantineItem
+	err := c.get(ctx, "/v1/quarantine", &out)
+	return out, err
+}
+
+func (c *Client) History(ctx context.Context, limit int) ([]HistoryEvent, error) {
+	var out []HistoryEvent
+	err := c.get(ctx, fmt.Sprintf("/v1/history?limit=%d", limit), &out)
+	return out, err
+}
+
+func (c *Client) get(ctx context.Context, path string, out any) error {
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, c.base+path, nil)
+	if err != nil {
+		return err
+	}
+	return c.do(req, out)
+}
+
+func (c *Client) post(ctx context.Context, path string, body any, out any) error {
+	b, err := json.Marshal(body)
+	if err != nil {
+		return err
+	}
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, c.base+path, bytes.NewReader(b))
+	if err != nil {
+		return err
+	}
+	req.Header.Set("Content-Type", "application/json")
+	return c.do(req, out)
+}
+
+func (c *Client) do(req *http.Request, out any) error {
+	resp, err := c.client.Do(req)
+	if err != nil {
+		return err
+	}
+	defer resp.Body.Close()
+	raw, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return err
+	}
+	if resp.StatusCode >= 400 {
+		return fmt.Errorf("ipc %s %s: %s", req.Method, req.URL.Path, string(raw))
+	}
+	if out != nil && len(raw) > 0 {
+		return json.Unmarshal(raw, out)
+	}
+	return nil
+}

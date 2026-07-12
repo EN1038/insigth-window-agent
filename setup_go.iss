@@ -1,0 +1,76 @@
+; =============================================================================
+; SOSECURE Threat inSight — Go Agent Inno Setup
+; Target  : Windows Server 2012 R2+ (no .NET 3.5 required)
+; Service : SOSECURE Threat inSight (single service)
+; =============================================================================
+
+[Setup]
+AppId={{A3C8F2E1-9B4D-4E7A-8C1F-2D5E6A9B0C3D}
+AppName=SOSECURE Threat inSight
+AppVersion=4.0.0.0
+AppVerName=SOSECURE Threat inSight 4.0 (Go)
+AppPublisher=SOSECURE
+AppPublisherURL=https://sosecure.co.th/
+DefaultDirName={autopf}\SOSECURE\Threat inSight
+DefaultGroupName=SOSECURE Threat inSight
+PrivilegesRequired=admin
+ArchitecturesInstallIn64BitMode=x64
+SetupIconFile=app.ico
+UninstallDisplayIcon={app}\app.ico
+WizardStyle=modern
+LicenseFile=LICENSE.txt
+OutputDir=Output
+OutputBaseFilename=SOSECURE_Threat_inSight_Go_Setup_v4.0.0
+Compression=lzma2/ultra64
+SolidCompression=yes
+MinVersion=6.3
+
+[Languages]
+Name: "english"; MessagesFile: "compiler:Default.isl"
+Name: "thai";    MessagesFile: "compiler:Languages\Thai.isl"
+
+[Tasks]
+Name: "desktopicon"; Description: "{cm:CreateDesktopIcon}"; GroupDescription: "{cm:AdditionalIcons}"; Flags: unchecked
+Name: "autostart"; Description: "Launch UI on Windows logon"; GroupDescription: "Options:"; Flags: unchecked
+
+[Files]
+Source: "dist\insite-agent.exe"; DestDir: "{app}"; Flags: ignoreversion
+Source: "Engine\Yara\yara64.exe"; DestDir: "{app}\Engine\Yara"; Flags: ignoreversion
+; Bundled rules are imported into encrypted store on first run (-mode upgrade), then wiped from disk.
+Source: "Engine\Yara\rules.yar"; DestDir: "{app}\Engine\Yara"; Flags: ignoreversion
+Source: "Engine\Yara\rules_unified.yar"; DestDir: "{app}\Engine\Yara"; Flags: ignoreversion
+Source: "app.ico"; DestDir: "{app}"; Flags: ignoreversion
+Source: "Config\Key\config.json"; DestDir: "{app}\Config\Key"; Flags: onlyifdoesntexist ignoreversion
+
+[Icons]
+Name: "{group}\SOSECURE Threat inSight"; Filename: "{app}\insite-agent.exe"; Parameters: "-mode ui"; IconFilename: "{app}\app.ico"
+Name: "{group}\{cm:UninstallProgram,SOSECURE Threat inSight}"; Filename: "{uninstallexe}"
+Name: "{commondesktop}\SOSECURE Threat inSight"; Filename: "{app}\insite-agent.exe"; Parameters: "-mode ui"; Tasks: desktopicon
+Name: "{userstartup}\SOSECURE Threat inSight"; Filename: "{app}\insite-agent.exe"; Parameters: "-mode ui"; Tasks: autostart
+
+[Run]
+Filename: "{app}\insite-agent.exe"; Parameters: "-mode upgrade"; StatusMsg: "Installing Windows Service..."; Flags: runhidden waituntilterminated
+Filename: "{app}\insite-agent.exe"; Parameters: "-mode ui"; Description: "Open SOSECURE Threat inSight"; Flags: nowait postinstall skipifsilent
+
+[UninstallRun]
+Filename: "{app}\insite-agent.exe"; Parameters: "-mode uninstall"; Flags: runhidden waituntilterminated
+Filename: "{sys}\taskkill.exe"; Parameters: "/F /IM insite-agent.exe"; Flags: runhidden
+Filename: "{sys}\taskkill.exe"; Parameters: "/F /IM insight.sosecure.legacy.exe"; Flags: runhidden
+Filename: "{sys}\taskkill.exe"; Parameters: "/F /IM sosecure-engine.exe"; Flags: runhidden
+
+[UninstallDelete]
+Type: filesandordirs; Name: "{app}\Logs"
+
+[Code]
+function InitializeSetup(): Boolean;
+begin
+  Result := True;
+end;
+
+procedure CurStepChanged(CurStep: TSetupStep);
+begin
+  if CurStep = ssInstall then
+  begin
+    { Legacy services stopped by insite-agent.exe -mode upgrade }
+  end;
+end;

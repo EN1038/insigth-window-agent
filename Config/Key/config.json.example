@@ -1,0 +1,8 @@
+{
+  "system_name": "SOSECURE Threat inSight",
+  "system_version": "1.0",
+  "system_client_site_ip": "https://your-server.example/",
+  "system_client_site_id": "00000000-0000-0000-0000-000000000000",
+  "system_client_site_key": "YOUR_SITE_KEY_HERE",
+  "system_client_site_name": "YOUR_SITE_NAME"
+}
