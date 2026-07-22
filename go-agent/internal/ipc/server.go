@@ -97,21 +97,13 @@ func (s *Server) handleConfig(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		cfg := &config.AgentConfig{
-			SiteIP: strings.TrimSpace(req.SiteIP),
-			SiteID: strings.TrimSpace(req.SiteID),
+			SiteIP:  strings.TrimSpace(req.SiteIP),
+			SiteID:  strings.TrimSpace(req.SiteID),
 			SiteKey: strings.TrimSpace(req.SiteKey),
 		}
-		// UI never receives the stored key; keep the existing one when the field is left blank.
-		if cfg.SiteKey == "" {
-			if cur := s.svc.GetConfig(); cur != nil {
-				cfg.SiteKey = cur.SiteKey
-				if cfg.SiteName == "" {
-					cfg.SiteName = cur.SiteName
-				}
-			}
-		}
+		// Require all three fields every time (no silent reuse of a stored site key).
 		if cfg.SiteIP == "" || cfg.SiteID == "" || cfg.SiteKey == "" {
-			writeJSON(w, OKResponse{OK: false, Message: "missing fields"})
+			writeJSON(w, OKResponse{OK: false, Message: "Please fill Server IP, Site Code, and Site Key"})
 			return
 		}
 		if err := s.svc.ReloadConfig(cfg); err != nil {

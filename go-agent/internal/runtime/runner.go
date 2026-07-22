@@ -40,6 +40,11 @@ type Runner struct {
 	postApprovalStarted bool
 	scanStarted         bool
 	Scan                *ScanRuntime
+
+	runCtx         context.Context
+	configReady    chan struct{}
+	approvalCancel context.CancelFunc
+	heartbeatCancel context.CancelFunc
 }
 
 func New(baseDir string, cfg *config.AgentConfig, st *settings.Store, snap *snapshot.Store, ruleStore *rules.Store, h *history.Store) *Runner {
@@ -48,13 +53,14 @@ func New(baseDir string, cfg *config.AgentConfig, st *settings.Store, snap *snap
 		cli = api.New(cfg)
 	}
 	return &Runner{
-		BaseDir:  baseDir,
-		Config:   cfg,
-		Settings: st,
-		Snapshot: snap,
-		Rules:    ruleStore,
-		API:      cli,
-		History:  h,
+		BaseDir:     baseDir,
+		Config:      cfg,
+		Settings:    st,
+		Snapshot:    snap,
+		Rules:       ruleStore,
+		API:         cli,
+		History:     h,
+		configReady: make(chan struct{}, 1),
 	}
 }
 
@@ -65,31 +71,105 @@ func (r *Runner) Run(ctx context.Context) error {
 	if r.History == nil {
 		return errors.New("missing history")
 	}
-	if r.API == nil {
-		_ = r.History.Append("runtime.warn", "API config missing; waiting for UI/installer", nil)
-		<-ctx.Done()
-		return ctx.Err()
-	}
+
+	r.mu.Lock()
+	r.runCtx = ctx
+	r.mu.Unlock()
 
 	_ = r.History.Append("runtime.start", "service runtime started", nil)
 
-	if !r.Settings.GetBool(keyDataInfoSent) {
-		if ok := r.tryDataInfo(); ok {
-			r.Settings.Set(keyDataInfoSent, "true")
-			_ = r.Settings.Save()
-		}
+	if err := r.waitUntilConfigured(ctx); err != nil {
+		_ = r.History.Append("runtime.stop", "service runtime stopping", nil)
+		return err
 	}
 
-	go r.approvalLoop(ctx)
-	go r.heartbeatLoop(ctx)
-
-	if r.Settings.GetBool(keyApproved) {
+	if r.standaloneMode() {
+		_ = r.History.Append("runtime.standalone", "local scan mode (no server API required)", nil)
+		r.Settings.Set(keyApproved, "true")
+		_ = r.Settings.Save()
 		r.startPostApproval(ctx)
+		<-ctx.Done()
+		_ = r.History.Append("runtime.stop", "service runtime stopping", nil)
+		return ctx.Err()
 	}
+
+	r.startOnlineRuntime(ctx)
 
 	<-ctx.Done()
 	_ = r.History.Append("runtime.stop", "service runtime stopping", nil)
 	return ctx.Err()
+}
+
+func (r *Runner) waitUntilConfigured(ctx context.Context) error {
+	for {
+		if r.standaloneMode() || r.API != nil {
+			return nil
+		}
+		_ = r.History.Append("runtime.warn", "API config missing; waiting for UI/installer", nil)
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-r.configReady:
+		}
+	}
+}
+
+func (r *Runner) startOnlineRuntime(ctx context.Context) {
+	if r.API == nil {
+		return
+	}
+	_ = r.History.Append("approve.progress", "starting device registration with server", map[string]any{
+		"site_ip": r.ConfigSiteIP(),
+	})
+	// Always collect + push dataInfo on every online start (IP/hardware can change).
+	_ = r.History.Append("approve.progress", "step 1/2: calling dataInfo (collect device info)", nil)
+	if ok := r.tryDataInfo(); ok {
+		r.Settings.Set(keyDataInfoSent, "true")
+		_ = r.Settings.Save()
+		_ = r.History.Append("approve.progress", "step 1/2 done: dataInfo sent", nil)
+	} else {
+		r.Settings.Set(keyDataInfoSent, "false")
+		_ = r.Settings.Save()
+		_ = r.History.Append("approve.wait", "step 1/2 failed: will retry dataInfo every 10s", map[string]any{
+			"ip_private": r.currentIP(),
+		})
+	}
+	r.restartApprovalLoop(ctx)
+	r.restartHeartbeatLoop(ctx)
+	if r.Settings.GetBool(keyApproved) {
+		r.startPostApproval(ctx)
+	}
+}
+
+func (r *Runner) ConfigSiteIP() string {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if r.Config == nil {
+		return ""
+	}
+	return r.Config.SiteIP
+}
+
+func (r *Runner) restartApprovalLoop(ctx context.Context) {
+	r.mu.Lock()
+	if r.approvalCancel != nil {
+		r.approvalCancel()
+	}
+	loopCtx, cancel := context.WithCancel(ctx)
+	r.approvalCancel = cancel
+	r.mu.Unlock()
+	go r.approvalLoop(loopCtx)
+}
+
+func (r *Runner) restartHeartbeatLoop(ctx context.Context) {
+	r.mu.Lock()
+	if r.heartbeatCancel != nil {
+		r.heartbeatCancel()
+	}
+	loopCtx, cancel := context.WithCancel(ctx)
+	r.heartbeatCancel = cancel
+	r.mu.Unlock()
+	go r.heartbeatLoop(loopCtx)
 }
 
 func (r *Runner) tryDataInfo() bool {
@@ -105,16 +185,22 @@ func (r *Runner) tryDataInfo() bool {
 		return false
 	}
 	_ = r.History.Append("api.ok", "dataInfo ok", map[string]any{
-		"ip_private": r.currentIP(),
-		"device":     r.currentDevice(),
+		"ip_private":  r.currentIP(),
+		"device":      r.currentDevice(),
+		"system_info": sysinfo.SystemInfo(),
+		"os":          sysinfo.OsDescription(),
 	})
 	return true
 }
 
 func (r *Runner) approvalLoop(ctx context.Context) {
 	if r.Settings.GetBool(keyApproved) {
+		r.startPostApproval(ctx)
 		return
 	}
+
+	_ = r.History.Append("approve.progress", "step 2/2: checking approval status every 10s", nil)
+	r.checkApprovalOnce()
 
 	t := time.NewTicker(10 * time.Second)
 	defer t.Stop()
@@ -124,53 +210,84 @@ func (r *Runner) approvalLoop(ctx context.Context) {
 		case <-ctx.Done():
 			return
 		case <-t.C:
-			r.Settings.Set(keyLastApproveChk, time.Now().Format(time.RFC3339))
-			_ = r.Settings.Save()
-
-			// Ensure device is registered before approval check.
-			if !r.Settings.GetBool(keyDataInfoSent) {
-				if r.tryDataInfo() {
-					r.Settings.Set(keyDataInfoSent, "true")
-					_ = r.Settings.Save()
-				} else {
-					_ = r.History.Append("approve.wait", "waiting for dataInfo registration", map[string]any{
-						"ip_private": r.currentIP(),
-					})
-					continue
-				}
-			}
-
-			resp, raw, err := r.API.CheckedAgentApproved()
-			if err != nil {
-				_ = r.History.Append("api.error", "checkedAgentApproved: "+err.Error(), nil)
-				continue
-			}
-			if resp.StatusCode != 200 {
-				_ = r.History.Append("api.warn", fmt.Sprintf("checkedAgentApproved status=%d body=%s", resp.StatusCode, compact(raw)), nil)
-				continue
-			}
-
-			r.mu.Lock()
-			r.lastApprovalRaw = append(json.RawMessage(nil), resp.Data...)
-			r.mu.Unlock()
-
-			approved, agentID := parseApprovedAgentID(resp.Data)
-			if approved {
-				r.Settings.Set(keyApproved, "true")
-				if agentID > 0 {
-					r.Settings.Set(keyAgentID, fmt.Sprintf("%d", agentID))
-				}
-				_ = r.Settings.Save()
-				_ = r.History.Append("approve.ok", fmt.Sprintf("approved (agent_id=%d)", agentID), nil)
-				r.startPostApproval(ctx)
+			if r.checkApprovalOnce() {
 				return
 			}
-
-			r.Settings.Set(keyApproved, "false")
-			_ = r.Settings.Save()
-			_ = r.History.Append("approve.wait", "waiting for admin approval", nil)
 		}
 	}
+}
+
+// checkApprovalOnce registers the device if needed and polls server approval.
+// Returns true when approved (loop should stop).
+func (r *Runner) checkApprovalOnce() bool {
+	if r.API == nil {
+		_ = r.History.Append("approve.wait", "no API client; open Server Setup and save again", nil)
+		return false
+	}
+
+	r.Settings.Set(keyLastApproveChk, time.Now().Format(time.RFC3339))
+	_ = r.Settings.Save()
+
+	if !r.Settings.GetBool(keyDataInfoSent) {
+		_ = r.History.Append("approve.progress", "retry step 1/2: calling dataInfo", nil)
+		if r.tryDataInfo() {
+			r.Settings.Set(keyDataInfoSent, "true")
+			_ = r.Settings.Save()
+			_ = r.History.Append("approve.progress", "step 1/2 done: device registered (dataInfo ok)", nil)
+		} else {
+			_ = r.History.Append("approve.wait", "still waiting: dataInfo not accepted yet (check SiteIP/SiteKey/network)", map[string]any{
+				"ip_private": r.currentIP(),
+			})
+			return false
+		}
+	}
+
+	_ = r.History.Append("approve.progress", "step 2/2: calling checkedAgentApproved", nil)
+	resp, raw, err := r.API.CheckedAgentApproved()
+	if err != nil {
+		_ = r.History.Append("api.error", "checkedAgentApproved: "+err.Error(), nil)
+		return false
+	}
+	if resp.StatusCode != 200 {
+		_ = r.History.Append("api.warn", fmt.Sprintf("checkedAgentApproved status=%d body=%s", resp.StatusCode, compact(raw)), nil)
+		return false
+	}
+
+	r.mu.Lock()
+	r.lastApprovalRaw = append(json.RawMessage(nil), resp.Data...)
+	r.mu.Unlock()
+
+	approved, agentID := parseApprovedAgentID(resp.Data)
+	if approved {
+		r.Settings.Set(keyApproved, "true")
+		if agentID > 0 {
+			r.Settings.Set(keyAgentID, fmt.Sprintf("%d", agentID))
+		}
+		_ = r.Settings.Save()
+		_ = r.History.Append("approve.ok", fmt.Sprintf("approved (agent_id=%d)", agentID), nil)
+		r.startPostApproval(r.runCtxOrBackground())
+		return true
+	}
+
+	r.Settings.Set(keyApproved, "false")
+	_ = r.Settings.Save()
+	msg := "not approved yet — ask admin to approve this device on the web portal (retry in 10s)"
+	if agentID > 0 {
+		msg = fmt.Sprintf("agent_id=%d registered but status is pending approval (retry in 10s)", agentID)
+	}
+	_ = r.History.Append("approve.wait", msg, map[string]any{
+		"agent_id": agentID,
+	})
+	return false
+}
+
+func (r *Runner) runCtxOrBackground() context.Context {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if r.runCtx != nil {
+		return r.runCtx
+	}
+	return context.Background()
 }
 
 func (r *Runner) startPostApproval(ctx context.Context) {
@@ -180,12 +297,23 @@ func (r *Runner) startPostApproval(ctx context.Context) {
 		return
 	}
 	r.postApprovalStarted = true
+	standalone := r.standaloneMode()
 	r.mu.Unlock()
 
-	go r.postApprovalLoop(ctx)
-	go r.configSyncLoop(ctx)
-	go r.rulesSyncLoop(ctx)
+	if !standalone {
+		go r.postApprovalLoop(ctx)
+		go r.configSyncLoop(ctx)
+		go r.rulesSyncLoop(ctx)
+		go r.ssdeepSyncLoop(ctx)
+	}
 	r.startScanSubsystem(ctx)
+}
+
+func (r *Runner) standaloneMode() bool {
+	if r.Settings != nil && r.Settings.GetBool(settings.KeyStandaloneScan) {
+		return true
+	}
+	return r.API == nil
 }
 
 func (r *Runner) startScanSubsystem(ctx context.Context) {
@@ -217,6 +345,9 @@ func (r *Runner) postApprovalLoop(ctx context.Context) {
 }
 
 func (r *Runner) runPostApproval() {
+	if r.API == nil {
+		return
+	}
 	if err := r.syncConfigFromServer(); err == nil {
 		r.Settings.Set(keyLastConfigSync, time.Now().Format(time.RFC3339))
 		_ = r.Settings.Save()
@@ -233,6 +364,11 @@ func (r *Runner) runPostApproval() {
 		if r.Scan != nil {
 			r.Scan.RefreshRules()
 		}
+	}
+
+	if n := r.syncSsdeepFromServer(); n > 0 {
+		r.Settings.Set(keyLastSsdeepSync, time.Now().Format(time.RFC3339))
+		_ = r.Settings.Save()
 	}
 }
 
@@ -282,19 +418,22 @@ func (r *Runner) heartbeatLoop(ctx context.Context) {
 	t := time.NewTicker(60 * time.Second)
 	defer t.Stop()
 
-	r.doHeartbeat(false)
+	r.doHeartbeat(true)
 
 	for {
 		select {
 		case <-ctx.Done():
 			return
 		case <-t.C:
-			r.doHeartbeat(false)
+			r.doHeartbeat(true)
 		}
 	}
 }
 
 func (r *Runner) doHeartbeat(isLogin bool) {
+	if r.API == nil {
+		return
+	}
 	resp, raw, err := r.API.AgentOnlineTimestamp(isLogin)
 	if err != nil {
 		_ = r.History.Append("api.error", "heartbeat: "+err.Error(), nil)
@@ -336,17 +475,32 @@ func parseApprovedAgentID(data json.RawMessage) (approved bool, agentID int64) {
 }
 
 func (r *Runner) ReloadConfig(cfg *config.AgentConfig) {
+	r.mu.Lock()
 	r.Config = cfg
 	if cfg != nil {
 		r.API = api.New(cfg)
 	} else {
 		r.API = nil
 	}
+	runCtx := r.runCtx
+	r.mu.Unlock()
+
 	if r.Settings != nil {
 		r.Settings.Set(keyDataInfoSent, "false")
 		r.Settings.Set(keyApproved, "false")
 		r.Settings.Set("agent_id", "")
 		_ = r.Settings.Save()
+	}
+
+	select {
+	case r.configReady <- struct{}{}:
+	default:
+	}
+
+	// If runtime is already alive, kick dataInfo + approval immediately after Save & Connect.
+	if runCtx != nil && cfg != nil && !r.standaloneMode() {
+		_ = r.History.Append("config.reload", "server settings saved; registering device", nil)
+		r.startOnlineRuntime(runCtx)
 	}
 }
 

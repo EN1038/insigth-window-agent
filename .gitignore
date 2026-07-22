@@ -4,6 +4,16 @@
 /Output/
 /go-agent/dist/
 
+# Large bundled ssdeep DB (keep locally or in installer)
+/go-agent/bundled/ssdeep/signatures.db
+/Engine/Ssdeep/signatures.db
+
+# Mesa software OpenGL (downloaded by scripts/fetch-mesa.ps1; large)
+/Engine/Mesa/_cache/
+/Engine/Mesa/*.dll
+!Engine/Mesa/README.txt
+
+
 # Legacy / bundled binaries (not part of Go agent)
 /Engine/sosecure-engine.exe
 /Engine/*.exe~
@@ -22,6 +32,7 @@
 *.test
 *.out
 /vendor/
+/go-agent/cmd/insite-agent/*.syso
 
 # OS / IDE
 .DS_Store

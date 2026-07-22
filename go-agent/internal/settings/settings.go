@@ -27,6 +27,18 @@ const (
 	KeyBatchJobEveryDay = "batchjob_everydate"
 	KeyLastBatchJobRun  = "last_batchjob_run"
 	KeyAPISecret        = "api_secret"
+	// Ssdeep secondary engine: runs only on files YARA did not flag.
+	KeySsdeepEnabled   = "ssdeep_enabled"
+	KeySsdeepThreshold = "ssdeep_threshold"
+	KeySsdeepBundledTotal = "ssdeep_bundled_total"
+	KeySsdeepReportAPI    = "ssdeep_report_api" // POST sendLogSsdeep (separate from legacy YARA APIs)
+	KeySsdeepDBVersion    = "ssdeep_db_version"
+	KeySendSsdeepCandidate = "send_ssdeep_candidate"
+	KeyQuarantineOnDetect = "quarantine_on_detect"
+	// AuthorizedServiceStop is set after successful credential confirm; allows real service stop without watchdog restart.
+	KeyAuthorizedServiceStop = "authorized_service_stop"
+	// StandaloneScan allows local YARA/ssdeep without server API (dev / air-gapped).
+	KeyStandaloneScan = "standalone_scan"
 )
 
 type Store struct {
@@ -67,6 +79,14 @@ func (s *Store) setDefaults() {
 	def(KeyRealtimeShield, "true")
 	def(KeyBatchJobEveryDay, "02:00")
 	def(KeyAPISecret, "")
+	def(KeySsdeepEnabled, "true")
+	def(KeySsdeepThreshold, "85")
+	def(KeySsdeepReportAPI, "true")
+	def(KeySsdeepDBVersion, "")
+	def(KeySendSsdeepCandidate, "false")
+	def(KeyQuarantineOnDetect, "true")
+	def(KeyAuthorizedServiceStop, "false")
+	def(KeyStandaloneScan, "false")
 }
 
 func (s *Store) Load() error {

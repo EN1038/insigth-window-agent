@@ -113,7 +113,8 @@ func (r *Router) buildSidebar(setPage func(fyne.CanvasObject)) fyne.CanvasObject
 
 func (r *Router) buildTopChrome() fyne.CanvasObject {
 	bg := canvas.NewRectangle(color.NRGBA{R: 0x00, G: 0x00, B: 0x00, A: 0xcc})
-	closeBtn := chromeCloseButton(func() { r.window.Close() })
+	// Hide (not Close): Close destroys the window; tray Open can no longer restore it.
+	closeBtn := chromeCloseButton(func() { r.window.Hide() })
 	drag := container.NewMax(newDragBar(func() uintptr { return r.windowHWND() }))
 	return draggableTopBar(bg, 36, hspace(1), closeBtn, drag)
 }
@@ -147,26 +148,35 @@ func (r *Router) buildStatsBar() (fyne.CanvasObject, func()) {
 		container.NewHBox(hspace(16), stats), nil, layout.NewSpacer())))
 
 	refresh := func() {
+		siteName := ""
 		if cfg, err := r.client.GetConfig(r.ctx); err == nil && strings.TrimSpace(cfg.SiteName) != "" {
-			siteVal.Text = strings.ToUpper(cfg.SiteName)
+			siteName = strings.ToUpper(cfg.SiteName)
 		}
-		ipVal.Text = sysinfo.LocalIPv4()
-		osVal.Text = shorten(sysinfo.OsDescription(), 26)
+		ip := sysinfo.LocalIPv4()
+		osDesc := shorten(sysinfo.OsDescription(), 26)
 		online, _ := r.client.TestConnection(r.ctx)
-		if online {
-			statusDotV.FillColor = colorStatusGrn
-			statusVal.Text = "ONLINE"
-		} else {
-			statusDotV.FillColor = colorError
-			statusVal.Text = "OFFLINE"
-		}
-		statusTime.Text = "(" + time.Now().Format("2006.01.02 / 15.04.05") + ")"
-		siteVal.Refresh()
-		ipVal.Refresh()
-		osVal.Refresh()
-		statusDotV.Refresh()
-		statusVal.Refresh()
-		statusTime.Refresh()
+		now := time.Now().Format("2006.01.02 / 15.04.05")
+		fyne.Do(func() {
+			if siteName != "" {
+				siteVal.Text = siteName
+			}
+			ipVal.Text = ip
+			osVal.Text = osDesc
+			if online {
+				statusDotV.FillColor = colorStatusGrn
+				statusVal.Text = "ONLINE"
+			} else {
+				statusDotV.FillColor = colorError
+				statusVal.Text = "OFFLINE"
+			}
+			statusTime.Text = "(" + now + ")"
+			siteVal.Refresh()
+			ipVal.Refresh()
+			osVal.Refresh()
+			statusDotV.Refresh()
+			statusVal.Refresh()
+			statusTime.Refresh()
+		})
 	}
 	return bar, refresh
 }
@@ -321,25 +331,27 @@ func (r *Router) showOverview(setPage func(fyne.CanvasObject)) {
 		if err != nil {
 			return
 		}
-		fileCount.Text = fmtCount(ss.Scanned)
-		detectCount.Text = fmtCount(ss.Threats)
-		frac := 0.0
-		if ss.Total > 0 {
-			frac = float64(ss.Scanned) / float64(ss.Total)
-		} else if !ss.Scanning {
-			frac = 0
-		}
-		ring.set(frac)
-		pct.Text = fmtCount(int(frac * 100))
-		fileCount.Refresh()
-		detectCount.Refresh()
-		pct.Refresh()
-		stopCtrl.setScanning(ss.Scanning)
-
-		if ev, e := r.client.History(r.ctx, 40); e == nil {
-			logEvents = filterScanEvents(ev, 40)
-			logList.Refresh()
-		}
+		ev, evErr := r.client.History(r.ctx, 40)
+		fyne.Do(func() {
+			fileCount.Text = fmtCount(ss.Scanned)
+			detectCount.Text = fmtCount(ss.Threats)
+			frac := 0.0
+			if ss.Total > 0 {
+				frac = float64(ss.Scanned) / float64(ss.Total)
+			} else if !ss.Scanning {
+				frac = 0
+			}
+			ring.set(frac)
+			pct.Text = fmtCount(int(frac * 100))
+			fileCount.Refresh()
+			detectCount.Refresh()
+			pct.Refresh()
+			stopCtrl.setScanning(ss.Scanning)
+			if evErr == nil {
+				logEvents = filterScanEvents(ev, 40)
+				logList.Refresh()
+			}
+		})
 	}
 	go func() {
 		refresh()

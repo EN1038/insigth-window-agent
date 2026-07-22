@@ -76,5 +76,46 @@ func RunUI() error {
 	if err != nil {
 		return err
 	}
+	_ = host
 	return ui.Run(ctx, client, host != nil)
+}
+
+// RunConfirmStopUI opens the credential gate used when stopping protection.
+func RunConfirmStopUI() error {
+	baseDir := config.DataBaseDir()
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	ch := make(chan os.Signal, 1)
+	signal.Notify(ch, os.Interrupt, syscall.SIGTERM)
+	go func() {
+		<-ch
+		cancel()
+	}()
+
+	_, client, err := ensureHost(ctx, baseDir)
+	if err != nil {
+		return err
+	}
+	return ui.RunConfirmStop(ctx, client, StopProtectionAuthorized)
+}
+
+// RunConfirmExitUI opens the credential gate used when exiting the tray UI.
+func RunConfirmExitUI() error {
+	baseDir := config.DataBaseDir()
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	ch := make(chan os.Signal, 1)
+	signal.Notify(ch, os.Interrupt, syscall.SIGTERM)
+	go func() {
+		<-ch
+		cancel()
+	}()
+
+	_, client, err := ensureHost(ctx, baseDir)
+	if err != nil {
+		return err
+	}
+	return ui.RunConfirmExit(ctx, client)
 }

@@ -15,7 +15,7 @@ import (
 	"golang.org/x/sys/windows/svc/mgr"
 )
 
-// Install registers and starts the Go agent Windows service.
+// Install registers and starts the main agent + watchdog services.
 func Install() error {
 	exe, err := os.Executable()
 	if err != nil {
@@ -40,35 +40,64 @@ func Install() error {
 	}
 	defer m.Disconnect()
 
-	if s, err := m.OpenService(ServiceName); err == nil {
-		s.Close()
-		_ = stopService(ServiceName)
-		_ = uninstallService(m, ServiceName)
+	if err := recreateService(m, exe, ServiceName, ServiceDisplayName, ServiceDescription, "-mode", "service"); err != nil {
+		return err
+	}
+	if err := recreateService(m, exe, WatchdogServiceName, WatchdogServiceDisplayName, WatchdogServiceDescription, "-mode", "watchdog"); err != nil {
+		return err
 	}
 
-	cfg := mgr.Config{
-		DisplayName:      ServiceDisplayName,
-		Description:      ServiceDescription,
-		StartType:        mgr.StartAutomatic,
-		ServiceStartName: "LocalSystem",
+	if err := startService(m, ServiceName); err != nil {
+		return fmt.Errorf("start main service: %w", err)
 	}
-	s, err := m.CreateService(ServiceName, exe, cfg, "-mode", "service")
-	if err != nil {
-		return fmt.Errorf("create service: %w", err)
-	}
-	defer s.Close()
-
-	_ = configureDelayedAuto(ServiceName)
-	_ = configureRecovery(ServiceName)
-
-	if err := s.Start(); err != nil {
-		return fmt.Errorf("start service: %w", err)
+	if err := startService(m, WatchdogServiceName); err != nil {
+		return fmt.Errorf("start watchdog service: %w", err)
 	}
 	return nil
 }
 
-// Uninstall stops and removes the Go agent service.
+func recreateService(m *mgr.Mgr, exe, name, display, desc string, args ...string) error {
+	if s, err := m.OpenService(name); err == nil {
+		s.Close()
+		_ = stopService(name)
+		_ = uninstallService(m, name)
+		time.Sleep(500 * time.Millisecond)
+	}
+	cfg := mgr.Config{
+		DisplayName:      display,
+		Description:      desc,
+		StartType:        mgr.StartAutomatic,
+		ServiceStartName: "LocalSystem",
+	}
+	s, err := m.CreateService(name, exe, cfg, args...)
+	if err != nil {
+		return fmt.Errorf("create %s: %w", name, err)
+	}
+	s.Close()
+	_ = configureDelayedAuto(name)
+	_ = configureRecovery(name)
+	return nil
+}
+
+func startService(m *mgr.Mgr, name string) error {
+	s, err := m.OpenService(name)
+	if err != nil {
+		return err
+	}
+	defer s.Close()
+	st, err := s.Query()
+	if err != nil {
+		return err
+	}
+	if st.State == svc.Running || st.State == svc.StartPending {
+		return nil
+	}
+	return s.Start()
+}
+
+// Uninstall stops and removes main + watchdog services.
 func Uninstall() error {
+	_ = stopService(WatchdogServiceName)
 	_ = stopService(ServiceName)
 
 	m, err := mgr.Connect()
@@ -77,14 +106,14 @@ func Uninstall() error {
 	}
 	defer m.Disconnect()
 
+	_ = uninstallService(m, WatchdogServiceName)
 	if err := uninstallService(m, ServiceName); err != nil {
 		return err
 	}
 	return nil
 }
 
-// UpgradeFromLegacy stops legacy services/processes and installs the Go service.
-// Data migration (config/settings) happens automatically on first service start.
+// UpgradeFromLegacy stops legacy services/processes and installs the Go services.
 func UpgradeFromLegacy() error {
 	exe, err := os.Executable()
 	if err != nil {

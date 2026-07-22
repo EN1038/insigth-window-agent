@@ -15,6 +15,7 @@ import (
 	"github.com/sosecure/insite-agent/internal/rules"
 	"github.com/sosecure/insite-agent/internal/settings"
 	"github.com/sosecure/insite-agent/internal/snapshot"
+	"github.com/sosecure/insite-agent/internal/ssdeepscan"
 	"github.com/sosecure/insite-agent/internal/sysinfo"
 )
 
@@ -28,13 +29,14 @@ type Manager struct {
 	Quarantine *quarantine.Store
 
 	scanner *Scanner
+	ssdeep  *ssdeepscan.Matcher
 
-	mu        sync.Mutex
-	running   atomic.Bool
-	stopCh    chan struct{}
-	scanAll   bool
-	ruleCache string
-	rulePaths []string
+	mu          sync.Mutex
+	running     atomic.Bool
+	stopCh      chan struct{}
+	scanAll     bool
+	ruleCache   string
+	rulePaths   []string
 	ruleTempDir string
 
 	statusMu sync.RWMutex
@@ -63,6 +65,7 @@ func (m *Manager) setStatus(fn func(*StatusInfo)) {
 
 func NewManager(baseDir string, st *settings.Store, snap *snapshot.Store, apiClient *api.Client, hist *history.Store, ruleStore *rules.Store, quar *quarantine.Store) *Manager {
 	yaraPath := ResolveYaraPath(baseDir, st.Get(settings.KeyYaraEnginePath, ""))
+	threshold := readSsdeepThreshold(st)
 	return &Manager{
 		BaseDir:    baseDir,
 		Settings:   st,
@@ -72,7 +75,19 @@ func NewManager(baseDir string, st *settings.Store, snap *snapshot.Store, apiCli
 		Rules:      ruleStore,
 		Quarantine: quar,
 		scanner:    NewScanner(yaraPath),
+		ssdeep:     ssdeepscan.NewMatcher(baseDir, threshold),
 	}
+}
+
+func readSsdeepThreshold(st *settings.Store) int {
+	threshold := 85
+	if st != nil {
+		fmt.Sscanf(strings.TrimSpace(st.Get(settings.KeySsdeepThreshold, "85")), "%d", &threshold)
+	}
+	if threshold <= 0 {
+		threshold = 85
+	}
+	return threshold
 }
 
 func (m *Manager) IsScanning() bool {
@@ -146,7 +161,7 @@ func (m *Manager) scanWork(scanType ScanType, customPath string, scanAll bool, s
 	m.mu.Unlock()
 	defer rules.WipeMaterializedDir(ruleTempDir)
 
-	m.sendScanLog(APIMode(scanType, result.ScanSource), fmt.Sprintf("Scan started: %s initialized", APIMode(scanType, result.ScanSource)), "start")
+	m.sendScanLog(APIMode(scanType, result.ScanSource), scanStartDescription(m), "start")
 
 	queue := NewQueue(queueCap)
 	var totalFound, scanned, skipped, threats atomic.Int64
@@ -251,19 +266,43 @@ func (m *Manager) scanWork(scanType ScanType, customPath string, scanAll bool, s
 		"scanned": result.FilesScanned,
 		"skipped": result.FilesSkipped,
 		"total":   result.TotalFound,
+		"yara":    countThreatsByEngine(result.Threats, "yara"),
+		"ssdeep":  countThreatsByEngine(result.Threats, "ssdeep"),
 	})
 
-	desc := fmt.Sprintf("Scan %s: %d files, %d threats found", result.Status, result.TotalFound, result.ThreatsFound)
+	yaraN := countThreatsByEngine(result.Threats, "yara")
+	ssdeepN := countThreatsByEngine(result.Threats, "ssdeep")
+	desc := fmt.Sprintf("Scan %s: %d files, %d threats (yara=%d ssdeep=%d)",
+		result.Status, result.TotalFound, result.ThreatsFound, yaraN, ssdeepN)
 	m.sendScanLog(APIMode(scanType, result.ScanSource), desc, "end")
+}
+
+func countThreatsByEngine(threats []Threat, engine string) int {
+	n := 0
+	for _, th := range threats {
+		e := th.Engine
+		if e == "" {
+			e = "yara"
+		}
+		if e == engine {
+			n++
+		}
+	}
+	return n
 }
 
 func (m *Manager) processBatch(batch []FileItem, rulePaths []string, result *Result, scanType ScanType, scanned, threats *atomic.Int64, stopped func() bool) {
 	if len(batch) == 0 || stopped() {
 		return
 	}
+	if m.ssdeep != nil {
+		m.ssdeep.SetThreshold(readSsdeepThreshold(m.Settings))
+	}
 	paths := make([]string, len(batch))
+	sizes := make(map[string]int64, len(batch))
 	for i, item := range batch {
 		paths[i] = item.Path
+		sizes[item.Path] = item.Size
 	}
 
 	matches, err := m.scanner.ScanBatch(rulePaths, paths)
@@ -274,7 +313,27 @@ func (m *Manager) processBatch(batch []FileItem, rulePaths []string, result *Res
 
 	matchMap := map[string][]string{}
 	for _, match := range matches {
-		matchMap[match.FilePath] = append(matchMap[match.FilePath], match.Rule)
+		key := strings.ToLower(match.FilePath)
+		matchMap[key] = append(matchMap[key], match.Rule)
+	}
+
+	// YARA-first: only miss files go to ssdeep (enabled by default).
+	var cleanPaths []string
+	for _, item := range batch {
+		if _, hit := matchMap[strings.ToLower(item.Path)]; !hit {
+			cleanPaths = append(cleanPaths, item.Path)
+		}
+	}
+	ssdeepHits := map[string]ssdeepscan.Match{}
+	if m.ssdeepEnabled() && len(cleanPaths) > 0 && m.ssdeep != nil {
+		hits, serr := m.ssdeep.ScanCleanFiles(cleanPaths, sizes, stopped)
+		if serr != nil {
+			_ = m.History.Append("scan.error", "ssdeep batch: "+serr.Error(), nil)
+		} else {
+			for _, h := range hits {
+				ssdeepHits[strings.ToLower(h.Path)] = h
+			}
+		}
 	}
 
 	var batchThreats []Threat
@@ -283,16 +342,31 @@ func (m *Manager) processBatch(batch []FileItem, rulePaths []string, result *Res
 		if stopped() {
 			return
 		}
-		rulesMatched, infected := matchMap[item.Path]
+		key := strings.ToLower(item.Path)
+		rulesMatched, infected := matchMap[key]
 		status := "clean"
 		if infected {
 			status = "infected"
 			threats.Add(1)
 			for _, rule := range rulesMatched {
-				th := Threat{Path: item.Path, Rule: rule, ScanType: scanType}
+				th := Threat{Path: item.Path, Rule: rule, ScanType: scanType, Engine: "yara"}
 				result.Threats = append(result.Threats, th)
 				batchThreats = append(batchThreats, th)
 			}
+		} else if hit, ok := ssdeepHits[key]; ok {
+			// Second pass only: YARA clean + ssdeep hit → still one file / one threat count.
+			status = "infected"
+			threats.Add(1)
+			th := Threat{
+				Path:     item.Path,
+				Rule:     ssdeepscan.RuleLabel(hit.Name, hit.Score),
+				ScanType: scanType,
+				Engine:   "ssdeep",
+				Score:    hit.Score,
+				Ssdeep:   hit.Ssdeep,
+			}
+			result.Threats = append(result.Threats, th)
+			batchThreats = append(batchThreats, th)
 		}
 
 		m.Snapshot.Upsert(item.Path, snapshot.FileRecord{
@@ -319,11 +393,39 @@ func (m *Manager) processBatch(batch []FileItem, rulePaths []string, result *Res
 				continue
 			}
 			seen[key] = true
-			if m.Quarantine != nil {
+			if m.shouldQuarantine() && m.Quarantine != nil {
 				_ = m.Quarantine.Isolate(th.Path, th.Rule)
 			}
 		}
 	}
+}
+
+func (m *Manager) ssdeepEnabled() bool {
+	v := strings.ToLower(strings.TrimSpace(m.Settings.Get(settings.KeySsdeepEnabled, "true")))
+	return v == "true" || v == "1" || v == "yes"
+}
+
+func (m *Manager) ssdeepReportAPIEnabled() bool {
+	v := strings.ToLower(strings.TrimSpace(m.Settings.Get(settings.KeySsdeepReportAPI, "true")))
+	return v == "true" || v == "1" || v == "yes"
+}
+
+func (m *Manager) shouldQuarantine() bool {
+	v := strings.ToLower(strings.TrimSpace(m.Settings.Get(settings.KeyQuarantineOnDetect, "true")))
+	return v == "true" || v == "1" || v == "yes"
+}
+
+func (m *Manager) shouldSendSsdeepCandidate() bool {
+	v := strings.ToLower(strings.TrimSpace(m.Settings.Get(settings.KeySendSsdeepCandidate, "false")))
+	return v == "true" || v == "1" || v == "yes"
+}
+
+func scanStartDescription(m *Manager) string {
+	engines := "yara"
+	if m.ssdeepEnabled() {
+		engines = "yara+ssdeep"
+	}
+	return fmt.Sprintf("Scan started; engines=%s", engines)
 }
 
 func (m *Manager) reportThreats(threats []Threat) {
@@ -334,8 +436,19 @@ func (m *Manager) reportThreats(threats []Threat) {
 	device := sysinfo.Hostname()
 	ts := time.Now().Format("2006-01-02 15:04:05")
 
+	fuzzyFor := func(th Threat) string {
+		if s := strings.TrimSpace(th.Ssdeep); s != "" {
+			return s
+		}
+		return ssdeepscan.FuzzyHashFile(th.Path)
+	}
+
+	// Legacy web: YARA detections only (unchanged payload).
 	yaraItems := make([]api.YaraLogItem, 0, len(threats))
 	for _, th := range threats {
+		if th.Engine == "ssdeep" {
+			continue
+		}
 		yaraItems = append(yaraItems, api.YaraLogItem{
 			AgentID:     agentID,
 			Path:        th.Path,
@@ -347,13 +460,20 @@ func (m *Manager) reportThreats(threats []Threat) {
 			LastScan:    ts,
 		})
 	}
-	if _, _, err := m.API.SendLogYara(yaraItems); err != nil {
-		_ = m.History.Append("api.error", "sendLogYara: "+err.Error(), nil)
+	if len(yaraItems) > 0 {
+		if _, _, err := m.API.SendLogYara(yaraItems); err != nil {
+			_ = m.History.Append("api.error", "sendLogYara: "+err.Error(), nil)
+		} else {
+			_ = m.History.Append("api.ok", fmt.Sprintf("sendLogYara (%d threats)", len(yaraItems)), nil)
+		}
 	}
 
 	seen := map[string]bool{}
 	hashItems := make([]api.HashItem, 0)
 	for _, th := range threats {
+		if th.Engine == "ssdeep" {
+			continue
+		}
 		if seen[strings.ToLower(th.Path)] {
 			continue
 		}
@@ -371,6 +491,91 @@ func (m *Manager) reportThreats(threats []Threat) {
 	if len(hashItems) > 0 {
 		if _, _, err := m.API.SendHash(hashItems); err != nil {
 			_ = m.History.Append("api.error", "sendHash: "+err.Error(), nil)
+		}
+	}
+
+	// New endpoint: fuzzy hash + engine metadata (YARA and ssdeep); web implements when ready.
+	if !m.ssdeepReportAPIEnabled() {
+		return
+	}
+	ssdeepItems := make([]api.SsdeepLogItem, 0, len(threats))
+	for _, th := range threats {
+		fuzzy := fuzzyFor(th)
+		if fuzzy == "" {
+			continue
+		}
+		engine := th.Engine
+		if engine == "" {
+			engine = "yara"
+		}
+		desc := "Malware detected: " + th.Rule
+		if engine == "ssdeep" {
+			desc = fmt.Sprintf("Ssdeep similarity match: %s (score=%d)", th.Rule, th.Score)
+		}
+		item := api.SsdeepLogItem{
+			AgentID:     agentID,
+			Path:        th.Path,
+			FileName:    filepath.Base(th.Path),
+			HashMD5:     FileMD5(th.Path),
+			Ssdeep:      fuzzy,
+			Engine:      engine,
+			Rule:        th.Rule,
+			Description: desc,
+			DeviceName:  device,
+			DetectedAt:  ts,
+		}
+		if engine == "ssdeep" {
+			item.Score = th.Score
+		}
+		ssdeepItems = append(ssdeepItems, item)
+	}
+	if len(ssdeepItems) > 0 {
+		if _, _, err := m.API.SendLogSsdeep(ssdeepItems); err != nil {
+			_ = m.History.Append("api.error", "sendLogSsdeep: "+err.Error(), nil)
+		} else {
+			_ = m.History.Append("api.ok", fmt.Sprintf("sendLogSsdeep (%d)", len(ssdeepItems)), nil)
+		}
+	}
+
+	if !m.shouldSendSsdeepCandidate() {
+		return
+	}
+	candidates := make([]api.SsdeepCandidateItem, 0, len(threats))
+	for _, th := range threats {
+		fuzzy := fuzzyFor(th)
+		if fuzzy == "" {
+			continue
+		}
+		engine := th.Engine
+		if engine == "" {
+			engine = "yara"
+		}
+		candidate := api.SsdeepCandidateItem{
+			AgentID:    agentID,
+			Path:       th.Path,
+			FileName:   filepath.Base(th.Path),
+			HashMD5:    FileMD5(th.Path),
+			HashSHA256: FileSHA256(th.Path),
+			Ssdeep:     fuzzy,
+			Engine:     engine,
+			Rule:       th.Rule,
+			DetectedAt: ts,
+			ScanMode:   APIMode(th.ScanType, ""),
+			Source:     "agent_detection",
+		}
+		if engine == "ssdeep" {
+			candidate.Score = th.Score
+			candidate.Source = "ssdeep_hit"
+		} else {
+			candidate.Source = "yara_hit"
+		}
+		candidates = append(candidates, candidate)
+	}
+	if len(candidates) > 0 {
+		if _, _, err := m.API.SendSsdeepCandidate(candidates); err != nil {
+			_ = m.History.Append("api.error", "sendSsdeepCandidate: "+err.Error(), nil)
+		} else {
+			_ = m.History.Append("api.ok", fmt.Sprintf("sendSsdeepCandidate (%d)", len(candidates)), nil)
 		}
 	}
 }
@@ -439,4 +644,12 @@ func (m *Manager) RefreshRules() {
 	if tmp != "" {
 		_ = rules.WipeMaterializedDir(tmp)
 	}
+}
+
+func (m *Manager) RefreshSsdeep() {
+	if m == nil || m.ssdeep == nil {
+		return
+	}
+	m.ssdeep.SetThreshold(readSsdeepThreshold(m.Settings))
+	m.ssdeep.Reload()
 }

@@ -30,23 +30,28 @@ Name: "english"; MessagesFile: "compiler:Default.isl"
 Name: "thai";    MessagesFile: "compiler:Languages\Thai.isl"
 
 [Tasks]
-Name: "desktopicon"; Description: "{cm:CreateDesktopIcon}"; GroupDescription: "{cm:AdditionalIcons}"; Flags: unchecked
+Name: "desktopicon"; Description: "{cm:CreateDesktopIcon}"; GroupDescription: "{cm:AdditionalIcons}"
 Name: "autostart"; Description: "Launch UI on Windows logon"; GroupDescription: "Options:"; Flags: unchecked
 
 [Files]
 Source: "dist\insite-agent.exe"; DestDir: "{app}"; Flags: ignoreversion
+; Mesa software OpenGL (llvmpipe) — enables Fyne UI on VMs without GPU OpenGL.
+Source: "Engine\Mesa\opengl32.dll"; DestDir: "{app}"; Flags: ignoreversion
+Source: "Engine\Mesa\libgallium_wgl.dll"; DestDir: "{app}"; Flags: ignoreversion
+Source: "Engine\Mesa\insite-agent.exe.local"; DestDir: "{app}"; Flags: ignoreversion skipifsourcedoesntexist
 Source: "Engine\Yara\yara64.exe"; DestDir: "{app}\Engine\Yara"; Flags: ignoreversion
 ; Bundled rules are imported into encrypted store on first run (-mode upgrade), then wiped from disk.
 Source: "Engine\Yara\rules.yar"; DestDir: "{app}\Engine\Yara"; Flags: ignoreversion
 Source: "Engine\Yara\rules_unified.yar"; DestDir: "{app}\Engine\Yara"; Flags: ignoreversion
 Source: "app.ico"; DestDir: "{app}"; Flags: ignoreversion
-Source: "Config\Key\config.json"; DestDir: "{app}\Config\Key"; Flags: onlyifdoesntexist ignoreversion
+Source: "Config\Key\config.json"; DestDir: "{app}\Config\Key"; Flags: onlyifdoesntexist ignoreversion skipifsourcedoesntexist
+Source: "Config\Key\config.json.example"; DestDir: "{app}\Config\Key"; Flags: onlyifdoesntexist ignoreversion skipifsourcedoesntexist
 
 [Icons]
 Name: "{group}\SOSECURE Threat inSight"; Filename: "{app}\insite-agent.exe"; Parameters: "-mode ui"; IconFilename: "{app}\app.ico"
-Name: "{group}\{cm:UninstallProgram,SOSECURE Threat inSight}"; Filename: "{uninstallexe}"
-Name: "{commondesktop}\SOSECURE Threat inSight"; Filename: "{app}\insite-agent.exe"; Parameters: "-mode ui"; Tasks: desktopicon
-Name: "{userstartup}\SOSECURE Threat inSight"; Filename: "{app}\insite-agent.exe"; Parameters: "-mode ui"; Tasks: autostart
+Name: "{group}\{cm:UninstallProgram,SOSECURE Threat inSight}"; Filename: "{uninstallexe}"; IconFilename: "{app}\app.ico"
+Name: "{commondesktop}\SOSECURE Threat inSight"; Filename: "{app}\insite-agent.exe"; Parameters: "-mode ui"; IconFilename: "{app}\app.ico"; Tasks: desktopicon
+Name: "{userstartup}\SOSECURE Threat inSight"; Filename: "{app}\insite-agent.exe"; Parameters: "-mode ui"; IconFilename: "{app}\app.ico"; Tasks: autostart
 
 [Run]
 Filename: "{app}\insite-agent.exe"; Parameters: "-mode upgrade"; StatusMsg: "Installing Windows Service..."; Flags: runhidden waituntilterminated

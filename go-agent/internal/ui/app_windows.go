@@ -28,6 +28,15 @@ const appTitle = "SOSECURE Threat inSight"
 // Run displays the UI. embedded is true when the UI had to start its own
 // in-process host because the background service was not running.
 func Run(ctx context.Context, client *ipc.Client, embedded bool) error {
+	release, ok := tryAcquireUISingleton()
+	if !ok {
+		// Another UI is already running — just ask it to show, do not add another tray icon.
+		_ = requestUIShow()
+		return nil
+	}
+	defer release()
+
+	prepareSoftwareGL()
 	a := app.NewWithID("com.sosecure.insite-agent")
 	a.Settings().SetTheme(insiteTheme{})
 	a.SetIcon(resIconMain)
@@ -45,13 +54,15 @@ func Run(ctx context.Context, client *ipc.Client, embedded bool) error {
 	if embedded {
 		go func() {
 			time.Sleep(700 * time.Millisecond)
-			dialog.ShowInformation(
-				"Background service not running",
-				"Running in standalone mode inside this window.\n"+
-					"Real-time protection runs only while this window stays open.\n\n"+
-					"Start the \""+appTitle+"\" Windows service for always-on protection.",
-				w,
-			)
+			fyne.Do(func() {
+				dialog.ShowInformation(
+					"Background service not running",
+					"Running in standalone mode inside this window.\n"+
+						"Real-time protection runs only while this window stays open.\n\n"+
+						"Start the \""+appTitle+"\" Windows service for always-on protection.",
+					w,
+				)
+			})
 		}()
 	}
 	w.ShowAndRun()
@@ -70,37 +81,61 @@ type Router struct {
 }
 
 func (r *Router) setupTrayAndCloseBehavior() {
-	// System tray menu keeps the app alive even if window is hidden.
+	// System tray: left-click shows window (Fyne 2.7+); right-click opens menu.
+	// Tray menu callbacks must NOT call Fyne window APIs directly (deadlocks).
 	if desk, ok := r.app.(desktop.App); ok {
-		desk.SetSystemTrayMenu(fyne.NewMenu("",
-			fyne.NewMenuItem("Open", func() {
-				r.window.Show()
-				r.window.RequestFocus()
-			}),
-			fyne.NewMenuItemSeparator(),
-			fyne.NewMenuItem("Exit", func() {
-				msg := "Close the UI?\n\nThe background service will keep protecting this device."
-				if r.embedded {
-					msg = "Close the UI?\n\nStandalone mode is running inside this window. Closing it will stop protection on this device."
-				}
-				dialog.ShowConfirm("Exit", msg, func(ok bool) {
-					if !ok {
-						return
-					}
-					// Disable intercept so Close actually exits.
-					r.window.SetCloseIntercept(nil)
-					r.window.Close()
-					r.app.Quit()
-				}, r.window)
-			}),
-		))
+		openItem := fyne.NewMenuItem("Open", func() {
+			_ = requestUIShow()
+			r.forceShowNative()
+		})
+		exitItem := fyne.NewMenuItem("Exit", func() {
+			_ = launchConfirmExit()
+		})
+		exitItem.IsQuit = true
+		desk.SetSystemTrayMenu(fyne.NewMenu("", openItem, fyne.NewMenuItemSeparator(), exitItem))
 		desk.SetSystemTrayIcon(resIconMain)
+		desk.SetSystemTrayWindow(r.window)
 	}
 
-	// Close button (✕) should minimize to tray instead of exiting.
+	// Close / ✕ hide to tray (do not destroy the window).
 	r.window.SetCloseIntercept(func() {
 		r.window.Hide()
 	})
+
+	go r.traySignalPump()
+}
+
+// traySignalPump handles Open/Exit requests from the tray without touching Fyne
+// APIs on the systray callback goroutine.
+func (r *Router) traySignalPump() {
+	t := time.NewTicker(200 * time.Millisecond)
+	defer t.Stop()
+	for {
+		select {
+		case <-r.ctx.Done():
+			return
+		case <-t.C:
+			if consumeUISignal(uiShowSignal) {
+				fyne.Do(func() {
+					r.window.Show()
+					r.window.RequestFocus()
+					if c := r.window.Content(); c != nil {
+						c.Show()
+					}
+				})
+				time.Sleep(80 * time.Millisecond)
+				r.forceShowNative()
+			}
+			if consumeUISignal(uiQuitSignal) {
+				fyne.Do(func() {
+					r.window.SetCloseIntercept(nil)
+					r.window.Close()
+					r.app.Quit()
+				})
+				return
+			}
+		}
+	}
 }
 
 // stopTicker halts any running page refresh loop.
@@ -137,7 +172,8 @@ func (r *Router) showFlow() {
 // authScreen composes the branded 800x480 layout: full-window backdrop, a dark
 // top bar (menu + close + drag), the form column on the left, and status bar.
 func (r *Router) authScreen(form fyne.CanvasObject, showConn bool) fyne.CanvasObject {
-	r.window.Resize(fyne.NewSize(800, 480))
+	// Do not call window.Resize here: tray handlers may already be on the UI
+	// thread via RunNative, and Resize re-enters runOnMain (deadlock).
 	r.window.SetPadded(false)
 
 	top := r.authTopBar()
@@ -180,7 +216,8 @@ func (r *Router) authTopBar() fyne.CanvasObject {
 	menuBtn := chromeMenuButton(func() { r.showAppMenu() })
 	left := container.NewHBox(hspace(4), menuBtn)
 
-	closeBtn := chromeCloseButton(func() { r.window.Close() })
+	// Hide (not Close): Close destroys the window and leaves a dead tray icon that Open cannot restore.
+	closeBtn := chromeCloseButton(func() { r.window.Hide() })
 	drag := container.NewMax(newDragBar(func() uintptr { return r.windowHWND() }))
 
 	return draggableTopBar(bg, 40, left, closeBtn, drag)
@@ -223,15 +260,17 @@ func (r *Router) pollConnection(dot *sizedCircle, lbl *canvas.Text) {
 	r.stopRefresh = stop
 	update := func() {
 		ok, _ := r.client.TestConnection(r.ctx)
-		if ok {
-			dot.FillColor = colorStatusGrn
-			lbl.Text = "Online"
-		} else {
-			dot.FillColor = colorError
-			lbl.Text = "Offline"
-		}
-		dot.Refresh()
-		lbl.Refresh()
+		fyne.Do(func() {
+			if ok {
+				dot.FillColor = colorStatusGrn
+				lbl.Text = "Online"
+			} else {
+				dot.FillColor = colorError
+				lbl.Text = "Offline"
+			}
+			dot.Refresh()
+			lbl.Refresh()
+		})
 	}
 	go func() {
 		update()
@@ -298,21 +337,25 @@ func (r *Router) showConfig() {
 	codeEntry := newPlainEntry()
 	codeEntry.SetPlaceHolder("Your site code")
 	keyEntry := newPlainPassword()
-	keyEntry.SetPlaceHolder("Site key (token) — re-enter to change")
+	keyEntry.SetPlaceHolder("Site key (token)")
 
-	if cfg, err := r.client.GetConfig(r.ctx); err == nil {
-		ipEntry.SetText(cfg.SiteIP)
-		codeEntry.SetText(cfg.SiteID)
-		// Site key is never loaded from disk into the UI.
-	}
-
-	status := canvasMuted("Enter your server details to continue", colorMuted)
+	// Always start blank — user must enter Server IP, Site Code, and Site Key step by step.
+	status := canvasMuted("Enter Server IP, Site Code, and Site Key to continue", colorMuted)
 
 	saveBtn := widget.NewButton("SAVE & CONNECT", func() {
+		siteIP := strings.TrimSpace(ipEntry.Text)
+		siteID := strings.TrimSpace(codeEntry.Text)
+		siteKey := strings.TrimSpace(keyEntry.Text)
+		if siteIP == "" || siteID == "" || siteKey == "" {
+			status.Text = "Please fill Server IP, Site Code, and Site Key"
+			status.Color = colorError
+			status.Refresh()
+			return
+		}
 		resp, err := r.client.SaveConfig(r.ctx, ipc.SaveConfigRequest{
-			SiteIP:  strings.TrimSpace(ipEntry.Text),
-			SiteID:  strings.TrimSpace(codeEntry.Text),
-			SiteKey: strings.TrimSpace(keyEntry.Text),
+			SiteIP:  siteIP,
+			SiteID:  siteID,
+			SiteKey: siteKey,
 		})
 		if err != nil || !resp.OK {
 			msg := "Save failed"
@@ -363,7 +406,7 @@ func (r *Router) showApproval() {
 	statusText := heading("Registering device info to server...", 16, colorText)
 	sub := canvasMuted("Waiting for administrator approval to activate this device.", colorMuted)
 
-	logPanel, refreshLogs := newApprovalLogPanel(r, 8)
+	logPanel, refreshLogs := newApprovalLogPanel(r, 12)
 
 	back := widget.NewButton("← Back to Server Setup", func() { r.showConfig() })
 	back.Importance = widget.LowImportance
@@ -382,14 +425,17 @@ func (r *Router) showApproval() {
 		container.NewHBox(back),
 	)
 	r.window.SetContent(r.authScreen(form, false))
-	refreshLogs()
+	events := refreshLogs()
 	updateApprovalStatus := func(events []ipc.HistoryEvent) {
 		headline, detail := approvalStatusFromEvents(events)
-		statusText.Text = headline
-		sub.Text = detail
-		statusText.Refresh()
-		sub.Refresh()
+		fyne.Do(func() {
+			statusText.Text = headline
+			sub.Text = detail
+			statusText.Refresh()
+			sub.Refresh()
+		})
 	}
+	updateApprovalStatus(events)
 
 	// Poll for approval.
 	stop := make(chan struct{})
@@ -400,13 +446,15 @@ func (r *Router) showApproval() {
 			return false
 		}
 		if !st.HasConfig {
-			r.showConfig()
+			fyne.Do(func() { r.showConfig() })
 			return true
 		}
 		if st.Approved {
-			statusText.Text = "Approved! Continuing…"
-			statusText.Refresh()
-			r.showLogin()
+			fyne.Do(func() {
+				statusText.Text = "Approved! Continuing…"
+				statusText.Refresh()
+				r.showLogin()
+			})
 			return true
 		}
 		return false
@@ -415,8 +463,8 @@ func (r *Router) showApproval() {
 		if check() {
 			return
 		}
-		logTick := time.NewTicker(4 * time.Second)
-		approveTick := time.NewTicker(10 * time.Second)
+		logTick := time.NewTicker(2 * time.Second)
+		approveTick := time.NewTicker(5 * time.Second)
 		defer logTick.Stop()
 		defer approveTick.Stop()
 		for {
@@ -583,6 +631,7 @@ func isConnectionLogKind(kind string) bool {
 	case strings.HasPrefix(kind, "approve"):
 	case strings.HasPrefix(kind, "api"):
 	case strings.HasPrefix(kind, "heartbeat"):
+	case strings.HasPrefix(kind, "config"):
 	case kind == "runtime.start", kind == "runtime.warn":
 	default:
 		return false
@@ -596,35 +645,69 @@ func formatApprovalLogLine(e ipc.HistoryEvent) string {
 		ts = ts[11:19]
 	}
 	msg := e.Message
-	if len(msg) > 96 {
-		msg = msg[:93] + "…"
+	if len(msg) > 110 {
+		msg = msg[:107] + "…"
 	}
-	return fmt.Sprintf("%s  %s", ts, msg)
+	return fmt.Sprintf("%s  [%s] %s", ts, e.Kind, msg)
 }
 
 func approvalStatusFromEvents(events []ipc.HistoryEvent) (headline, detail string) {
-	headline = "Registering device info to server..."
-	detail = "Waiting for administrator approval to activate this device."
+	headline = "Connecting to server…"
+	detail = "Watch CONNECTION LOG below for live steps (dataInfo → approval check)."
 	if len(events) == 0 {
 		return headline, detail
 	}
-	latest := events[0]
+
+	// Prefer the most meaningful recent status, not just the newest heartbeat.
+	var (
+		hasApproveOK   bool
+		hasApproveWait bool
+		hasAPIError    bool
+		hasProgress    bool
+		hasDataInfoOK  bool
+		latestMsg      = events[0].Message
+	)
+	for _, e := range events {
+		switch {
+		case e.Kind == "approve.ok":
+			hasApproveOK = true
+		case e.Kind == "approve.wait":
+			hasApproveWait = true
+			latestMsg = e.Message
+		case strings.HasPrefix(e.Kind, "api.error"), e.Kind == "api.warn":
+			hasAPIError = true
+			if !hasApproveWait {
+				latestMsg = e.Message
+			}
+		case e.Kind == "approve.progress":
+			hasProgress = true
+			if !hasApproveWait && !hasAPIError {
+				latestMsg = e.Message
+			}
+		case e.Kind == "api.ok" && strings.Contains(e.Message, "dataInfo"):
+			hasDataInfoOK = true
+		}
+	}
+
 	switch {
-	case latest.Kind == "approve.ok":
+	case hasApproveOK:
 		headline = "Device approved"
 		detail = "Continuing to login…"
-	case strings.Contains(latest.Message, "dataInfo registration"):
-		headline = "Registering device info to server..."
-		detail = "Sending machine details to the server. Check connection log below."
-	case latest.Kind == "approve.wait":
+	case hasAPIError:
+		headline = "Server connection / API problem"
+		detail = latestMsg
+	case hasApproveWait:
 		headline = "Waiting for administrator approval"
-		detail = "Device registered. An admin must approve this machine on the server."
-	case strings.HasPrefix(latest.Kind, "api.error"):
-		headline = "Connection problem"
-		detail = "Could not reach the server. Verify Server Settings or network, then watch the log below."
-	case latest.Kind == "heartbeat.ok", latest.Kind == "api.ok":
-		headline = "Connected to server"
-		detail = "Server is reachable. Waiting for registration or approval to complete."
+		detail = latestMsg
+	case hasDataInfoOK || (hasProgress && strings.Contains(strings.ToLower(latestMsg), "step 2")):
+		headline = "Checking approval status"
+		detail = latestMsg
+	case hasProgress:
+		headline = "Registering device with server"
+		detail = latestMsg
+	default:
+		headline = "Working…"
+		detail = latestMsg
 	}
 	return headline, detail
 }

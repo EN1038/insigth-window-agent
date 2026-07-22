@@ -16,6 +16,7 @@ import (
 	"github.com/sosecure/insite-agent/internal/runtime"
 	"github.com/sosecure/insite-agent/internal/settings"
 	"github.com/sosecure/insite-agent/internal/snapshot"
+	"github.com/sosecure/insite-agent/internal/ssdeepscan"
 )
 
 type Host struct {
@@ -65,6 +66,14 @@ func NewHost(baseDir string) (*Host, error) {
 				_ = hist.Append("rules.error", "legacy import: "+err.Error(), map[string]any{"src": legacy})
 			}
 		}
+	}
+
+	if n, err := ssdeepscan.SealBundledSignatures(baseDir, config.InstallDir()); err != nil {
+		_ = hist.Append("ssdeep.error", "bundled seal: "+err.Error(), nil)
+	} else if n > 0 {
+		st.Set(settings.KeySsdeepBundledTotal, fmt.Sprintf("%d", n))
+		_ = st.Save()
+		_ = hist.Append("ssdeep.bundled", fmt.Sprintf("sealed bundled ssdeep signatures (%d)", n), nil)
 	}
 
 	cfg, _ := config.Load(baseDir)

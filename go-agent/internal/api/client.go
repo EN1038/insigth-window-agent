@@ -89,7 +89,7 @@ func (c *Client) isOK(r *Response) bool {
 	return r != nil && r.StatusCode == 200
 }
 
-// DataInfo registers the machine (first run).
+// DataInfo registers/refreshes machine identity (hostname, OS, hardware, IP).
 func (c *Client) DataInfo() (*Response, []byte, error) {
 	payload := map[string]any{
 		"device_name":    sysinfo.Hostname(),
@@ -171,9 +171,9 @@ func (c *Client) UpdateRuleDownload(agentID int64, ruleID int64) (*Response, []b
 
 // AgentOnlineTimestamp sends heartbeat.
 func (c *Client) AgentOnlineTimestamp(isLogin bool) (*Response, []byte, error) {
-	_ = isLogin // legacy API only sends ip_private
 	payload := map[string]any{
 		"ip_private": sysinfo.LocalIPv4(),
+		"is_login":   isLogin,
 	}
 	return c.postJSON("agentOnlineTimestamp", payload)
 }
@@ -223,6 +223,89 @@ func (c *Client) SendHash(items []HashItem) (*Response, []byte, error) {
 		"data":       items,
 	}
 	return c.postJSON("sendHash", payload)
+}
+
+func (c *Client) GetSsdeep(currentVersion string) (*Response, []byte, error) {
+	payload := map[string]any{
+		"ip_private": sysinfo.LocalIPv4(),
+	}
+	if strings.TrimSpace(currentVersion) != "" {
+		payload["current_version"] = currentVersion
+	}
+	return c.postJSON("getSsdeep", payload)
+}
+
+func (c *Client) DownloadSsdeepSite(currentVersion string) (*Response, []byte, error) {
+	payload := map[string]any{
+		"ip_private": sysinfo.LocalIPv4(),
+	}
+	if strings.TrimSpace(currentVersion) != "" {
+		payload["current_version"] = currentVersion
+	}
+	return c.postJSON("downloadSsdeepSite", payload)
+}
+
+func (c *Client) DownloadSsdeepSiteComplete(id int64) (*Response, []byte, error) {
+	payload := map[string]any{
+		"id": id,
+	}
+	return c.postJSON("downloadSsdeepSiteComplete", payload)
+}
+
+func (c *Client) UpdateSsdeepDownload(agentID, ssdeepID int64, version string) (*Response, []byte, error) {
+	payload := map[string]any{
+		"agent_id":  agentID,
+		"ssdeep_id": ssdeepID,
+	}
+	if strings.TrimSpace(version) != "" {
+		payload["version"] = version
+	}
+	return c.postJSON("updateSsdeepDownload", payload)
+}
+
+// SsdeepLogItem is for sendLogSsdeep only — does not change legacy sendLogYara / sendHash.
+type SsdeepLogItem struct {
+	AgentID     int64  `json:"agent_id"`
+	Path        string `json:"path"`
+	FileName    string `json:"file_name"`
+	HashMD5     string `json:"hash_md5,omitempty"`
+	Ssdeep      string `json:"ssdeep"`
+	Engine      string `json:"engine"` // yara | ssdeep
+	Rule        string `json:"rule"`
+	Score       int    `json:"score,omitempty"`
+	Description string `json:"description"`
+	DeviceName  string `json:"device_name"`
+	DetectedAt  string `json:"detected_at"`
+}
+
+func (c *Client) SendLogSsdeep(items []SsdeepLogItem) (*Response, []byte, error) {
+	payload := map[string]any{
+		"ssdeep": items,
+	}
+	return c.postJSON("sendLogSsdeep", payload)
+}
+
+type SsdeepCandidateItem struct {
+	AgentID    int64  `json:"agent_id"`
+	Path       string `json:"path"`
+	FileName   string `json:"file_name"`
+	HashMD5    string `json:"hash_md5,omitempty"`
+	HashSHA256 string `json:"hash_sha256,omitempty"`
+	Ssdeep     string `json:"ssdeep"`
+	Engine     string `json:"engine"`
+	Rule       string `json:"rule"`
+	Score      int    `json:"score,omitempty"`
+	ScanMode   string `json:"scan_mode,omitempty"`
+	DetectedAt string `json:"detected_at"`
+	Source     string `json:"source,omitempty"`
+}
+
+func (c *Client) SendSsdeepCandidate(items []SsdeepCandidateItem) (*Response, []byte, error) {
+	payload := map[string]any{
+		"ip_private":  sysinfo.LocalIPv4(),
+		"candidates": items,
+	}
+	return c.postJSON("sendSsdeepCandidate", payload)
 }
 
 func boolToInt(v bool) int {

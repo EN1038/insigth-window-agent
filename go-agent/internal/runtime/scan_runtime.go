@@ -48,3 +48,9 @@ func (sr *ScanRuntime) RefreshRules() {
 		sr.Manager.RefreshRules()
 	}
 }
+
+func (sr *ScanRuntime) RefreshSsdeep() {
+	if sr != nil && sr.Manager != nil {
+		sr.Manager.RefreshSsdeep()
+	}
+}

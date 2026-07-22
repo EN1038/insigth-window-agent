@@ -13,7 +13,7 @@ import (
 )
 
 func main() {
-	mode := flag.String("mode", "auto", "auto|service|ui|setup|install|uninstall|upgrade|seal")
+	mode := flag.String("mode", "auto", "auto|service|watchdog|ui|confirm-stop|confirm-exit|setup|install|uninstall|upgrade|seal")
 	flag.Parse()
 
 	switch *mode {
@@ -22,15 +22,28 @@ func main() {
 			fmt.Fprintln(os.Stderr, err.Error())
 			os.Exit(1)
 		}
+	case "watchdog":
+		if err := service.RunWatchdog(); err != nil {
+			fmt.Fprintln(os.Stderr, err.Error())
+			os.Exit(1)
+		}
 	case "ui":
 		if err := service.RunUI(); err != nil {
 			fmt.Fprintln(os.Stderr, err.Error())
 			os.Exit(1)
 		}
+	case "confirm-stop":
+		if err := service.RunConfirmStopUI(); err != nil {
+			fmt.Fprintln(os.Stderr, err.Error())
+			os.Exit(1)
+		}
+	case "confirm-exit":
+		if err := service.RunConfirmExitUI(); err != nil {
+			fmt.Fprintln(os.Stderr, err.Error())
+			os.Exit(1)
+		}
 	case "setup":
-		// One-click installer: elevates, installs service to Program Files, launches UI.
 		if !install.IsAdmin() {
-			// Relaunch elevated and exit current process.
 			_ = install.RunElevated("-mode", "setup")
 			return
 		}
@@ -43,19 +56,21 @@ func main() {
 			fmt.Fprintln(os.Stderr, err.Error())
 			os.Exit(1)
 		}
-		fmt.Println("Service installed and started:", install.ServiceName)
+		fmt.Println("Services installed and started:")
+		fmt.Println(" -", install.ServiceName)
+		fmt.Println(" -", install.WatchdogServiceName)
 	case "uninstall":
 		if err := install.Uninstall(); err != nil {
 			fmt.Fprintln(os.Stderr, err.Error())
 			os.Exit(1)
 		}
-		fmt.Println("Service removed:", install.ServiceName)
+		fmt.Println("Services removed:", install.ServiceName, "+", install.WatchdogServiceName)
 	case "upgrade":
 		if err := install.UpgradeFromLegacy(); err != nil {
 			fmt.Fprintln(os.Stderr, err.Error())
 			os.Exit(1)
 		}
-		fmt.Println("Upgraded from legacy to:", install.ServiceName)
+		fmt.Println("Upgraded from legacy to:", install.ServiceName, "+", install.WatchdogServiceName)
 	case "seal":
 		exe, err := os.Executable()
 		if err != nil {

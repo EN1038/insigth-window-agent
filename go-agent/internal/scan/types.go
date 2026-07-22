@@ -40,6 +40,10 @@ type Threat struct {
 	Path     string
 	Rule     string
 	ScanType ScanType
+	Engine   string // "yara" | "ssdeep"
+	Score    int    // ssdeep similarity score when Engine == "ssdeep"
+	// Ssdeep fuzzy hash of the file (ssdeep hits; computed at report time for YARA).
+	Ssdeep string
 }
 
 type Result struct {

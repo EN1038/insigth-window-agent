@@ -3,10 +3,16 @@
 package sysinfo
 
 import (
+	"fmt"
 	"net"
 	"os"
 	"runtime"
 	"strings"
+	"sync"
+	"unsafe"
+
+	"golang.org/x/sys/windows"
+	"golang.org/x/sys/windows/registry"
 )
 
 // Hostname returns device_name.
@@ -105,8 +111,11 @@ func isPrivateIPv4(ip string) bool {
 	return false
 }
 
-// OsDescription is best-effort; WMI enrichment can be added later.
+// OsDescription returns a human-readable Windows version for dataInfo.
 func OsDescription() string {
+	if s := windowsProductLabel(); s != "" {
+		return s
+	}
 	return runtime.GOOS + " " + runtime.GOARCH
 }
 
@@ -119,8 +128,105 @@ func Domain() string {
 	return "-"
 }
 
-// SystemInfo is best-effort.
+var (
+	sysInfoOnce sync.Once
+	sysInfoCached string
+)
+
+// SystemInfo collects manufacturer/model/CPU/RAM/OS for dataInfo (cached per process).
 func SystemInfo() string {
-	return "-"
+	sysInfoOnce.Do(func() {
+		sysInfoCached = buildSystemInfo()
+	})
+	if sysInfoCached == "" {
+		return "-"
+	}
+	return sysInfoCached
 }
 
+func buildSystemInfo() string {
+	parts := make([]string, 0, 4)
+
+	mfr := regString(registry.LOCAL_MACHINE, `SYSTEM\CurrentControlSet\Control\SystemInformation`, "SystemManufacturer")
+	model := regString(registry.LOCAL_MACHINE, `SYSTEM\CurrentControlSet\Control\SystemInformation`, "SystemProductName")
+	hw := strings.TrimSpace(strings.Join([]string{mfr, model}, " "))
+	if hw != "" {
+		parts = append(parts, hw)
+	}
+
+	if cpu := strings.TrimSpace(regString(registry.LOCAL_MACHINE, `HARDWARE\DESCRIPTION\System\CentralProcessor\0`, "ProcessorNameString")); cpu != "" {
+		parts = append(parts, cpu)
+	}
+
+	if gb := totalRAMGiB(); gb > 0 {
+		parts = append(parts, fmt.Sprintf("%dGB RAM", gb))
+	}
+
+	if osLabel := windowsProductLabel(); osLabel != "" {
+		parts = append(parts, osLabel)
+	}
+
+	if len(parts) == 0 {
+		return "-"
+	}
+	return strings.Join(parts, " | ")
+}
+
+func windowsProductLabel() string {
+	product := regString(registry.LOCAL_MACHINE, `SOFTWARE\Microsoft\Windows NT\CurrentVersion`, "ProductName")
+	display := regString(registry.LOCAL_MACHINE, `SOFTWARE\Microsoft\Windows NT\CurrentVersion`, "DisplayVersion")
+	build := regString(registry.LOCAL_MACHINE, `SOFTWARE\Microsoft\Windows NT\CurrentVersion`, "CurrentBuild")
+	product = strings.TrimSpace(product)
+	display = strings.TrimSpace(display)
+	build = strings.TrimSpace(build)
+	switch {
+	case product != "" && display != "":
+		return product + " " + display
+	case product != "" && build != "":
+		return product + " (build " + build + ")"
+	case product != "":
+		return product
+	default:
+		return ""
+	}
+}
+
+func regString(root registry.Key, path, name string) string {
+	k, err := registry.OpenKey(root, path, registry.QUERY_VALUE)
+	if err != nil {
+		return ""
+	}
+	defer k.Close()
+	v, _, err := k.GetStringValue(name)
+	if err != nil {
+		return ""
+	}
+	return strings.TrimSpace(v)
+}
+
+type memoryStatusEx struct {
+	Length               uint32
+	MemoryLoad           uint32
+	TotalPhys            uint64
+	AvailPhys            uint64
+	TotalPageFile        uint64
+	AvailPageFile        uint64
+	TotalVirtual         uint64
+	AvailVirtual         uint64
+	AvailExtendedVirtual uint64
+}
+
+func totalRAMGiB() int {
+	var ms memoryStatusEx
+	ms.Length = uint32(unsafe.Sizeof(ms))
+	ret, _, _ := windows.NewLazySystemDLL("kernel32.dll").NewProc("GlobalMemoryStatusEx").Call(uintptr(unsafe.Pointer(&ms)))
+	if ret == 0 || ms.TotalPhys == 0 {
+		return 0
+	}
+	const gib = 1024 * 1024 * 1024
+	gb := int((ms.TotalPhys + gib/2) / gib)
+	if gb < 1 {
+		gb = 1
+	}
+	return gb
+}

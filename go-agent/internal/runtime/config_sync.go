@@ -15,8 +15,14 @@ type serverConfigPayload struct {
 	} `json:"agent"`
 	RealTimeProtection any `json:"real_time_protection"`
 	USBProtection      any `json:"usb_protection"`
-	BatchJobEveryDate    any `json:"batchjob_everydate"`
+	BatchJobEveryDate  any `json:"batchjob_everydate"`
 	ScanExtensions     any `json:"scan_extensions"`
+	SsdeepEnabled      any `json:"ssdeep_enabled"`
+	SsdeepThreshold    any `json:"ssdeep_threshold"`
+	SsdeepReportAPI    any `json:"ssdeep_report_api"`
+	SsdeepDBVersion    any `json:"ssdeep_db_version"`
+	QuarantineOnDetect any `json:"quarantine_on_detect"`
+	SendSsdeepCandidate any `json:"send_ssdeep_candidate"`
 }
 
 func applyGetConfig(st *settings.Store, data json.RawMessage) error {
@@ -44,6 +50,24 @@ func applyGetConfig(st *settings.Store, data json.RawMessage) error {
 	}
 	if ext := parseExtensions(cfg.ScanExtensions); ext != "" {
 		st.Set(settings.KeyScanExtensions, ext)
+	}
+	if v, ok := parseOnOff(cfg.SsdeepEnabled); ok {
+		st.Set(settings.KeySsdeepEnabled, boolStr(v))
+	}
+	if threshold := stringify(cfg.SsdeepThreshold); threshold != "" {
+		st.Set(settings.KeySsdeepThreshold, threshold)
+	}
+	if v, ok := parseOnOff(cfg.SsdeepReportAPI); ok {
+		st.Set(settings.KeySsdeepReportAPI, boolStr(v))
+	}
+	if version := stringify(cfg.SsdeepDBVersion); version != "" {
+		st.Set(settings.KeySsdeepDBVersion, version)
+	}
+	if v, ok := parseOnOff(cfg.QuarantineOnDetect); ok {
+		st.Set(settings.KeyQuarantineOnDetect, boolStr(v))
+	}
+	if v, ok := parseOnOff(cfg.SendSsdeepCandidate); ok {
+		st.Set(settings.KeySendSsdeepCandidate, boolStr(v))
 	}
 
 	return st.Save()
