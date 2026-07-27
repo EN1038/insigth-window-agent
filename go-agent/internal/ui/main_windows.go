@@ -441,7 +441,33 @@ func (r *Router) showSettings(setPage func(fyne.CanvasObject)) {
 
 	excl := widget.NewMultiLineEntry()
 	excl.SetText(st.ExclusionPaths)
-	excl.SetMinRowsVisible(4)
+	excl.SetMinRowsVisible(3)
+
+	scanExt := widget.NewMultiLineEntry()
+	scanExt.SetText(st.ScanExtensions)
+	scanExt.SetMinRowsVisible(3)
+
+	quick := widget.NewMultiLineEntry()
+	quick.SetText(st.QuickScanPaths)
+	quick.SetMinRowsVisible(2)
+
+	ssdeepOn := widget.NewCheck("", nil)
+	ssdeepOn.SetChecked(st.SsdeepEnabled)
+	ssdeepReport := widget.NewCheck("", nil)
+	ssdeepReport.SetChecked(st.SsdeepReportAPI)
+	quarantine := widget.NewCheck("", nil)
+	quarantine.SetChecked(st.QuarantineOnDetect)
+	sendCand := widget.NewCheck("", nil)
+	sendCand.SetChecked(st.SendSsdeepCandidate)
+
+	threshold := widget.NewEntry()
+	threshold.SetText(st.SsdeepThreshold)
+	threshold.SetPlaceHolder("85")
+
+	logLevel := widget.NewEntry()
+	logLevel.SetText(st.LogLevel)
+	cacheHours := widget.NewEntry()
+	cacheHours.SetText(st.CacheExpiryHours)
 
 	protection := card(container.NewVBox(
 		sectionHeaderImg(resIconRT, "Protection"),
@@ -454,13 +480,44 @@ func (r *Router) showSettings(setPage func(fyne.CanvasObject)) {
 	))
 
 	schedule := card(container.NewVBox(
-		sectionHeaderImg(resIconBatch, "Scheduled scan"),
+		sectionHeaderImg(resIconBatch, "Scheduled scan & scope"),
 		vspace(4),
 		fieldLabel("Daily batch scan time (HH:mm)"),
 		batch,
 		vspace(8),
 		fieldLabel("Excluded paths (one per line)"),
 		excl,
+		vspace(8),
+		fieldLabel("Scan extensions (comma-separated)"),
+		scanExt,
+		vspace(8),
+		fieldLabel("Quick scan paths (one per line)"),
+		quick,
+	))
+
+	ssdeepCard := card(container.NewVBox(
+		sectionHeaderImg(resIconYara, "Ssdeep"),
+		vspace(4),
+		toggleRowImg(resIconYara, "Ssdeep engine", "Fuzzy-hash secondary scanner", ssdeepOn),
+		divider(),
+		fieldLabel("Match threshold (0–100)"),
+		threshold,
+		vspace(6),
+		toggleRowImg(resIconConn, "Report detections to API", "POST sendLogSsdeep", ssdeepReport),
+		divider(),
+		toggleRowImg(resIconConn, "Quarantine on detect", "Isolate matched files", quarantine),
+		divider(),
+		toggleRowImg(resIconConn, "Send ssdeep candidate", "Queue unknown samples", sendCand),
+	))
+
+	advanced := card(container.NewVBox(
+		sectionHeaderImg(resIconSet, "Advanced"),
+		vspace(4),
+		fieldLabel("Log level"),
+		logLevel,
+		vspace(6),
+		fieldLabel("Cache expiry (hours)"),
+		cacheHours,
 	))
 
 	rulesVer := muted("Version " + orDash(st.RulesVersion))
@@ -479,11 +536,20 @@ func (r *Router) showSettings(setPage func(fyne.CanvasObject)) {
 
 	save := widget.NewButtonWithIcon("Save settings", theme.DocumentSaveIcon(), func() {
 		if err := r.client.UpdateSettings(r.ctx, ipc.UpdateSettingsRequest{
-			RealtimeShield:   boolPtr(rt.Checked),
-			USBProtection:    boolPtr(usb.Checked),
-			AutoScanOnLogin:  boolPtr(auto.Checked),
-			BatchJobEveryDay: batch.Text,
-			ExclusionPaths:   excl.Text,
+			RealtimeShield:      boolPtr(rt.Checked),
+			USBProtection:       boolPtr(usb.Checked),
+			AutoScanOnLogin:     boolPtr(auto.Checked),
+			BatchJobEveryDay:    batch.Text,
+			ExclusionPaths:      excl.Text,
+			ScanExtensions:      scanExt.Text,
+			QuickScanPaths:      quick.Text,
+			SsdeepEnabled:       boolPtr(ssdeepOn.Checked),
+			SsdeepThreshold:     threshold.Text,
+			SsdeepReportAPI:     boolPtr(ssdeepReport.Checked),
+			QuarantineOnDetect:  boolPtr(quarantine.Checked),
+			SendSsdeepCandidate: boolPtr(sendCand.Checked),
+			LogLevel:            logLevel.Text,
+			CacheExpiryHours:    cacheHours.Text,
 		}); err != nil {
 			dialog.ShowError(err, r.window)
 			return
@@ -506,6 +572,8 @@ func (r *Router) showSettings(setPage func(fyne.CanvasObject)) {
 	body := container.NewVBox(
 		protection, vspace(6),
 		schedule, vspace(6),
+		ssdeepCard, vspace(6),
+		advanced, vspace(6),
 		rulesCard, vspace(6),
 		container.NewGridWithColumns(2, logout, save),
 	)

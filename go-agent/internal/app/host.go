@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"strings"
 	"sync"
 
 	"github.com/sosecure/insite-agent/internal/api"
@@ -171,7 +172,7 @@ func (h *Host) PushSettingsToServer() {
 	h.mu.RLock()
 	apiClient := h.API
 	h.mu.RUnlock()
-	if apiClient == nil {
+	if apiClient == nil || h.Settings == nil {
 		return
 	}
 	usb := 0
@@ -183,5 +184,43 @@ func (h *Host) PushSettingsToServer() {
 		rtp = 1
 	}
 	batch := h.Settings.Get(settings.KeyBatchJobEveryDay, "02:00")
-	_, _, _ = apiClient.UpdateConfig(batch, rtp, usb)
+
+	flagInt := func(key string) int {
+		if h.Settings.GetBool(key) {
+			return 1
+		}
+		return 0
+	}
+	threshold := 85
+	fmt.Sscanf(strings.TrimSpace(h.Settings.Get(settings.KeySsdeepThreshold, "85")), "%d", &threshold)
+	cacheHours := 168
+	fmt.Sscanf(strings.TrimSpace(h.Settings.Get(settings.KeyCacheExpiryHours, "168")), "%d", &cacheHours)
+
+	extra := map[string]any{
+		"ssdeep_enabled":        flagInt(settings.KeySsdeepEnabled),
+		"ssdeep_threshold":      threshold,
+		"ssdeep_report_api":     flagInt(settings.KeySsdeepReportAPI),
+		"quarantine_on_detect":  flagInt(settings.KeyQuarantineOnDetect),
+		"send_ssdeep_candidate": flagInt(settings.KeySendSsdeepCandidate),
+		"auto_scan_on_login":    flagInt(settings.KeyAutoScanOnLogin),
+		"exclusion_paths":       h.Settings.Get(settings.KeyExclusionPaths, ""),
+		"scan_extensions":       h.Settings.Get(settings.KeyScanExtensions, ""),
+		"quick_scan_paths":      h.Settings.Get(settings.KeyQuickScanPaths, ""),
+		"log_level":             h.Settings.Get(settings.KeyLogLevel, "info"),
+		"cache_expiry_hours":    cacheHours,
+		"config_updated_at":     configUpdatedAtUnix(h.Settings),
+	}
+	_, _, _ = apiClient.UpdateConfig(batch, rtp, usb, extra)
+}
+
+func configUpdatedAtUnix(st *settings.Store) int64 {
+	if st == nil {
+		return 0
+	}
+	var n int64
+	fmt.Sscanf(strings.TrimSpace(st.Get(settings.KeyConfigUpdatedAt, "0")), "%d", &n)
+	if n > 0 {
+		return n
+	}
+	return 0
 }

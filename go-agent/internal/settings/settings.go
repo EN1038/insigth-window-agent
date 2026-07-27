@@ -39,7 +39,24 @@ const (
 	KeyAuthorizedServiceStop = "authorized_service_stop"
 	// StandaloneScan allows local YARA/ssdeep without server API (dev / air-gapped).
 	KeyStandaloneScan = "standalone_scan"
+	// ConfigUpdatedAt is unix seconds (UTC) for last-write-wins vs Center Control Agent.
+	KeyConfigUpdatedAt = "config_updated_at"
 )
+
+// DefaultScanExtensions is the baseline on-demand / realtime file filter.
+// Includes common executable/script types plus rename-evasion suffixes used by
+// webshells (e.g. c99.php saved as .txt) and alternate PHP / Windows script forms.
+const DefaultScanExtensions = "" +
+	".exe,.dll,.sys,.scr,.com,.pif,.msi,.cpl," +
+	".bat,.cmd,.ps1,.psm1,.vbs,.vbe,.js,.jse,.wsf,.wsh,.hta," +
+	".lnk,.url,.scf,.reg,.chm," +
+	".php,.phtml,.php3,.php4,.php5,.php7,.phps,.phar," +
+	".asp,.aspx,.ashx,.asmx,.jsp,.jspx," +
+	".html,.htm,.shtml,.cfm,.cgi,.pl,.py,.rb,.sh," +
+	".inc,.tpl," +
+	".docm,.xlsm,.pptm,.jar," +
+	".txt,.log,.bak,.old,.dat," +
+	".img,.iso"
 
 type Store struct {
 	baseDir string
@@ -70,7 +87,7 @@ func (s *Store) setDefaults() {
 	def(KeyRulesVersion, "1.1")
 	def(KeyQuarantinePath, filepath.Join(s.baseDir, "Quarantine"))
 	def(KeyLogLevel, "info")
-	def(KeyScanExtensions, ".exe,.dll,.sys,.bat,.ps1,.cmd,.vbs,.js,.wsf,.scr,.com,.pif,.php,.asp,.aspx,.jsp,.html,.htm,.inc,.tpl")
+	def(KeyScanExtensions, DefaultScanExtensions)
 	def(KeyExclusionPaths, `\windows;\$recycle.bin;\system volume information;\program files;\program files (x86);\programdata`)
 	def(KeyCacheExpiryHours, "168")
 	def(KeyQuickScanPaths, `%USERPROFILE%\Downloads;%USERPROFILE%\Desktop;%TEMP%;%APPDATA%`)
@@ -87,6 +104,7 @@ func (s *Store) setDefaults() {
 	def(KeyQuarantineOnDetect, "true")
 	def(KeyAuthorizedServiceStop, "false")
 	def(KeyStandaloneScan, "false")
+	def(KeyConfigUpdatedAt, "0")
 }
 
 func (s *Store) Load() error {
@@ -104,6 +122,7 @@ func (s *Store) Load() error {
 		// If missing, attempt migrate legacy settings.cfg (encrypted/plain), then save.
 		if os.IsNotExist(err) {
 			_ = s.migrateLegacySettingsCfg(filepath.Join(s.paths.DataDir, "settings.cfg"))
+			_ = s.MergeDefaultScanExtensions()
 			_ = s.Save()
 			return nil
 		}
@@ -114,6 +133,9 @@ func (s *Store) Load() error {
 	}
 	s.Values = p.Values
 	s.setDefaults()
+	if s.MergeDefaultScanExtensions() {
+		_ = s.Save()
+	}
 	return nil
 }
 
@@ -183,6 +205,36 @@ func (s *Store) ScanExtensions() []string {
 		out = append(out, strings.ToLower(p))
 	}
 	return out
+}
+
+// MergeDefaultScanExtensions appends any missing DefaultScanExtensions entries
+// so upgrades pick up new risky suffixes (e.g. .txt) without wiping custom lists.
+// Returns true if the stored value changed.
+func (s *Store) MergeDefaultScanExtensions() bool {
+	have := map[string]bool{}
+	var ordered []string
+	for _, e := range s.ScanExtensions() {
+		if e == "" || have[e] {
+			continue
+		}
+		have[e] = true
+		ordered = append(ordered, e)
+	}
+	changed := false
+	for _, e := range strings.Split(DefaultScanExtensions, ",") {
+		e = strings.TrimSpace(strings.ToLower(e))
+		if e == "" || have[e] {
+			continue
+		}
+		have[e] = true
+		ordered = append(ordered, e)
+		changed = true
+	}
+	if !changed {
+		return false
+	}
+	s.Values[KeyScanExtensions] = strings.Join(ordered, ",")
+	return true
 }
 
 func (s *Store) QuickScanPaths() []string {

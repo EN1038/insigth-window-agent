@@ -51,20 +51,38 @@ type ScanStatusResponse struct {
 }
 
 type SettingsView struct {
-	RealtimeShield   bool   `json:"realtime_shield"`
-	USBProtection    bool   `json:"usb_protection"`
-	AutoScanOnLogin  bool   `json:"auto_scan_on_login"`
-	BatchJobEveryDay string `json:"batchjob_everydate"`
-	ExclusionPaths   string `json:"exclusion_paths"`
-	RulesVersion     string `json:"rules_version"`
+	RealtimeShield      bool   `json:"realtime_shield"`
+	USBProtection       bool   `json:"usb_protection"`
+	AutoScanOnLogin     bool   `json:"auto_scan_on_login"`
+	BatchJobEveryDay    string `json:"batchjob_everydate"`
+	ExclusionPaths      string `json:"exclusion_paths"`
+	ScanExtensions      string `json:"scan_extensions"`
+	QuickScanPaths      string `json:"quick_scan_paths"`
+	SsdeepEnabled       bool   `json:"ssdeep_enabled"`
+	SsdeepThreshold     string `json:"ssdeep_threshold"`
+	SsdeepReportAPI     bool   `json:"ssdeep_report_api"`
+	QuarantineOnDetect  bool   `json:"quarantine_on_detect"`
+	SendSsdeepCandidate bool   `json:"send_ssdeep_candidate"`
+	LogLevel            string `json:"log_level"`
+	CacheExpiryHours    string `json:"cache_expiry_hours"`
+	RulesVersion        string `json:"rules_version"`
 }
 
 type UpdateSettingsRequest struct {
-	RealtimeShield   *bool  `json:"realtime_shield,omitempty"`
-	USBProtection    *bool  `json:"usb_protection,omitempty"`
-	AutoScanOnLogin  *bool  `json:"auto_scan_on_login,omitempty"`
-	BatchJobEveryDay string `json:"batchjob_everydate,omitempty"`
-	ExclusionPaths   string `json:"exclusion_paths,omitempty"`
+	RealtimeShield      *bool  `json:"realtime_shield,omitempty"`
+	USBProtection       *bool  `json:"usb_protection,omitempty"`
+	AutoScanOnLogin     *bool  `json:"auto_scan_on_login,omitempty"`
+	BatchJobEveryDay    string `json:"batchjob_everydate,omitempty"`
+	ExclusionPaths      string `json:"exclusion_paths,omitempty"`
+	ScanExtensions      string `json:"scan_extensions,omitempty"`
+	QuickScanPaths      string `json:"quick_scan_paths,omitempty"`
+	SsdeepEnabled       *bool  `json:"ssdeep_enabled,omitempty"`
+	SsdeepThreshold     string `json:"ssdeep_threshold,omitempty"`
+	SsdeepReportAPI     *bool  `json:"ssdeep_report_api,omitempty"`
+	QuarantineOnDetect  *bool  `json:"quarantine_on_detect,omitempty"`
+	SendSsdeepCandidate *bool  `json:"send_ssdeep_candidate,omitempty"`
+	LogLevel            string `json:"log_level,omitempty"`
+	CacheExpiryHours    string `json:"cache_expiry_hours,omitempty"`
 }
 
 type HistoryEvent struct {

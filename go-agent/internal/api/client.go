@@ -128,12 +128,18 @@ func (c *Client) GetConfig() (*Response, []byte, error) {
 }
 
 // UpdateConfig updates config settings back to server.
-func (c *Client) UpdateConfig(batchHHmm string, realtime int, usb int) (*Response, []byte, error) {
+func (c *Client) UpdateConfig(batchHHmm string, realtime int, usb int, extra map[string]any) (*Response, []byte, error) {
 	payload := map[string]any{
 		"ip_private":           sysinfo.LocalIPv4(),
 		"batchjob_everydate":   batchHHmm,
 		"real_time_protection": realtime,
 		"usb_protection":       usb,
+	}
+	for k, v := range extra {
+		if k == "" || v == nil {
+			continue
+		}
+		payload[k] = v
 	}
 	return c.postJSON("updateConfig", payload)
 }

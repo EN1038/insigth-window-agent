@@ -319,12 +319,21 @@ func (s *Server) handleServiceInstall(w http.ResponseWriter, r *http.Request) {
 
 func settingsView(st *settings.Store) SettingsView {
 	return SettingsView{
-		RealtimeShield:   st.GetBool(settings.KeyRealtimeShield),
-		USBProtection:    st.GetBool(settings.KeyUSBProtection),
-		AutoScanOnLogin:  st.GetBool(settings.KeyAutoScanOnLogin),
-		BatchJobEveryDay: st.Get(settings.KeyBatchJobEveryDay, "02:00"),
-		ExclusionPaths:   strings.ReplaceAll(st.Get(settings.KeyExclusionPaths, ""), ";", "\n"),
-		RulesVersion:     st.Get(settings.KeyRulesVersion, ""),
+		RealtimeShield:      st.GetBool(settings.KeyRealtimeShield),
+		USBProtection:       st.GetBool(settings.KeyUSBProtection),
+		AutoScanOnLogin:     st.GetBool(settings.KeyAutoScanOnLogin),
+		BatchJobEveryDay:    st.Get(settings.KeyBatchJobEveryDay, "02:00"),
+		ExclusionPaths:      strings.ReplaceAll(st.Get(settings.KeyExclusionPaths, ""), ";", "\n"),
+		ScanExtensions:      st.Get(settings.KeyScanExtensions, ""),
+		QuickScanPaths:      strings.ReplaceAll(st.Get(settings.KeyQuickScanPaths, ""), ";", "\n"),
+		SsdeepEnabled:       st.GetBool(settings.KeySsdeepEnabled),
+		SsdeepThreshold:     st.Get(settings.KeySsdeepThreshold, "85"),
+		SsdeepReportAPI:     st.GetBool(settings.KeySsdeepReportAPI),
+		QuarantineOnDetect:  st.GetBool(settings.KeyQuarantineOnDetect),
+		SendSsdeepCandidate: st.GetBool(settings.KeySendSsdeepCandidate),
+		LogLevel:            st.Get(settings.KeyLogLevel, "info"),
+		CacheExpiryHours:    st.Get(settings.KeyCacheExpiryHours, "168"),
+		RulesVersion:        st.Get(settings.KeyRulesVersion, ""),
 	}
 }
 
@@ -341,11 +350,47 @@ func applySettings(st *settings.Store, req UpdateSettingsRequest) {
 	if req.BatchJobEveryDay != "" {
 		st.Set(settings.KeyBatchJobEveryDay, req.BatchJobEveryDay)
 	}
-	if req.ExclusionPaths != "" {
+	// UI always sends these; allow empty to clear exclusions.
+	{
 		normalized := strings.ReplaceAll(req.ExclusionPaths, "\r\n", ";")
 		normalized = strings.ReplaceAll(normalized, "\n", ";")
 		st.Set(settings.KeyExclusionPaths, normalized)
 	}
+	if strings.TrimSpace(req.ScanExtensions) != "" {
+		normalized := strings.ReplaceAll(req.ScanExtensions, "\r\n", ",")
+		normalized = strings.ReplaceAll(normalized, "\n", ",")
+		normalized = strings.ReplaceAll(normalized, ";", ",")
+		st.Set(settings.KeyScanExtensions, normalized)
+		_ = st.MergeDefaultScanExtensions()
+	}
+	{
+		normalized := strings.ReplaceAll(req.QuickScanPaths, "\r\n", ";")
+		normalized = strings.ReplaceAll(normalized, "\n", ";")
+		st.Set(settings.KeyQuickScanPaths, normalized)
+	}
+	if req.SsdeepEnabled != nil {
+		st.Set(settings.KeySsdeepEnabled, boolStr(*req.SsdeepEnabled))
+	}
+	if req.SsdeepThreshold != "" {
+		st.Set(settings.KeySsdeepThreshold, strings.TrimSpace(req.SsdeepThreshold))
+	}
+	if req.SsdeepReportAPI != nil {
+		st.Set(settings.KeySsdeepReportAPI, boolStr(*req.SsdeepReportAPI))
+	}
+	if req.QuarantineOnDetect != nil {
+		st.Set(settings.KeyQuarantineOnDetect, boolStr(*req.QuarantineOnDetect))
+	}
+	if req.SendSsdeepCandidate != nil {
+		st.Set(settings.KeySendSsdeepCandidate, boolStr(*req.SendSsdeepCandidate))
+	}
+	if req.LogLevel != "" {
+		st.Set(settings.KeyLogLevel, strings.ToLower(strings.TrimSpace(req.LogLevel)))
+	}
+	if req.CacheExpiryHours != "" {
+		st.Set(settings.KeyCacheExpiryHours, strings.TrimSpace(req.CacheExpiryHours))
+	}
+	// Local Settings save wins until a newer Center edit arrives.
+	st.Set(settings.KeyConfigUpdatedAt, strconv.FormatInt(time.Now().Unix(), 10))
 }
 
 func boolStr(v bool) string {
