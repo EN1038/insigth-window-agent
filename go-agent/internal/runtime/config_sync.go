@@ -15,6 +15,7 @@ type serverConfigPayload struct {
 		RealTimeProtection  any   `json:"real_time_protection"`
 		USBProtection       any   `json:"usb_protection"`
 		BatchJobEveryDate   any   `json:"batchjob_everydate"`
+		TISyncEveryDate     any   `json:"ti_sync_everydate"`
 		SsdeepEnabled       any   `json:"ssdeep_enabled"`
 		SsdeepThreshold     any   `json:"ssdeep_threshold"`
 		SsdeepReportAPI     any   `json:"ssdeep_report_api"`
@@ -31,6 +32,7 @@ type serverConfigPayload struct {
 	RealTimeProtection  any `json:"real_time_protection"`
 	USBProtection       any `json:"usb_protection"`
 	BatchJobEveryDate   any `json:"batchjob_everydate"`
+	TISyncEveryDate     any `json:"ti_sync_everydate"`
 	ScanExtensions      any `json:"scan_extensions"`
 	Extentions          any `json:"extentions"` // Center typo / legacy key
 	ExclusionPaths      any `json:"exclusion_paths"`
@@ -79,6 +81,10 @@ func applyGetConfig(st *settings.Store, data json.RawMessage) error {
 	batch := firstNonNil(cfg.BatchJobEveryDate, cfg.Agent.BatchJobEveryDate)
 	if b := stringify(batch); b != "" {
 		st.Set(settings.KeyBatchJobEveryDay, b)
+	}
+	tiSync := firstNonNil(cfg.TISyncEveryDate, cfg.Agent.TISyncEveryDate)
+	if t := stringify(tiSync); t != "" {
+		st.Set(settings.KeyTISyncEveryDay, t)
 	}
 
 	autoLogin := firstNonNil(cfg.AutoScanOnLogin, cfg.Agent.AutoScanOnLogin)

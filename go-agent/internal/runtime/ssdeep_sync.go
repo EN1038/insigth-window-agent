@@ -2,7 +2,6 @@ package runtime
 
 import (
 	"archive/zip"
-	"context"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -30,25 +29,6 @@ type ssdeepDownloadItem struct {
 	FileName string `json:"file_name"`
 	Version  string `json:"version"`
 	Format   string `json:"format"`
-}
-
-func (r *Runner) ssdeepSyncLoop(ctx context.Context) {
-	t := time.NewTicker(6 * time.Hour)
-	defer t.Stop()
-	for {
-		select {
-		case <-ctx.Done():
-			return
-		case <-t.C:
-			if !r.Settings.GetBool(keyApproved) {
-				continue
-			}
-			if n := r.syncSsdeepFromServer(); n > 0 {
-				r.Settings.Set(keyLastSsdeepSync, time.Now().Format(time.RFC3339))
-				_ = r.Settings.Save()
-			}
-		}
-	}
 }
 
 func (r *Runner) syncSsdeepFromServer() int {

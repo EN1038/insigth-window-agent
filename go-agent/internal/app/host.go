@@ -226,6 +226,7 @@ func (h *Host) PushSettingsToServer() {
 		"quick_scan_paths":      h.Settings.Get(settings.KeyQuickScanPaths, ""),
 		"log_level":             h.Settings.Get(settings.KeyLogLevel, "info"),
 		"cache_expiry_hours":    cacheHours,
+		"ti_sync_everydate":     h.Settings.Get(settings.KeyTISyncEveryDay, "03:00"),
 		"config_updated_at":     configUpdatedAtUnix(h.Settings),
 	}
 	_, _, _ = apiClient.UpdateConfig(batch, rtp, usb, extra)

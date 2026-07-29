@@ -5,6 +5,8 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"strconv"
+	"strings"
 	"sync"
 	"time"
 
@@ -323,10 +325,8 @@ func (r *Runner) startPostApproval(ctx context.Context) {
 			if r.Settings == nil || !r.Settings.GetBool(settings.KeyTIBootstrapDone) {
 				r.runThreatIntelBootstrap(ctx)
 			}
-			go r.postApprovalLoop(ctx)
 			go r.configSyncLoop(ctx)
-			go r.rulesSyncLoop(ctx)
-			go r.ssdeepSyncLoop(ctx)
+			go r.tiSyncScheduleLoop(ctx)
 		}()
 	} else if r.Settings != nil {
 		r.Settings.Set(settings.KeyTIBootstrapDone, "true")
@@ -428,46 +428,50 @@ func (r *Runner) startScanSubsystem(ctx context.Context) {
 	_ = r.History.Append("scan.runtime", "scan subsystem started (scheduler, watcher, usb)", nil)
 }
 
-func (r *Runner) postApprovalLoop(ctx context.Context) {
-	// Initial bootstrap already ran; periodic refresh only.
-	t := time.NewTicker(6 * time.Hour)
+func (r *Runner) tiSyncScheduleLoop(ctx context.Context) {
+	t := time.NewTicker(1 * time.Minute)
 	defer t.Stop()
 	for {
 		select {
 		case <-ctx.Done():
 			return
 		case <-t.C:
-			r.runPostApproval()
+			r.tickTISyncSchedule()
 		}
 	}
 }
 
-func (r *Runner) runPostApproval() {
-	if r.API == nil {
+func (r *Runner) tickTISyncSchedule() {
+	if r.API == nil || r.Settings == nil {
 		return
 	}
-	if err := r.syncConfigFromServer(); err == nil {
-		r.Settings.Set(keyLastConfigSync, time.Now().Format(time.RFC3339))
-		_ = r.Settings.Save()
+	if !r.Settings.GetBool(keyApproved) {
+		return
 	}
-
-	r.mu.Lock()
-	fallback := append(json.RawMessage(nil), r.lastApprovalRaw...)
-	r.mu.Unlock()
-
-	n := r.syncRulesFromServer(fallback)
-	if n > 0 {
-		r.Settings.Set(keyLastRulesSync, time.Now().Format(time.RFC3339))
-		_ = r.Settings.Save()
-		if r.Scan != nil {
-			r.Scan.RefreshRules()
-		}
+	if r.Settings.GetBool(settings.KeyTISyncBusy) {
+		return
 	}
-
-	if n := r.syncSsdeepFromServer(); n > 0 {
-		r.Settings.Set(keyLastSsdeepSync, time.Now().Format(time.RFC3339))
-		_ = r.Settings.Save()
+	schedule := r.Settings.Get(settings.KeyTISyncEveryDay, "03:00")
+	parts := strings.Split(schedule, ":")
+	if len(parts) < 2 {
+		return
 	}
+	hour, err1 := strconv.Atoi(strings.TrimSpace(parts[0]))
+	minute, err2 := strconv.Atoi(strings.TrimSpace(parts[1]))
+	if err1 != nil || err2 != nil {
+		return
+	}
+	now := time.Now()
+	if now.Hour() != hour || now.Minute() != minute {
+		return
+	}
+	today := now.Format("2006-01-02")
+	if r.Settings.Get(settings.KeyLastTISyncRun, "") == today {
+		return
+	}
+	r.Settings.Set(settings.KeyLastTISyncRun, today)
+	_ = r.Settings.Save()
+	_, _, _ = r.SyncThreatIntel()
 }
 
 // SyncThreatIntel pulls config + rules + ssdeep from Center immediately (UI Sync now).
@@ -491,6 +495,7 @@ func (r *Runner) SyncThreatIntel() (rulesN, ssdeepN int, err error) {
 	if ssdeepN > 0 {
 		r.Settings.Set(keyLastSsdeepSync, time.Now().Format(time.RFC3339))
 	}
+	r.Settings.Set(settings.KeyLastTISyncRun, time.Now().Format("2006-01-02"))
 	_ = r.Settings.Save()
 	r.Settings.Set(settings.KeyTIBootstrapDone, "true")
 	r.Settings.Set(settings.KeyTIDownloadPercent, "100")
@@ -516,29 +521,6 @@ func (r *Runner) configSyncLoop(ctx context.Context) {
 			if err := r.syncConfigFromServer(); err == nil {
 				r.Settings.Set(keyLastConfigSync, time.Now().Format(time.RFC3339))
 				_ = r.Settings.Save()
-			}
-		}
-	}
-}
-
-func (r *Runner) rulesSyncLoop(ctx context.Context) {
-	t := time.NewTicker(6 * time.Hour)
-	defer t.Stop()
-	for {
-		select {
-		case <-ctx.Done():
-			return
-		case <-t.C:
-			if !r.Settings.GetBool(keyApproved) {
-				continue
-			}
-			n := r.syncRulesFromServer(nil)
-			if n > 0 {
-				r.Settings.Set(keyLastRulesSync, time.Now().Format(time.RFC3339))
-				_ = r.Settings.Save()
-				if r.Scan != nil {
-					r.Scan.RefreshRules()
-				}
 			}
 		}
 	}

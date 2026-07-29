@@ -439,6 +439,10 @@ func (r *Router) showSettings(setPage func(fyne.CanvasObject)) {
 	batch.SetText(st.BatchJobEveryDay)
 	batch.SetPlaceHolder("HH:mm")
 
+	tiSync := widget.NewEntry()
+	tiSync.SetText(st.TISyncEveryDay)
+	tiSync.SetPlaceHolder("HH:mm")
+
 	excl := widget.NewMultiLineEntry()
 	excl.SetText(st.ExclusionPaths)
 	excl.SetMinRowsVisible(3)
@@ -484,6 +488,9 @@ func (r *Router) showSettings(setPage func(fyne.CanvasObject)) {
 		vspace(4),
 		fieldLabel("Daily batch scan time (HH:mm)"),
 		batch,
+		vspace(8),
+		fieldLabel("Daily threat intelligence sync (rules + ssdeep, HH:mm)"),
+		tiSync,
 		vspace(8),
 		fieldLabel("Excluded paths (one per line)"),
 		excl,
@@ -550,6 +557,7 @@ func (r *Router) showSettings(setPage func(fyne.CanvasObject)) {
 			USBProtection:       boolPtr(usb.Checked),
 			AutoScanOnLogin:     boolPtr(auto.Checked),
 			BatchJobEveryDay:    batch.Text,
+			TISyncEveryDay:      tiSync.Text,
 			ExclusionPaths:      excl.Text,
 			ScanExtensions:      scanExt.Text,
 			QuickScanPaths:      quick.Text,

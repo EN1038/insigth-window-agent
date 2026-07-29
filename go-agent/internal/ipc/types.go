@@ -59,6 +59,7 @@ type SettingsView struct {
 	USBProtection       bool   `json:"usb_protection"`
 	AutoScanOnLogin     bool   `json:"auto_scan_on_login"`
 	BatchJobEveryDay    string `json:"batchjob_everydate"`
+	TISyncEveryDay      string `json:"ti_sync_everydate"`
 	ExclusionPaths      string `json:"exclusion_paths"`
 	ScanExtensions      string `json:"scan_extensions"`
 	QuickScanPaths      string `json:"quick_scan_paths"`
@@ -77,6 +78,7 @@ type UpdateSettingsRequest struct {
 	USBProtection       *bool  `json:"usb_protection,omitempty"`
 	AutoScanOnLogin     *bool  `json:"auto_scan_on_login,omitempty"`
 	BatchJobEveryDay    string `json:"batchjob_everydate,omitempty"`
+	TISyncEveryDay      string `json:"ti_sync_everydate,omitempty"`
 	ExclusionPaths      string `json:"exclusion_paths,omitempty"`
 	ScanExtensions      string `json:"scan_extensions,omitempty"`
 	QuickScanPaths      string `json:"quick_scan_paths,omitempty"`

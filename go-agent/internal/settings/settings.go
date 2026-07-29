@@ -26,6 +26,9 @@ const (
 	KeyRealtimeShield   = "realtime_shield"
 	KeyBatchJobEveryDay = "batchjob_everydate"
 	KeyLastBatchJobRun  = "last_batchjob_run"
+	// Daily local HH:mm for rules + ssdeep pack sync (Center/Client mirrored).
+	KeyTISyncEveryDay = "ti_sync_everydate"
+	KeyLastTISyncRun  = "last_ti_sync_run"
 	KeyAPISecret        = "api_secret"
 	// Ssdeep secondary engine: runs only on files YARA did not flag.
 	KeySsdeepEnabled   = "ssdeep_enabled"
@@ -104,6 +107,7 @@ func (s *Store) setDefaults() {
 	def(KeyUSBProtection, "true")
 	def(KeyRealtimeShield, "true")
 	def(KeyBatchJobEveryDay, "02:00")
+	def(KeyTISyncEveryDay, "03:00")
 	def(KeyAPISecret, "")
 	def(KeySsdeepEnabled, "true")
 	def(KeySsdeepThreshold, "85")

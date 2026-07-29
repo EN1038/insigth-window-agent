@@ -372,6 +372,7 @@ func settingsView(st *settings.Store) SettingsView {
 		USBProtection:       st.GetBool(settings.KeyUSBProtection),
 		AutoScanOnLogin:     st.GetBool(settings.KeyAutoScanOnLogin),
 		BatchJobEveryDay:    st.Get(settings.KeyBatchJobEveryDay, "02:00"),
+		TISyncEveryDay:      st.Get(settings.KeyTISyncEveryDay, "03:00"),
 		ExclusionPaths:      strings.ReplaceAll(st.Get(settings.KeyExclusionPaths, ""), ";", "\n"),
 		ScanExtensions:      st.Get(settings.KeyScanExtensions, ""),
 		QuickScanPaths:      strings.ReplaceAll(st.Get(settings.KeyQuickScanPaths, ""), ";", "\n"),
@@ -398,6 +399,9 @@ func applySettings(st *settings.Store, req UpdateSettingsRequest) {
 	}
 	if req.BatchJobEveryDay != "" {
 		st.Set(settings.KeyBatchJobEveryDay, req.BatchJobEveryDay)
+	}
+	if req.TISyncEveryDay != "" {
+		st.Set(settings.KeyTISyncEveryDay, req.TISyncEveryDay)
 	}
 	// UI always sends these; allow empty to clear exclusions.
 	{
