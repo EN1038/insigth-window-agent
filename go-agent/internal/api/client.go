@@ -62,36 +62,42 @@ func New(cfg *config.AgentConfig) *Client {
 func buildTLSConfig(cfg *config.AgentConfig) *tls.Config {
 	tlsCfg := &tls.Config{
 		MinVersion: tls.VersionTLS12,
+		// Legacy/.NET parity: skip server cert verify by default (self-signed site certs are common).
+		// Presence of client.p12 must NOT flip this off — that caused Post "https://..." TLS failures.
+		InsecureSkipVerify: true,
+	}
+	if cfg != nil && cfg.TLSInsecureSkipVerify {
+		tlsCfg.InsecureSkipVerify = true
 	}
 	certPath, certPass := resolveClientCert(cfg)
-	insecure := true
-	if cfg != nil {
-		insecure = cfg.TLSInsecureSkipVerify || certPath == ""
-		if !cfg.TLSInsecureSkipVerify && certPath != "" {
-			insecure = false
-		}
-	}
 	if certPath != "" {
 		if cert, err := loadPKCS12(certPath, certPass); err == nil {
 			tlsCfg.Certificates = []tls.Certificate{*cert}
 		}
 	}
-	tlsCfg.InsecureSkipVerify = insecure
 	return tlsCfg
 }
 
 func resolveClientCert(cfg *config.AgentConfig) (path, pass string) {
 	if cfg != nil && strings.TrimSpace(cfg.ClientCertPath) != "" {
-		return strings.TrimSpace(cfg.ClientCertPath), cfg.ClientCertPass
+		path = strings.TrimSpace(cfg.ClientCertPath)
+		pass = cfg.ClientCertPass
 	}
-	if p := strings.TrimSpace(os.Getenv("INSITE_CLIENT_CERT_PATH")); p != "" {
-		return p, os.Getenv("INSITE_CLIENT_CERT_PASS")
+	if path == "" {
+		if p := strings.TrimSpace(os.Getenv("INSITE_CLIENT_CERT_PATH")); p != "" {
+			path = p
+		}
 	}
-	def := filepath.Join(config.DataBaseDir(), "Config", "Key", "client.p12")
-	if _, err := os.Stat(def); err == nil {
-		return def, os.Getenv("INSITE_CLIENT_CERT_PASS")
+	if pass == "" {
+		pass = os.Getenv("INSITE_CLIENT_CERT_PASS")
 	}
-	return "", ""
+	if path == "" {
+		def := filepath.Join(config.DataBaseDir(), "Config", "Key", "client.p12")
+		if _, err := os.Stat(def); err == nil {
+			path = def
+		}
+	}
+	return path, pass
 }
 
 func loadPKCS12(path, password string) (*tls.Certificate, error) {
