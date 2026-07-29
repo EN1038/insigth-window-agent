@@ -77,6 +77,9 @@ func New(baseDir string) *Store {
 }
 
 func (s *Store) setDefaults() {
+	if s.Values == nil {
+		s.Values = map[string]string{}
+	}
 	def := func(k, v string) {
 		if _, ok := s.Values[k]; !ok {
 			s.Values[k] = v
