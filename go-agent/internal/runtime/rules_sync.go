@@ -71,7 +71,7 @@ func (r *Runner) syncRulesFromServerResult(fallbackRaw json.RawMessage) (complet
 		if len(items) == 0 {
 			if listOK {
 				_ = r.History.Append("rules.skip", "no rules available to sync", nil)
-				r.setTIProgress(45, "No rule packs to download")
+				r.setTIProgress(45, "YARA rules: no packs on server — continuing to ssdeep")
 				return true, 0, 0
 			}
 			if err != nil {
@@ -110,7 +110,7 @@ func (r *Runner) downloadRules(items []ruleDownloadItem, agentID int64, useOffic
 		localZip := filepath.Join(paths, fileName)
 
 		pct := 5 + float64(idx)*40/float64(max(total, 1))
-		msg := fmt.Sprintf("Rules %d/%d: %s", idx+1, total, fileName)
+		msg := fmt.Sprintf("YARA rules %d/%d: %s", idx+1, total, fileName)
 		r.setTIProgress(pct, msg)
 		_ = r.History.Append("download.progress", msg, map[string]any{
 			"phase": "rules", "file_index": idx + 1, "file_total": total, "percent": pct,
@@ -165,7 +165,9 @@ func (r *Runner) downloadRules(items []ruleDownloadItem, agentID int64, useOffic
 		r.Scan.RefreshRules()
 	}
 	if total > 0 {
-		r.setTIProgress(50, fmt.Sprintf("Rules done (%d ok, %d failed)", imported, failed))
+		r.setTIProgress(50, fmt.Sprintf("YARA rules done (%d ok, %d failed)", imported, failed))
+	} else {
+		r.setTIProgress(50, "YARA rules: nothing to download")
 	}
 	return imported, failed
 }

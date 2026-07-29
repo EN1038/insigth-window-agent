@@ -512,7 +512,6 @@ func (r *Router) showTIDownload() {
 	bar.Min = 0
 	bar.Max = 100
 	bar.SetValue(0)
-	pctLabel := canvasMuted("0%", colorMuted)
 
 	logPanel, refreshLogs := newApprovalLogPanel(r, 12)
 
@@ -526,7 +525,6 @@ func (r *Router) showTIDownload() {
 		sub,
 		vspace(10),
 		bar,
-		container.NewCenter(pctLabel),
 		vspace(10),
 		logPanel,
 	)
@@ -550,12 +548,20 @@ func (r *Router) showTIDownload() {
 		}
 		fyne.Do(func() {
 			bar.SetValue(st.DownloadPercent)
-			pctLabel.Text = fmt.Sprintf("%.0f%%", st.DownloadPercent)
-			pctLabel.Refresh()
 			if msg := strings.TrimSpace(st.DownloadMessage); msg != "" {
 				sub.Text = msg
 				sub.Refresh()
 			}
+			low := strings.ToLower(st.DownloadMessage)
+			switch {
+			case strings.Contains(low, "ssdeep"):
+				statusText.Text = "Downloading ssdeep packs…"
+			case strings.Contains(low, "rule"):
+				statusText.Text = "Downloading YARA rules…"
+			default:
+				statusText.Text = "Downloading threat intelligence…"
+			}
+			statusText.Refresh()
 		})
 		if st.ThreatIntelReady {
 			fyne.Do(func() {
