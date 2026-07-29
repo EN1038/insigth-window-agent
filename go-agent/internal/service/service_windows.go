@@ -4,7 +4,6 @@ package service
 
 import (
 	"context"
-	"fmt"
 	"time"
 
 	"github.com/sosecure/insite-agent/internal/app"
@@ -14,13 +13,9 @@ import (
 )
 
 func Run() error {
-	isService, err := winSvc.IsWindowsService()
-	if err != nil {
-		return fmt.Errorf("detect windows service: %w", err)
-	}
-	if !isService {
-		return runConsole()
-	}
+	// Always register with SCM when launched as `-mode service`.
+	// Falling back to runConsole() when IsWindowsService() is false caused the
+	// service to exit immediately (WIN32_EXIT_CODE 0) under LocalSystem.
 	return winSvc.Run(install.ServiceName, &handler{})
 }
 

@@ -4,7 +4,6 @@ package service
 
 import (
 	"context"
-	"fmt"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -20,13 +19,7 @@ import (
 // RunWatchdog runs the mutual-watch service that restarts the main agent if
 // it was stopped without an authorized credential confirm.
 func RunWatchdog() error {
-	isService, err := svc.IsWindowsService()
-	if err != nil {
-		return fmt.Errorf("detect windows service: %w", err)
-	}
-	if !isService {
-		return runWatchdogLoop(context.Background())
-	}
+	// Always register with SCM when launched as `-mode watchdog`.
 	return svc.Run(install.WatchdogServiceName, &watchdogHandler{})
 }
 
