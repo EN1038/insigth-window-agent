@@ -82,12 +82,15 @@ type Router struct {
 
 func (r *Router) setupTrayAndCloseBehavior() {
 	// System tray: left-click shows window (Fyne 2.7+); right-click opens menu.
-	// Tray menu callbacks must NOT call Fyne window APIs directly (deadlocks).
+	// Fyne invokes menu Actions via runOnMain — Show/RequestFocus are safe there.
+	// Win32-only ShowWindow (without Fyne Show) leaves GLFW thinking the window
+	// is still hidden, so Open must call window.Show first.
 	if desk, ok := r.app.(desktop.App); ok {
 		openItem := fyne.NewMenuItem("Open", func() {
-			_ = requestUIShow()
-			r.forceShowNative()
+			r.showWindowFromTray()
 		})
+		// IsQuit tells Fyne this is the quit entry so it does NOT append its own
+		// "Quit" (which would call app.Quit immediately and skip confirm-exit).
 		exitItem := fyne.NewMenuItem("Exit", func() {
 			_ = launchConfirmExit()
 		})
@@ -105,8 +108,24 @@ func (r *Router) setupTrayAndCloseBehavior() {
 	go r.traySignalPump()
 }
 
-// traySignalPump handles Open/Exit requests from the tray without touching Fyne
-// APIs on the systray callback goroutine.
+// showWindowFromTray restores the Fyne window. Safe on the Fyne main thread
+// (tray menu Action) and via fyne.Do from the pump.
+func (r *Router) showWindowFromTray() {
+	if r.window == nil {
+		return
+	}
+	r.window.Show()
+	r.window.RequestFocus()
+	if c := r.window.Content(); c != nil {
+		c.Show()
+	}
+	go func() {
+		time.Sleep(80 * time.Millisecond)
+		r.forceShowNative()
+	}()
+}
+
+// traySignalPump handles Open from a second process (ui.show) and Exit (ui.quit).
 func (r *Router) traySignalPump() {
 	t := time.NewTicker(200 * time.Millisecond)
 	defer t.Stop()
@@ -116,15 +135,7 @@ func (r *Router) traySignalPump() {
 			return
 		case <-t.C:
 			if consumeUISignal(uiShowSignal) {
-				fyne.Do(func() {
-					r.window.Show()
-					r.window.RequestFocus()
-					if c := r.window.Content(); c != nil {
-						c.Show()
-					}
-				})
-				time.Sleep(80 * time.Millisecond)
-				r.forceShowNative()
+				fyne.Do(r.showWindowFromTray)
 			}
 			if consumeUISignal(uiQuitSignal) {
 				fyne.Do(func() {
@@ -632,6 +643,9 @@ func isConnectionLogKind(kind string) bool {
 	case strings.HasPrefix(kind, "api"):
 	case strings.HasPrefix(kind, "heartbeat"):
 	case strings.HasPrefix(kind, "config"):
+	case strings.HasPrefix(kind, "download"):
+	case strings.HasPrefix(kind, "rules"):
+	case strings.HasPrefix(kind, "ssdeep"):
 	case kind == "runtime.start", kind == "runtime.warn":
 	default:
 		return false
@@ -656,6 +670,10 @@ func approvalStatusFromEvents(events []ipc.HistoryEvent) (headline, detail strin
 	detail = "Watch CONNECTION LOG below for live steps (dataInfo → approval check)."
 	if len(events) == 0 {
 		return headline, detail
+	}
+
+	if events[0].Kind == "download.progress" {
+		return "Downloading threat intelligence", events[0].Message
 	}
 
 	// Prefer the most meaningful recent status, not just the newest heartbeat.
@@ -684,12 +702,18 @@ func approvalStatusFromEvents(events []ipc.HistoryEvent) (headline, detail strin
 			if !hasApproveWait && !hasAPIError {
 				latestMsg = e.Message
 			}
+		case e.Kind == "download.progress":
+			hasProgress = true
+			latestMsg = e.Message
 		case e.Kind == "api.ok" && strings.Contains(e.Message, "dataInfo"):
 			hasDataInfoOK = true
 		}
 	}
 
 	switch {
+	case hasApproveOK && strings.Contains(strings.ToLower(latestMsg), "download"):
+		headline = "Downloading threat intelligence"
+		detail = latestMsg
 	case hasApproveOK:
 		headline = "Device approved"
 		detail = "Continuing to login…"

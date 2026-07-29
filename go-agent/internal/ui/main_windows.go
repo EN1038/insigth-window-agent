@@ -526,7 +526,7 @@ func (r *Router) showSettings(setPage func(fyne.CanvasObject)) {
 			dialog.ShowError(err, r.window)
 			return
 		}
-		dialog.ShowInformation("Rules", "Rule sync requested.", r.window)
+		dialog.ShowInformation("Threat intelligence", "Synced rules and ssdeep packs from server.", r.window)
 	})
 	rulesCard := card(container.NewVBox(
 		sectionHeaderImg(resIconYara, "Threat intelligence"),

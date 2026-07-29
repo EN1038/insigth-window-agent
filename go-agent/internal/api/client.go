@@ -3,12 +3,18 @@ package api
 import (
 	"bytes"
 	"crypto/tls"
+	"encoding/base64"
 	"encoding/json"
 	"fmt"
 	"io"
 	"net/http"
+	"os"
+	"path/filepath"
 	"strings"
+	"sync"
 	"time"
+
+	"software.sslmate.com/src/go-pkcs12"
 
 	"github.com/sosecure/insite-agent/internal/config"
 	"github.com/sosecure/insite-agent/internal/sysinfo"
@@ -17,6 +23,21 @@ import (
 type Client struct {
 	cfg  *config.AgentConfig
 	http *http.Client
+
+	mu       sync.Mutex
+	progress ProgressFunc
+}
+
+type ProgressFunc func(p Progress)
+
+type Progress struct {
+	Phase      string  // rules | ssdeep | file
+	Message    string
+	FileIndex  int
+	FileTotal  int
+	BytesRead  int64
+	BytesTotal int64
+	Percent    float64
 }
 
 type Response struct {
@@ -27,11 +48,7 @@ type Response struct {
 
 func New(cfg *config.AgentConfig) *Client {
 	tr := &http.Transport{
-		TLSClientConfig: &tls.Config{
-			// Legacy behavior in .NET accepted all certs. Keep for parity for now.
-			// We will add a strict mode flag later.
-			InsecureSkipVerify: true,
-		},
+		TLSClientConfig: buildTLSConfig(cfg),
 	}
 	return &Client{
 		cfg: cfg,
@@ -42,16 +59,166 @@ func New(cfg *config.AgentConfig) *Client {
 	}
 }
 
+func buildTLSConfig(cfg *config.AgentConfig) *tls.Config {
+	tlsCfg := &tls.Config{
+		MinVersion: tls.VersionTLS12,
+	}
+	certPath, certPass := resolveClientCert(cfg)
+	insecure := true
+	if cfg != nil {
+		insecure = cfg.TLSInsecureSkipVerify || certPath == ""
+		if !cfg.TLSInsecureSkipVerify && certPath != "" {
+			insecure = false
+		}
+	}
+	if certPath != "" {
+		if cert, err := loadPKCS12(certPath, certPass); err == nil {
+			tlsCfg.Certificates = []tls.Certificate{*cert}
+		}
+	}
+	tlsCfg.InsecureSkipVerify = insecure
+	return tlsCfg
+}
+
+func resolveClientCert(cfg *config.AgentConfig) (path, pass string) {
+	if cfg != nil && strings.TrimSpace(cfg.ClientCertPath) != "" {
+		return strings.TrimSpace(cfg.ClientCertPath), cfg.ClientCertPass
+	}
+	if p := strings.TrimSpace(os.Getenv("INSITE_CLIENT_CERT_PATH")); p != "" {
+		return p, os.Getenv("INSITE_CLIENT_CERT_PASS")
+	}
+	def := filepath.Join(config.DataBaseDir(), "Config", "Key", "client.p12")
+	if _, err := os.Stat(def); err == nil {
+		return def, os.Getenv("INSITE_CLIENT_CERT_PASS")
+	}
+	return "", ""
+}
+
+func loadPKCS12(path, password string) (*tls.Certificate, error) {
+	b, err := os.ReadFile(path)
+	if err != nil {
+		return nil, err
+	}
+	priv, cert, ca, err := pkcs12.DecodeChain(b, password)
+	if err != nil {
+		// Fallback: some exporters use Decode only.
+		priv2, cert2, err2 := pkcs12.Decode(b, password)
+		if err2 != nil {
+			return nil, err
+		}
+		priv, cert, ca = priv2, cert2, nil
+	}
+	var chain [][]byte
+	chain = append(chain, cert.Raw)
+	for _, c := range ca {
+		chain = append(chain, c.Raw)
+	}
+	return &tls.Certificate{
+		Certificate: chain,
+		PrivateKey:  priv,
+		Leaf:        cert,
+	}, nil
+}
+
+func (c *Client) SetProgressFunc(fn ProgressFunc) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.progress = fn
+}
+
+func (c *Client) reportProgress(p Progress) {
+	c.mu.Lock()
+	fn := c.progress
+	c.mu.Unlock()
+	if fn != nil {
+		fn(p)
+	}
+}
+
 func (c *Client) endpointURL(endpoint string) string {
 	base := strings.TrimRight(c.cfg.SiteIP, "/")
-	return base + "/api/" + c.cfg.SiteID + "/agentClient/" + endpoint
+	code := strings.Trim(c.cfg.SiteID, "/")
+	return base + "/api/v1/site_offline/" + code + "/agentCenter/" + endpoint
+}
+
+func (c *Client) ensureCryptoKeys() error {
+	if c.cfg == nil {
+		return fmt.Errorf("invalid config")
+	}
+	if strings.TrimSpace(c.cfg.SiteIPKey) != "" && strings.TrimSpace(c.cfg.SiteMacKey) != "" {
+		return nil
+	}
+	return c.fetchSiteCrypto()
+}
+
+func (c *Client) fetchSiteCrypto() error {
+	if c.cfg == nil || c.cfg.SiteIP == "" || c.cfg.SiteID == "" || c.cfg.SiteKey == "" {
+		return fmt.Errorf("invalid config")
+	}
+	body := map[string]any{"mode": "site_offline"}
+	b, err := json.Marshal(body)
+	if err != nil {
+		return err
+	}
+	req, err := http.NewRequest("POST", c.endpointURL("getSiteCrypto"), bytes.NewReader(b))
+	if err != nil {
+		return err
+	}
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("Accept", "application/json")
+	req.Header.Set("Authorization", "Bearer "+c.cfg.SiteKey)
+
+	resp, err := c.http.Do(req)
+	if err != nil {
+		return err
+	}
+	defer resp.Body.Close()
+	raw, _ := io.ReadAll(resp.Body)
+
+	var outer struct {
+		Error      string `json:"error"`
+		StatusCode int    `json:"status_code"`
+		Data       struct {
+			IPKey  string `json:"ip_key"`
+			MacKey string `json:"mac_address_key"`
+		} `json:"data"`
+	}
+	if err := json.Unmarshal(raw, &outer); err != nil {
+		return fmt.Errorf("getSiteCrypto decode: %w body=%s", err, string(raw))
+	}
+	if outer.StatusCode != 200 && outer.StatusCode != 0 {
+		return fmt.Errorf("getSiteCrypto status %d: %s", outer.StatusCode, outer.Error)
+	}
+	if strings.TrimSpace(outer.Data.IPKey) == "" || strings.TrimSpace(outer.Data.MacKey) == "" {
+		return fmt.Errorf("getSiteCrypto missing ip_key/mac_address_key")
+	}
+	c.cfg.SiteIPKey = outer.Data.IPKey
+	c.cfg.SiteMacKey = outer.Data.MacKey
+	_ = config.Save(config.DataBaseDir(), c.cfg)
+	return nil
 }
 
 func (c *Client) postJSON(endpoint string, body any) (*Response, []byte, error) {
 	if c.cfg == nil || c.cfg.SiteIP == "" || c.cfg.SiteID == "" || c.cfg.SiteKey == "" {
 		return nil, nil, fmt.Errorf("invalid config")
 	}
-	b, err := json.Marshal(body)
+	if err := c.ensureCryptoKeys(); err != nil {
+		return nil, nil, fmt.Errorf("crypto keys: %w", err)
+	}
+
+	plain, err := json.Marshal(body)
+	if err != nil {
+		return nil, nil, err
+	}
+	enc, err := CenterEncrypt(string(plain), c.cfg.SiteKey, c.cfg.SiteIPKey, c.cfg.SiteMacKey)
+	if err != nil {
+		return nil, nil, err
+	}
+	wrapper := map[string]any{
+		"mode": "site_offline",
+		"data": enc,
+	}
+	b, err := json.Marshal(wrapper)
 	if err != nil {
 		return nil, nil, err
 	}
@@ -70,19 +237,45 @@ func (c *Client) postJSON(endpoint string, body any) (*Response, []byte, error) 
 	defer resp.Body.Close()
 	raw, _ := io.ReadAll(resp.Body)
 
-	var r Response
-	if err := json.Unmarshal(raw, &r); err != nil {
-		// If server returns non-json, still bubble up raw body for troubleshooting.
+	var outer struct {
+		Error      string          `json:"error"`
+		StatusCode int             `json:"status_code"`
+		Data       json.RawMessage `json:"data"`
+	}
+	if err := json.Unmarshal(raw, &outer); err != nil {
 		return nil, raw, fmt.Errorf("decode response: %w", err)
+	}
+
+	r := &Response{Error: outer.Error, StatusCode: outer.StatusCode}
+	dataField := strings.TrimSpace(string(outer.Data))
+	if len(outer.Data) > 0 && dataField != "null" && dataField != `""` && dataField != "[]" && dataField != "{}" {
+		// Encrypted string JSON value, or already an object (legacy).
+		var encStr string
+		if err := json.Unmarshal(outer.Data, &encStr); err == nil && encStr != "" {
+			dec, err := CenterDecrypt(encStr, c.cfg.SiteKey, c.cfg.SiteIPKey, c.cfg.SiteMacKey)
+			if err != nil {
+				return nil, raw, fmt.Errorf("decrypt response: %w", err)
+			}
+			var inner Response
+			if err := json.Unmarshal([]byte(dec), &inner); err != nil {
+				return nil, raw, fmt.Errorf("decode inner response: %w", err)
+			}
+			r = &inner
+		} else {
+			// Treat as plaintext inner payload (or already-decrypted object).
+			r.Data = outer.Data
+			if r.StatusCode == 0 {
+				r.StatusCode = 200
+			}
+		}
 	}
 	if r.Error == "" && r.StatusCode >= 400 {
 		r.Error = http.StatusText(r.StatusCode)
 	}
 	if r.StatusCode == 0 && resp.StatusCode == http.StatusOK {
-		// Some deployments may not set status_code; normalize.
 		r.StatusCode = 200
 	}
-	return &r, raw, nil
+	return r, raw, nil
 }
 
 func (c *Client) isOK(r *Response) bool {
@@ -203,11 +396,11 @@ func (c *Client) SendLogYara(items []YaraLogItem) (*Response, []byte, error) {
 }
 
 type ScanLogItem struct {
-	AgentID      int64  `json:"agent_id"`
-	Description  string `json:"description"`
-	TimeStamp    string `json:"time_stamp"`
-	Mode         string `json:"mode"`
-	Type         string `json:"type"` // start|end
+	AgentID     int64  `json:"agent_id"`
+	Description string `json:"description"`
+	TimeStamp   string `json:"time_stamp"`
+	Mode        string `json:"mode"`
+	Type        string `json:"type"` // start|end
 }
 
 func (c *Client) SendAgentScanLog(items []ScanLogItem) (*Response, []byte, error) {
@@ -308,16 +501,52 @@ type SsdeepCandidateItem struct {
 
 func (c *Client) SendSsdeepCandidate(items []SsdeepCandidateItem) (*Response, []byte, error) {
 	payload := map[string]any{
-		"ip_private":  sysinfo.LocalIPv4(),
+		"ip_private": sysinfo.LocalIPv4(),
 		"candidates": items,
 	}
 	return c.postJSON("sendSsdeepCandidate", payload)
 }
 
-func boolToInt(v bool) int {
-	if v {
-		return 1
+// DownloadProtectedFile fetches a pack via authenticated encrypted API (preferred over static URLs).
+func (c *Client) DownloadProtectedFile(kind, path string, destPath string) error {
+	payload := map[string]any{
+		"kind": kind,
+		"path": path,
 	}
-	return 0
+	resp, _, err := c.postJSON("downloadProtectedFile", payload)
+	if err != nil {
+		return err
+	}
+	if resp.StatusCode != 200 {
+		return fmt.Errorf("downloadProtectedFile status %d: %s", resp.StatusCode, resp.Error)
+	}
+	var body struct {
+		FileName   string `json:"file_name"`
+		ContentB64 string `json:"content_b64"`
+	}
+	if err := json.Unmarshal(resp.Data, &body); err != nil {
+		return err
+	}
+	if body.ContentB64 == "" {
+		return fmt.Errorf("empty file content")
+	}
+	raw, err := base64.StdEncoding.DecodeString(body.ContentB64)
+	if err != nil {
+		raw, err = base64.RawStdEncoding.DecodeString(body.ContentB64)
+		if err != nil {
+			return err
+		}
+	}
+	c.reportProgress(Progress{
+		Phase:      "file",
+		Message:    "Saving " + body.FileName,
+		BytesTotal: int64(len(raw)),
+		BytesRead:  int64(len(raw)),
+		Percent:    100,
+	})
+	tmp := destPath + ".part"
+	if err := os.WriteFile(tmp, raw, 0o600); err != nil {
+		return err
+	}
+	return os.Rename(tmp, destPath)
 }
-

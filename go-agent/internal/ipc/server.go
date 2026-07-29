@@ -3,6 +3,7 @@ package ipc
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"io"
 	"net"
 	"net/http"
@@ -105,6 +106,16 @@ func (s *Server) handleConfig(w http.ResponseWriter, r *http.Request) {
 		if cfg.SiteIP == "" || cfg.SiteID == "" || cfg.SiteKey == "" {
 			writeJSON(w, OKResponse{OK: false, Message: "Please fill Server IP, Site Code, and Site Key"})
 			return
+		}
+		if prev := s.svc.GetConfig(); prev != nil {
+			cfg.ClientCertPath = prev.ClientCertPath
+			cfg.ClientCertPass = prev.ClientCertPass
+			cfg.TLSInsecureSkipVerify = prev.TLSInsecureSkipVerify
+			// Keep crypto salts only when connecting to the same site key.
+			if prev.SiteKey == cfg.SiteKey && prev.SiteID == cfg.SiteID {
+				cfg.SiteIPKey = prev.SiteIPKey
+				cfg.SiteMacKey = prev.SiteMacKey
+			}
 		}
 		if err := s.svc.ReloadConfig(cfg); err != nil {
 			writeJSON(w, OKResponse{OK: false, Message: err.Error()})
@@ -246,10 +257,18 @@ func (s *Server) handleRulesSync(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
 		return
 	}
+	rulesN, ssdeepN, err := s.svc.SyncThreatIntel()
+	if err != nil {
+		writeJSON(w, OKResponse{OK: false, Message: err.Error()})
+		return
+	}
 	if sr := s.svc.ScanRuntime(); sr != nil {
 		sr.RefreshRules()
 	}
-	writeJSON(w, OKResponse{OK: true, Message: "rules refresh requested"})
+	writeJSON(w, OKResponse{
+		OK:      true,
+		Message: fmt.Sprintf("Synced from server (rules=%d ssdeep packs=%d)", rulesN, ssdeepN),
+	})
 }
 
 func (s *Server) handleRulesInfo(w http.ResponseWriter, r *http.Request) {

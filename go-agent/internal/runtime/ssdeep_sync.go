@@ -87,7 +87,8 @@ func (r *Runner) downloadSsdeep(items []ssdeepDownloadItem, agentID int64) int {
 	_ = os.MkdirAll(downloadsDir, 0o700)
 
 	count := 0
-	for _, item := range items {
+	totalFiles := len(items)
+	for idx, item := range items {
 		if strings.TrimSpace(item.Path) == "" {
 			continue
 		}
@@ -99,7 +100,10 @@ func (r *Runner) downloadSsdeep(items []ssdeepDownloadItem, agentID int64) int {
 			fileName = fmt.Sprintf("ssdeep_%d.db", item.ID)
 		}
 		localPath := filepath.Join(downloadsDir, fileName)
-		if err := r.API.DownloadFile(item.Path, localPath); err != nil {
+		_ = r.History.Append("download.progress", fmt.Sprintf("Ssdeep %d/%d: %s", idx+1, totalFiles, fileName), map[string]any{
+			"phase": "ssdeep", "file_index": idx + 1, "file_total": totalFiles,
+		})
+		if err := r.API.DownloadFileWithProgress(item.Path, localPath, "ssdeep", idx+1, totalFiles); err != nil {
 			_ = r.History.Append("ssdeep.error", fmt.Sprintf("download %s: %s", fileName, err.Error()), nil)
 			continue
 		}

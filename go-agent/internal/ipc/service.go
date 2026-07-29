@@ -19,6 +19,7 @@ type Service interface {
 	TestConnection() bool
 	ScanRuntime() *runtime.ScanRuntime
 	PushSettingsToServer()
+	SyncThreatIntel() (rulesN, ssdeepN int, err error)
 	RulesInfo() RulesInfoResponse
 	QuarantineList() []QuarantineItem
 }

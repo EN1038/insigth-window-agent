@@ -11,6 +11,7 @@ import (
 	"github.com/sosecure/insite-agent/internal/api"
 	"github.com/sosecure/insite-agent/internal/config"
 	"github.com/sosecure/insite-agent/internal/history"
+	"github.com/sosecure/insite-agent/internal/keystore"
 	"github.com/sosecure/insite-agent/internal/rules"
 	"github.com/sosecure/insite-agent/internal/settings"
 	"github.com/sosecure/insite-agent/internal/snapshot"
@@ -50,9 +51,10 @@ type Runner struct {
 func New(baseDir string, cfg *config.AgentConfig, st *settings.Store, snap *snapshot.Store, ruleStore *rules.Store, h *history.Store) *Runner {
 	var cli *api.Client
 	if cfg != nil {
+		keystore.SetActiveSiteKey(cfg.SiteKey)
 		cli = api.New(cfg)
 	}
-	return &Runner{
+	r := &Runner{
 		BaseDir:     baseDir,
 		Config:      cfg,
 		Settings:    st,
@@ -62,6 +64,22 @@ func New(baseDir string, cfg *config.AgentConfig, st *settings.Store, snap *snap
 		History:     h,
 		configReady: make(chan struct{}, 1),
 	}
+	if cli != nil {
+		cli.SetProgressFunc(func(p api.Progress) {
+			msg := p.Message
+			if msg == "" {
+				msg = p.Phase
+			}
+			if p.Percent > 0 {
+				msg = fmt.Sprintf("%s (%.0f%%)", msg, p.Percent)
+			}
+			_ = r.History.Append("download.progress", msg, map[string]any{
+				"phase": p.Phase, "file_index": p.FileIndex, "file_total": p.FileTotal,
+				"bytes_read": p.BytesRead, "bytes_total": p.BytesTotal, "percent": p.Percent,
+			})
+		})
+	}
+	return r
 }
 
 func (r *Runner) Run(ctx context.Context) error {
@@ -372,6 +390,34 @@ func (r *Runner) runPostApproval() {
 	}
 }
 
+// SyncThreatIntel pulls config + rules + ssdeep from Center immediately (UI Sync now).
+func (r *Runner) SyncThreatIntel() (rulesN, ssdeepN int, err error) {
+	if r.API == nil {
+		return 0, 0, fmt.Errorf("not connected")
+	}
+	_ = r.History.Append("download.progress", "Syncing threat intelligence…", map[string]any{"phase": "sync", "percent": 0})
+	_ = r.syncConfigFromServer()
+	r.mu.Lock()
+	fallback := append(json.RawMessage(nil), r.lastApprovalRaw...)
+	r.mu.Unlock()
+	rulesN = r.syncRulesFromServer(fallback)
+	ssdeepN = r.syncSsdeepFromServer()
+	if rulesN > 0 {
+		r.Settings.Set(keyLastRulesSync, time.Now().Format(time.RFC3339))
+		if r.Scan != nil {
+			r.Scan.RefreshRules()
+		}
+	}
+	if ssdeepN > 0 {
+		r.Settings.Set(keyLastSsdeepSync, time.Now().Format(time.RFC3339))
+	}
+	_ = r.Settings.Save()
+	_ = r.History.Append("download.progress", fmt.Sprintf("Sync done (rules=%d ssdeep=%d)", rulesN, ssdeepN), map[string]any{
+		"phase": "sync", "percent": 100, "rules": rulesN, "ssdeep": ssdeepN,
+	})
+	return rulesN, ssdeepN, nil
+}
+
 func (r *Runner) configSyncLoop(ctx context.Context) {
 	t := time.NewTicker(30 * time.Minute)
 	defer t.Stop()
@@ -453,7 +499,8 @@ func parseApprovedAgentID(data json.RawMessage) (approved bool, agentID int64) {
 	}
 	agentRaw, ok := root["agent"]
 	if !ok {
-		return false, 0
+		// Pending responses often return the agent row at the top level.
+		agentRaw = data
 	}
 	var agent struct {
 		ID     int64 `json:"id"`
@@ -478,8 +525,27 @@ func (r *Runner) ReloadConfig(cfg *config.AgentConfig) {
 	r.mu.Lock()
 	r.Config = cfg
 	if cfg != nil {
+		keystore.SetActiveSiteKey(cfg.SiteKey)
 		r.API = api.New(cfg)
+		r.API.SetProgressFunc(func(p api.Progress) {
+			msg := p.Message
+			if msg == "" {
+				msg = p.Phase
+			}
+			if p.Percent > 0 {
+				msg = fmt.Sprintf("%s (%.0f%%)", msg, p.Percent)
+			}
+			_ = r.History.Append("download.progress", msg, map[string]any{
+				"phase":      p.Phase,
+				"file_index": p.FileIndex,
+				"file_total": p.FileTotal,
+				"bytes_read": p.BytesRead,
+				"bytes_total": p.BytesTotal,
+				"percent":    p.Percent,
+			})
+		})
 	} else {
+		keystore.SetActiveSiteKey("")
 		r.API = nil
 	}
 	runCtx := r.runCtx

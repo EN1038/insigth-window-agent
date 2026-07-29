@@ -13,6 +13,7 @@ import (
 	"github.com/sosecure/insite-agent/internal/history"
 	"github.com/sosecure/insite-agent/internal/install"
 	"github.com/sosecure/insite-agent/internal/ipc"
+	"github.com/sosecure/insite-agent/internal/keystore"
 	"github.com/sosecure/insite-agent/internal/rules"
 	"github.com/sosecure/insite-agent/internal/runtime"
 	"github.com/sosecure/insite-agent/internal/settings"
@@ -80,7 +81,18 @@ func NewHost(baseDir string) (*Host, error) {
 	cfg, _ := config.Load(baseDir)
 	var apiClient *api.Client
 	if cfg != nil {
+		keystore.SetActiveSiteKey(cfg.SiteKey)
 		apiClient = api.New(cfg)
+		apiClient.SetProgressFunc(func(p api.Progress) {
+			msg := p.Message
+			if p.Percent > 0 {
+				msg = fmt.Sprintf("%s (%.0f%%)", msg, p.Percent)
+			}
+			_ = hist.Append("download.progress", msg, map[string]any{
+				"phase": p.Phase, "percent": p.Percent,
+				"file_index": p.FileIndex, "file_total": p.FileTotal,
+			})
+		})
 	}
 
 	runner := runtime.New(baseDir, cfg, st, snap, ruleStore, hist)
@@ -110,6 +122,7 @@ func (h *Host) ReloadConfig(cfg *config.AgentConfig) error {
 	h.mu.Lock()
 	h.Config = cfg
 	if cfg != nil {
+		keystore.SetActiveSiteKey(cfg.SiteKey)
 		h.API = api.New(cfg)
 	}
 	h.mu.Unlock()
@@ -211,6 +224,13 @@ func (h *Host) PushSettingsToServer() {
 		"config_updated_at":     configUpdatedAtUnix(h.Settings),
 	}
 	_, _, _ = apiClient.UpdateConfig(batch, rtp, usb, extra)
+}
+
+func (h *Host) SyncThreatIntel() (rulesN, ssdeepN int, err error) {
+	if h.Runner == nil {
+		return 0, 0, fmt.Errorf("runtime not ready")
+	}
+	return h.Runner.SyncThreatIntel()
 }
 
 func configUpdatedAtUnix(st *settings.Store) int64 {

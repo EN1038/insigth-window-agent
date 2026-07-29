@@ -71,7 +71,8 @@ func (r *Runner) downloadRules(items []ruleDownloadItem, agentID int64, useOffic
 	_ = os.MkdirAll(paths, 0o700)
 
 	count := 0
-	for _, item := range items {
+	total := len(items)
+	for idx, item := range items {
 		if item.Path == "" {
 			continue
 		}
@@ -85,7 +86,11 @@ func (r *Runner) downloadRules(items []ruleDownloadItem, agentID int64, useOffic
 		}
 		localZip := filepath.Join(paths, fileName)
 
-		if err := r.API.DownloadFile(item.Path, localZip); err != nil {
+		_ = r.History.Append("download.progress", fmt.Sprintf("Rules %d/%d: %s", idx+1, total, fileName), map[string]any{
+			"phase": "rules", "file_index": idx + 1, "file_total": total, "percent": float64(idx) * 100 / float64(max(total, 1)),
+		})
+
+		if err := r.API.DownloadFileWithProgress(item.Path, localZip, "rules", idx+1, total); err != nil {
 			_ = r.History.Append("rules.error", fmt.Sprintf("download %s: %s", fileName, err.Error()), nil)
 			continue
 		}
