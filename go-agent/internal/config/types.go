@@ -7,7 +7,7 @@ type AgentConfig struct {
 	SiteKey  string `json:"system_client_site_key"`
 	SiteName string `json:"system_client_site_name"`
 
-	// Center AES salts (site.ip_key / site.mac_address_key). Filled via getSiteCrypto.
+	// Optional site AES salts from API Client getSiteCrypto (Client→Center crypto uses these on the Client).
 	SiteIPKey  string `json:"system_client_site_ip_key,omitempty"`
 	SiteMacKey string `json:"system_client_site_mac_key,omitempty"`
 

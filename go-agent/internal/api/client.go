@@ -138,87 +138,15 @@ func (c *Client) reportProgress(p Progress) {
 func (c *Client) endpointURL(endpoint string) string {
 	base := strings.TrimRight(c.cfg.SiteIP, "/")
 	code := strings.Trim(c.cfg.SiteID, "/")
-	return base + "/api/v1/site_offline/" + code + "/agentCenter/" + endpoint
-}
-
-func (c *Client) ensureCryptoKeys() error {
-	if c.cfg == nil {
-		return fmt.Errorf("invalid config")
-	}
-	if strings.TrimSpace(c.cfg.SiteIPKey) != "" && strings.TrimSpace(c.cfg.SiteMacKey) != "" {
-		return nil
-	}
-	return c.fetchSiteCrypto()
-}
-
-func (c *Client) fetchSiteCrypto() error {
-	if c.cfg == nil || c.cfg.SiteIP == "" || c.cfg.SiteID == "" || c.cfg.SiteKey == "" {
-		return fmt.Errorf("invalid config")
-	}
-	body := map[string]any{"mode": "site_offline"}
-	b, err := json.Marshal(body)
-	if err != nil {
-		return err
-	}
-	req, err := http.NewRequest("POST", c.endpointURL("getSiteCrypto"), bytes.NewReader(b))
-	if err != nil {
-		return err
-	}
-	req.Header.Set("Content-Type", "application/json")
-	req.Header.Set("Accept", "application/json")
-	req.Header.Set("Authorization", "Bearer "+c.cfg.SiteKey)
-
-	resp, err := c.http.Do(req)
-	if err != nil {
-		return err
-	}
-	defer resp.Body.Close()
-	raw, _ := io.ReadAll(resp.Body)
-
-	var outer struct {
-		Error      string `json:"error"`
-		StatusCode int    `json:"status_code"`
-		Data       struct {
-			IPKey  string `json:"ip_key"`
-			MacKey string `json:"mac_address_key"`
-		} `json:"data"`
-	}
-	if err := json.Unmarshal(raw, &outer); err != nil {
-		return fmt.Errorf("getSiteCrypto decode: %w body=%s", err, string(raw))
-	}
-	if outer.StatusCode != 200 && outer.StatusCode != 0 {
-		return fmt.Errorf("getSiteCrypto status %d: %s", outer.StatusCode, outer.Error)
-	}
-	if strings.TrimSpace(outer.Data.IPKey) == "" || strings.TrimSpace(outer.Data.MacKey) == "" {
-		return fmt.Errorf("getSiteCrypto missing ip_key/mac_address_key")
-	}
-	c.cfg.SiteIPKey = outer.Data.IPKey
-	c.cfg.SiteMacKey = outer.Data.MacKey
-	_ = config.Save(config.DataBaseDir(), c.cfg)
-	return nil
+	// Agent talks to Site API Client, which proxies/encrypts toward Center.
+	return base + "/api/" + code + "/agentClient/" + endpoint
 }
 
 func (c *Client) postJSON(endpoint string, body any) (*Response, []byte, error) {
 	if c.cfg == nil || c.cfg.SiteIP == "" || c.cfg.SiteID == "" || c.cfg.SiteKey == "" {
 		return nil, nil, fmt.Errorf("invalid config")
 	}
-	if err := c.ensureCryptoKeys(); err != nil {
-		return nil, nil, fmt.Errorf("crypto keys: %w", err)
-	}
-
-	plain, err := json.Marshal(body)
-	if err != nil {
-		return nil, nil, err
-	}
-	enc, err := CenterEncrypt(string(plain), c.cfg.SiteKey, c.cfg.SiteIPKey, c.cfg.SiteMacKey)
-	if err != nil {
-		return nil, nil, err
-	}
-	wrapper := map[string]any{
-		"mode": "site_offline",
-		"data": enc,
-	}
-	b, err := json.Marshal(wrapper)
+	b, err := json.Marshal(body)
 	if err != nil {
 		return nil, nil, err
 	}
@@ -237,37 +165,9 @@ func (c *Client) postJSON(endpoint string, body any) (*Response, []byte, error) 
 	defer resp.Body.Close()
 	raw, _ := io.ReadAll(resp.Body)
 
-	var outer struct {
-		Error      string          `json:"error"`
-		StatusCode int             `json:"status_code"`
-		Data       json.RawMessage `json:"data"`
-	}
-	if err := json.Unmarshal(raw, &outer); err != nil {
+	var r Response
+	if err := json.Unmarshal(raw, &r); err != nil {
 		return nil, raw, fmt.Errorf("decode response: %w", err)
-	}
-
-	r := &Response{Error: outer.Error, StatusCode: outer.StatusCode}
-	dataField := strings.TrimSpace(string(outer.Data))
-	if len(outer.Data) > 0 && dataField != "null" && dataField != `""` && dataField != "[]" && dataField != "{}" {
-		// Encrypted string JSON value, or already an object (legacy).
-		var encStr string
-		if err := json.Unmarshal(outer.Data, &encStr); err == nil && encStr != "" {
-			dec, err := CenterDecrypt(encStr, c.cfg.SiteKey, c.cfg.SiteIPKey, c.cfg.SiteMacKey)
-			if err != nil {
-				return nil, raw, fmt.Errorf("decrypt response: %w", err)
-			}
-			var inner Response
-			if err := json.Unmarshal([]byte(dec), &inner); err != nil {
-				return nil, raw, fmt.Errorf("decode inner response: %w", err)
-			}
-			r = &inner
-		} else {
-			// Treat as plaintext inner payload (or already-decrypted object).
-			r.Data = outer.Data
-			if r.StatusCode == 0 {
-				r.StatusCode = 200
-			}
-		}
 	}
 	if r.Error == "" && r.StatusCode >= 400 {
 		r.Error = http.StatusText(r.StatusCode)
@@ -275,7 +175,7 @@ func (c *Client) postJSON(endpoint string, body any) (*Response, []byte, error) 
 	if r.StatusCode == 0 && resp.StatusCode == http.StatusOK {
 		r.StatusCode = 200
 	}
-	return r, raw, nil
+	return &r, raw, nil
 }
 
 func (c *Client) isOK(r *Response) bool {

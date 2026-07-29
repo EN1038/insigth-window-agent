@@ -8,13 +8,11 @@
 
 ## ข้อตกลงทั่วไป (เหมือน API เดิม)
 
-- **URL:** `POST {SiteIP}/api/v1/site_offline/{SiteID}/agentCenter/{endpoint}`
+- **URL (Agent → Site API Client):** `POST {SiteIP}/api/{SiteID}/agentClient/{endpoint}`
 - **Header:** `Authorization: Bearer {SiteKey}`, `Content-Type: application/json`
-- **Body:** `{ "mode": "site_offline", "data": "<AES ciphertext of JSON payload>" }`
-  - AES-256-CBC via Center `encrypt_decrypt` (`public_key` + `ip_key` + `mac_address_key`)
-  - Bootstrap: `getSiteCrypto` returns `ip_key` / `mac_address_key` (plaintext) so the agent can encrypt
-- **Response:** outer `{ error, status_code, data }` where `data` is encrypted inner `{ error, status_code, data }`
-- **Pack files:** prefer `downloadProtectedFile` (encrypted API) over public `/rule_files` / `/ssdeep_files` URLs
+- **Body:** plain JSON (Site Client encrypts when proxying to Center `agentCenter`)
+- **Response:** `{ error, status_code, data }` (already decrypted by Site Client when proxied from Center)
+- **Pack files:** prefer `downloadProtectedFile` when available; else Bearer GET on `/rule_files` / `/ssdeep_files`
 
 ---
 
