@@ -101,13 +101,22 @@ func (r *Router) showYaraRules() {
 	countVal := heading(fmtCount(info.Count), 22, colorPrimary)
 	updated := muted("Last updated: " + orDash(info.UpdatedAt))
 
-	sync := widget.NewButtonWithIcon("Sync rules from server", theme.DownloadIcon(), func() {
-		if err := r.client.SyncRules(r.ctx); err != nil {
-			dialog.ShowError(err, r.window)
-			return
-		}
-		dialog.ShowInformation("YARA rules", "Rule sync requested. The list will update after download completes.", r.window)
-	})
+	sync := widget.NewButtonWithIcon("Sync rules from server", theme.DownloadIcon(), nil)
+	sync.OnTapped = func() {
+		sync.Disable()
+		r.runThreatIntelSyncUI(func(err error, msg string) {
+			sync.Enable()
+			if err != nil {
+				dialog.ShowError(err, r.window)
+				return
+			}
+			r.showYaraRules()
+			if strings.TrimSpace(msg) == "" {
+				msg = "Rule sync finished."
+			}
+			dialog.ShowInformation("YARA rules", msg, r.window)
+		})
+	}
 	sync.Importance = widget.HighImportance
 
 	stats := container.NewGridWithColumns(2,

@@ -6,6 +6,7 @@ type StatusResponse struct {
 	HasConfig        bool    `json:"has_config"`
 	Approved         bool    `json:"approved"`
 	ThreatIntelReady bool    `json:"threat_intel_ready"`
+	SyncBusy         bool    `json:"sync_busy"`
 	DownloadPercent  float64 `json:"download_percent"`
 	DownloadMessage  string  `json:"download_message"`
 	LoggedIn         bool    `json:"logged_in"`

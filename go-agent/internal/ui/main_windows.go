@@ -521,13 +521,23 @@ func (r *Router) showSettings(setPage func(fyne.CanvasObject)) {
 	))
 
 	rulesVer := muted("Version " + orDash(st.RulesVersion))
-	syncBtn := widget.NewButtonWithIcon("Sync now", theme.DownloadIcon(), func() {
-		if err := r.client.SyncRules(r.ctx); err != nil {
-			dialog.ShowError(err, r.window)
-			return
-		}
-		dialog.ShowInformation("Threat intelligence", "Synced rules and ssdeep packs from server.", r.window)
-	})
+	syncBtn := widget.NewButtonWithIcon("Sync now", theme.DownloadIcon(), nil)
+	syncBtn.OnTapped = func() {
+		syncBtn.Disable()
+		r.runThreatIntelSyncUI(func(err error, msg string) {
+			syncBtn.Enable()
+			if err != nil {
+				dialog.ShowError(err, r.window)
+				return
+			}
+			// Reload settings page so Center values appear without leaving the page.
+			r.showSettings(setPage)
+			if strings.TrimSpace(msg) == "" {
+				msg = "Synced rules, ssdeep, and settings from server."
+			}
+			dialog.ShowInformation("Threat intelligence", msg, r.window)
+		})
+	}
 	rulesCard := card(container.NewVBox(
 		sectionHeaderImg(resIconYara, "Threat intelligence"),
 		vspace(4),
@@ -1136,6 +1146,73 @@ func drawRing(w, h int, frac float64) image.Image {
 		}
 	}
 	return imgOut
+}
+
+// runThreatIntelSyncUI starts an async server sync and shows a progress dialog
+// until the service reports sync_busy=false.
+func (r *Router) runThreatIntelSyncUI(onDone func(err error, msg string)) {
+	msg := canvasMuted("Starting sync…", colorMuted)
+	bar := widget.NewProgressBar()
+	bar.Min = 0
+	bar.Max = 100
+	bar.SetValue(0)
+	body := container.NewVBox(msg, vspace(10), bar)
+	d := dialog.NewCustomWithoutButtons("Syncing threat intelligence", container.NewPadded(body), r.window)
+	d.Resize(fyne.NewSize(440, 150))
+	d.Show()
+
+	if err := r.client.SyncRules(r.ctx); err != nil {
+		d.Hide()
+		onDone(err, "")
+		return
+	}
+
+	go func() {
+		seenBusy := false
+		deadline := time.Now().Add(45 * time.Minute)
+		var lastMsg string
+		for time.Now().Before(deadline) {
+			st, err := r.client.Status(r.ctx)
+			if err == nil {
+				lastMsg = strings.TrimSpace(st.DownloadMessage)
+				pct := st.DownloadPercent
+				busy := st.SyncBusy
+				fyne.Do(func() {
+					bar.SetValue(pct)
+					if lastMsg != "" {
+						msg.Text = lastMsg
+						msg.Refresh()
+					}
+				})
+				if busy {
+					seenBusy = true
+				}
+				done := (seenBusy && !busy) ||
+					(!busy && strings.Contains(strings.ToLower(lastMsg), "sync done")) ||
+					(!busy && strings.Contains(strings.ToLower(lastMsg), "sync failed"))
+				if done {
+					failed := strings.Contains(strings.ToLower(lastMsg), "sync failed")
+					fyne.Do(func() {
+						if !failed {
+							bar.SetValue(100)
+						}
+						d.Hide()
+						if failed {
+							onDone(fmt.Errorf("%s", lastMsg), lastMsg)
+							return
+						}
+						onDone(nil, lastMsg)
+					})
+					return
+				}
+			}
+			time.Sleep(400 * time.Millisecond)
+		}
+		fyne.Do(func() {
+			d.Hide()
+			onDone(fmt.Errorf("sync timed out"), lastMsg)
+		})
+	}()
 }
 
 var _ = fmt.Sprintf

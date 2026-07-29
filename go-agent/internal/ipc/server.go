@@ -78,6 +78,7 @@ func (s *Server) handleStatus(w http.ResponseWriter, r *http.Request) {
 		HasConfig:        s.svc.GetConfig() != nil,
 		Approved:         st.GetBool("approved"),
 		ThreatIntelReady: st.GetBool(settings.KeyTIBootstrapDone),
+		SyncBusy:         st.GetBool(settings.KeyTISyncBusy),
 		DownloadMessage:  st.Get(settings.KeyTIDownloadMessage, ""),
 		LoggedIn:         s.svc.IsLoggedIn(),
 		Online:           false, // use POST /v1/connection/test for server reachability (avoid blocking status)
@@ -262,18 +263,42 @@ func (s *Server) handleRulesSync(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
 		return
 	}
-	rulesN, ssdeepN, err := s.svc.SyncThreatIntel()
-	if err != nil {
-		writeJSON(w, OKResponse{OK: false, Message: err.Error()})
+	st := s.svc.GetSettings()
+	if st != nil && st.GetBool(settings.KeyTISyncBusy) {
+		writeJSON(w, OKResponse{OK: true, Message: "Sync already in progress"})
 		return
 	}
-	if sr := s.svc.ScanRuntime(); sr != nil {
-		sr.RefreshRules()
+	if st != nil {
+		st.Set(settings.KeyTISyncBusy, "true")
+		st.Set(settings.KeyTIDownloadPercent, "0")
+		st.Set(settings.KeyTIDownloadMessage, "Starting sync…")
+		_ = st.Save()
 	}
-	writeJSON(w, OKResponse{
-		OK:      true,
-		Message: fmt.Sprintf("Synced from server (rules=%d ssdeep packs=%d)", rulesN, ssdeepN),
-	})
+	go func() {
+		defer func() {
+			if st := s.svc.GetSettings(); st != nil {
+				st.Set(settings.KeyTISyncBusy, "false")
+				_ = st.Save()
+			}
+		}()
+		rulesN, ssdeepN, err := s.svc.SyncThreatIntel()
+		if err != nil {
+			if st := s.svc.GetSettings(); st != nil {
+				st.Set(settings.KeyTIDownloadMessage, "Sync failed: "+err.Error())
+				_ = st.Save()
+			}
+			return
+		}
+		if sr := s.svc.ScanRuntime(); sr != nil {
+			sr.RefreshRules()
+		}
+		if st := s.svc.GetSettings(); st != nil {
+			st.Set(settings.KeyTIDownloadPercent, "100")
+			st.Set(settings.KeyTIDownloadMessage, fmt.Sprintf("Sync done (rules=%d ssdeep=%d)", rulesN, ssdeepN))
+			_ = st.Save()
+		}
+	}()
+	writeJSON(w, OKResponse{OK: true, Message: "Sync started"})
 }
 
 func (s *Server) handleRulesInfo(w http.ResponseWriter, r *http.Request) {

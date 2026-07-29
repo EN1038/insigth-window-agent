@@ -46,6 +46,7 @@ const (
 	KeyTIBootstrapDone = "ti_bootstrap_done"
 	KeyTIDownloadPercent = "ti_download_percent"
 	KeyTIDownloadMessage = "ti_download_message"
+	KeyTISyncBusy = "ti_sync_busy"
 )
 
 // DefaultScanExtensions is the baseline on-demand / realtime file filter.
@@ -116,6 +117,7 @@ func (s *Store) setDefaults() {
 	def(KeyTIBootstrapDone, "false")
 	def(KeyTIDownloadPercent, "0")
 	def(KeyTIDownloadMessage, "")
+	def(KeyTISyncBusy, "false")
 }
 
 func (s *Store) Load() error {
