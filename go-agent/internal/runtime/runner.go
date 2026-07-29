@@ -319,12 +319,92 @@ func (r *Runner) startPostApproval(ctx context.Context) {
 	r.mu.Unlock()
 
 	if !standalone {
-		go r.postApprovalLoop(ctx)
-		go r.configSyncLoop(ctx)
-		go r.rulesSyncLoop(ctx)
-		go r.ssdeepSyncLoop(ctx)
+		go func() {
+			if r.Settings == nil || !r.Settings.GetBool(settings.KeyTIBootstrapDone) {
+				r.runThreatIntelBootstrap(ctx)
+			}
+			go r.postApprovalLoop(ctx)
+			go r.configSyncLoop(ctx)
+			go r.rulesSyncLoop(ctx)
+			go r.ssdeepSyncLoop(ctx)
+		}()
+	} else if r.Settings != nil {
+		r.Settings.Set(settings.KeyTIBootstrapDone, "true")
+		_ = r.Settings.Save()
 	}
 	r.startScanSubsystem(ctx)
+}
+
+func (r *Runner) setTIProgress(percent float64, msg string) {
+	if r.Settings == nil {
+		return
+	}
+	if percent < 0 {
+		percent = 0
+	}
+	if percent > 100 {
+		percent = 100
+	}
+	r.Settings.Set(settings.KeyTIDownloadPercent, fmt.Sprintf("%.0f", percent))
+	r.Settings.Set(settings.KeyTIDownloadMessage, msg)
+	_ = r.Settings.Save()
+	_ = r.History.Append("download.progress", msg, map[string]any{
+		"phase": "bootstrap", "percent": percent,
+	})
+}
+
+// runThreatIntelBootstrap downloads rules + ssdeep after approval and retries until
+// every listed file succeeds (or the server lists are empty). UI stays on the loading
+// screen until KeyTIBootstrapDone is true.
+func (r *Runner) runThreatIntelBootstrap(ctx context.Context) {
+	if r.Settings != nil {
+		r.Settings.Set(settings.KeyTIBootstrapDone, "false")
+		_ = r.Settings.Save()
+	}
+	r.setTIProgress(0, "Preparing threat intelligence download…")
+
+	attempt := 0
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		default:
+		}
+		attempt++
+		r.setTIProgress(2, fmt.Sprintf("Downloading threat packs (attempt %d)…", attempt))
+
+		_ = r.syncConfigFromServer()
+
+		r.mu.Lock()
+		fallback := append(json.RawMessage(nil), r.lastApprovalRaw...)
+		r.mu.Unlock()
+
+		rulesDone := r.syncRulesFromServerComplete(fallback)
+		ssdeepDone := r.syncSsdeepFromServerComplete()
+		if rulesDone && ssdeepDone {
+			r.Settings.Set(keyLastRulesSync, time.Now().Format(time.RFC3339))
+			r.Settings.Set(keyLastSsdeepSync, time.Now().Format(time.RFC3339))
+			r.Settings.Set(settings.KeyTIBootstrapDone, "true")
+			r.Settings.Set(settings.KeyTIDownloadPercent, "100")
+			r.Settings.Set(settings.KeyTIDownloadMessage, "Threat intelligence ready")
+			_ = r.Settings.Save()
+			_ = r.History.Append("download.progress", "Threat intelligence download complete", map[string]any{
+				"phase": "bootstrap", "percent": 100,
+			})
+			if r.Scan != nil {
+				r.Scan.RefreshRules()
+				r.Scan.RefreshSsdeep()
+			}
+			return
+		}
+
+		r.setTIProgress(5, "Some packs failed — retrying in 10s…")
+		select {
+		case <-ctx.Done():
+			return
+		case <-time.After(10 * time.Second):
+		}
+	}
 }
 
 func (r *Runner) standaloneMode() bool {
@@ -349,7 +429,7 @@ func (r *Runner) startScanSubsystem(ctx context.Context) {
 }
 
 func (r *Runner) postApprovalLoop(ctx context.Context) {
-	r.runPostApproval()
+	// Initial bootstrap already ran; periodic refresh only.
 	t := time.NewTicker(6 * time.Hour)
 	defer t.Stop()
 	for {
@@ -411,6 +491,10 @@ func (r *Runner) SyncThreatIntel() (rulesN, ssdeepN int, err error) {
 	if ssdeepN > 0 {
 		r.Settings.Set(keyLastSsdeepSync, time.Now().Format(time.RFC3339))
 	}
+	_ = r.Settings.Save()
+	r.Settings.Set(settings.KeyTIBootstrapDone, "true")
+	r.Settings.Set(settings.KeyTIDownloadPercent, "100")
+	r.Settings.Set(settings.KeyTIDownloadMessage, fmt.Sprintf("Sync done (rules=%d ssdeep=%d)", rulesN, ssdeepN))
 	_ = r.Settings.Save()
 	_ = r.History.Append("download.progress", fmt.Sprintf("Sync done (rules=%d ssdeep=%d)", rulesN, ssdeepN), map[string]any{
 		"phase": "sync", "percent": 100, "rules": rulesN, "ssdeep": ssdeepN,
@@ -555,8 +639,15 @@ func (r *Runner) ReloadConfig(cfg *config.AgentConfig) {
 		r.Settings.Set(keyDataInfoSent, "false")
 		r.Settings.Set(keyApproved, "false")
 		r.Settings.Set("agent_id", "")
+		r.Settings.Set(settings.KeyTIBootstrapDone, "false")
+		r.Settings.Set(settings.KeyTIDownloadPercent, "0")
+		r.Settings.Set(settings.KeyTIDownloadMessage, "")
 		_ = r.Settings.Save()
 	}
+
+	r.mu.Lock()
+	r.postApprovalStarted = false
+	r.mu.Unlock()
 
 	select {
 	case r.configReady <- struct{}{}:

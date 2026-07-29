@@ -52,8 +52,21 @@ func (r *Runner) ssdeepSyncLoop(ctx context.Context) {
 }
 
 func (r *Runner) syncSsdeepFromServer() int {
+	ok, n, _ := r.syncSsdeepFromServerResult()
+	if ok {
+		return n
+	}
+	return 0
+}
+
+func (r *Runner) syncSsdeepFromServerComplete() bool {
+	ok, _, _ := r.syncSsdeepFromServerResult()
+	return ok
+}
+
+func (r *Runner) syncSsdeepFromServerResult() (complete bool, imported int, failed int) {
 	if r.API == nil {
-		return 0
+		return false, 0, 1
 	}
 	currentVersion := strings.TrimSpace(r.Settings.Get(settings.KeySsdeepDBVersion, ""))
 	if resp, raw, err := r.API.GetSsdeep(currentVersion); err != nil {
@@ -67,26 +80,27 @@ func (r *Runner) syncSsdeepFromServer() int {
 	resp, raw, err := r.API.DownloadSsdeepSite(currentVersion)
 	if err != nil {
 		_ = r.History.Append("api.warn", "downloadSsdeepSite: "+err.Error(), nil)
-		return 0
+		return false, 0, 1
 	}
 	if resp.StatusCode != 200 {
 		_ = r.History.Append("api.warn", fmt.Sprintf("downloadSsdeepSite status=%d body=%s", resp.StatusCode, compact(raw)), nil)
-		return 0
+		return false, 0, 1
 	}
 	items := parseSsdeepDownloadItems(resp.Data)
 	if len(items) == 0 {
 		_ = r.History.Append("ssdeep.skip", "no ssdeep updates available", nil)
-		return 0
+		r.setTIProgress(95, "No ssdeep packs to download")
+		return true, 0, 0
 	}
-	return r.downloadSsdeep(items, r.agentID())
+	imported, failed = r.downloadSsdeep(items, r.agentID())
+	return failed == 0, imported, failed
 }
 
-func (r *Runner) downloadSsdeep(items []ssdeepDownloadItem, agentID int64) int {
+func (r *Runner) downloadSsdeep(items []ssdeepDownloadItem, agentID int64) (imported int, failed int) {
 	store := ssdeepscan.NewStore(r.BaseDir)
 	downloadsDir := filepath.Join(r.BaseDir, "Data", "ssdeep", "downloads")
 	_ = os.MkdirAll(downloadsDir, 0o700)
 
-	count := 0
 	totalFiles := len(items)
 	for idx, item := range items {
 		if strings.TrimSpace(item.Path) == "" {
@@ -100,11 +114,15 @@ func (r *Runner) downloadSsdeep(items []ssdeepDownloadItem, agentID int64) int {
 			fileName = fmt.Sprintf("ssdeep_%d.db", item.ID)
 		}
 		localPath := filepath.Join(downloadsDir, fileName)
-		_ = r.History.Append("download.progress", fmt.Sprintf("Ssdeep %d/%d: %s", idx+1, totalFiles, fileName), map[string]any{
-			"phase": "ssdeep", "file_index": idx + 1, "file_total": totalFiles,
+		pct := 50 + float64(idx)*45/float64(max(totalFiles, 1))
+		msg := fmt.Sprintf("Ssdeep %d/%d: %s", idx+1, totalFiles, fileName)
+		r.setTIProgress(pct, msg)
+		_ = r.History.Append("download.progress", msg, map[string]any{
+			"phase": "ssdeep", "file_index": idx + 1, "file_total": totalFiles, "percent": pct,
 		})
 		if err := r.API.DownloadFileWithProgress(item.Path, localPath, "ssdeep", idx+1, totalFiles); err != nil {
 			_ = r.History.Append("ssdeep.error", fmt.Sprintf("download %s: %s", fileName, err.Error()), nil)
+			failed++
 			continue
 		}
 
@@ -112,6 +130,7 @@ func (r *Runner) downloadSsdeep(items []ssdeepDownloadItem, agentID int64) int {
 		if err != nil {
 			_ = r.History.Append("ssdeep.error", fmt.Sprintf("prepare %s: %s", fileName, err.Error()), nil)
 			_ = os.Remove(localPath)
+			failed++
 			continue
 		}
 		total, err := importSsdeepFile(store, importPath)
@@ -121,6 +140,7 @@ func (r *Runner) downloadSsdeep(items []ssdeepDownloadItem, agentID int64) int {
 		_ = os.Remove(localPath)
 		if err != nil {
 			_ = r.History.Append("ssdeep.error", fmt.Sprintf("import %s: %s", fileName, err.Error()), nil)
+			failed++
 			continue
 		}
 
@@ -145,16 +165,16 @@ func (r *Runner) downloadSsdeep(items []ssdeepDownloadItem, agentID int64) int {
 				_ = r.History.Append("api.warn", fmt.Sprintf("updateSsdeepDownload(%d) status=%d", item.ID, resp.StatusCode), nil)
 			}
 		}
-		count++
+		imported++
 		_ = r.History.Append("ssdeep.ok", fmt.Sprintf("imported %s (%d signatures, v=%s)", fileName, total, item.Version), map[string]any{
 			"ssdeep_id": item.ID,
 			"count":     total,
 		})
 	}
-	if count > 0 && r.Scan != nil {
+	if imported > 0 && r.Scan != nil {
 		r.Scan.RefreshSsdeep()
 	}
-	return count
+	return imported, failed
 }
 
 func parseSsdeepMetaVersion(data json.RawMessage) string {

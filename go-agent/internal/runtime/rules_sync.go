@@ -36,6 +36,21 @@ func (r *Runner) syncConfigFromServer() error {
 }
 
 func (r *Runner) syncRulesFromServer(fallbackRaw json.RawMessage) int {
+	ok, n, _ := r.syncRulesFromServerResult(fallbackRaw)
+	if ok {
+		return n
+	}
+	return 0
+}
+
+// syncRulesFromServerComplete returns true when listing succeeded and every file downloaded
+// (or there was nothing to download).
+func (r *Runner) syncRulesFromServerComplete(fallbackRaw json.RawMessage) bool {
+	ok, _, _ := r.syncRulesFromServerResult(fallbackRaw)
+	return ok
+}
+
+func (r *Runner) syncRulesFromServerResult(fallbackRaw json.RawMessage) (complete bool, imported int, failed int) {
 	agentID := r.agentID()
 
 	_, _, _ = r.API.GetRule()
@@ -43,34 +58,42 @@ func (r *Runner) syncRulesFromServer(fallbackRaw json.RawMessage) int {
 	resp, raw, err := r.API.DownloadRuleSite()
 	useOfficial := false
 	var items []ruleDownloadItem
+	listOK := false
 
 	if err == nil && resp.StatusCode == 200 {
 		items = parseRuleDownloadItems(resp.Data)
 		useOfficial = len(items) > 0
+		listOK = true
 	}
 	if len(items) == 0 {
 		items = parseRuleDownloadItems(fallbackRaw)
 		useOfficial = false
 		if len(items) == 0 {
-			_ = r.History.Append("rules.skip", "no rules available to sync", nil)
-			return 0
+			if listOK {
+				_ = r.History.Append("rules.skip", "no rules available to sync", nil)
+				r.setTIProgress(45, "No rule packs to download")
+				return true, 0, 0
+			}
+			if err != nil {
+				_ = r.History.Append("api.warn", "downloadRuleSite: "+err.Error(), nil)
+			} else if resp != nil {
+				_ = r.History.Append("api.warn", fmt.Sprintf("downloadRuleSite status=%d body=%s", resp.StatusCode, compact(raw)), nil)
+			}
+			return false, 0, 1
 		}
 		_ = r.History.Append("rules.fallback", "using approval/fallback rules JSON", nil)
-	} else if err != nil {
-		_ = r.History.Append("api.warn", "downloadRuleSite: "+err.Error(), nil)
-	} else if resp.StatusCode != 200 {
-		_ = r.History.Append("api.warn", fmt.Sprintf("downloadRuleSite status=%d body=%s", resp.StatusCode, compact(raw)), nil)
+		listOK = true
 	}
 
-	return r.downloadRules(items, agentID, useOfficial)
+	imported, failed = r.downloadRules(items, agentID, useOfficial)
+	return failed == 0, imported, failed
 }
 
-func (r *Runner) downloadRules(items []ruleDownloadItem, agentID int64, useOfficialComplete bool) int {
+func (r *Runner) downloadRules(items []ruleDownloadItem, agentID int64, useOfficialComplete bool) (imported int, failed int) {
 	store := rules.New(r.BaseDir)
 	paths := filepath.Join(r.BaseDir, "Data", "rules", "downloads")
 	_ = os.MkdirAll(paths, 0o700)
 
-	count := 0
 	total := len(items)
 	for idx, item := range items {
 		if item.Path == "" {
@@ -86,12 +109,16 @@ func (r *Runner) downloadRules(items []ruleDownloadItem, agentID int64, useOffic
 		}
 		localZip := filepath.Join(paths, fileName)
 
-		_ = r.History.Append("download.progress", fmt.Sprintf("Rules %d/%d: %s", idx+1, total, fileName), map[string]any{
-			"phase": "rules", "file_index": idx + 1, "file_total": total, "percent": float64(idx) * 100 / float64(max(total, 1)),
+		pct := 5 + float64(idx)*40/float64(max(total, 1))
+		msg := fmt.Sprintf("Rules %d/%d: %s", idx+1, total, fileName)
+		r.setTIProgress(pct, msg)
+		_ = r.History.Append("download.progress", msg, map[string]any{
+			"phase": "rules", "file_index": idx + 1, "file_total": total, "percent": pct,
 		})
 
 		if err := r.API.DownloadFileWithProgress(item.Path, localZip, "rules", idx+1, total); err != nil {
 			_ = r.History.Append("rules.error", fmt.Sprintf("download %s: %s", fileName, err.Error()), nil)
+			failed++
 			continue
 		}
 
@@ -99,6 +126,7 @@ func (r *Runner) downloadRules(items []ruleDownloadItem, agentID int64, useOffic
 		if err != nil {
 			_ = r.History.Append("rules.error", fmt.Sprintf("import %s: %s", fileName, err.Error()), nil)
 			_ = os.Remove(localZip)
+			failed++
 			continue
 		}
 
@@ -127,16 +155,19 @@ func (r *Runner) downloadRules(items []ruleDownloadItem, agentID int64, useOffic
 		}
 
 		_ = os.Remove(localZip)
-		count++
+		imported++
 		_ = r.History.Append("rules.ok", fmt.Sprintf("imported %s (%d files, v=%s)", fileName, ruleCount, version), map[string]any{
 			"rule_id": item.ID,
 			"count":   ruleCount,
 		})
 	}
-	if count > 0 && r.Scan != nil {
+	if imported > 0 && r.Scan != nil {
 		r.Scan.RefreshRules()
 	}
-	return count
+	if total > 0 {
+		r.setTIProgress(50, fmt.Sprintf("Rules done (%d ok, %d failed)", imported, failed))
+	}
+	return imported, failed
 }
 
 func parseRuleDownloadItems(data json.RawMessage) []ruleDownloadItem {

@@ -169,6 +169,8 @@ func (r *Router) showFlow() {
 		r.showConfig()
 	case !st.Approved:
 		r.showApproval()
+	case !st.ThreatIntelReady:
+		r.showTIDownload()
 	case !st.LoggedIn:
 		r.showLogin()
 	default:
@@ -462,9 +464,9 @@ func (r *Router) showApproval() {
 		}
 		if st.Approved {
 			fyne.Do(func() {
-				statusText.Text = "Approved! Continuing…"
+				statusText.Text = "Approved! Downloading threat packs…"
 				statusText.Refresh()
-				r.showLogin()
+				r.showTIDownload()
 			})
 			return true
 		}
@@ -488,6 +490,103 @@ func (r *Router) showApproval() {
 				events := refreshLogs()
 				updateApprovalStatus(events)
 			case <-approveTick.C:
+				if check() {
+					return
+				}
+			}
+		}
+	}()
+}
+
+// showTIDownload waits until rules + ssdeep bootstrap finishes, then opens login.
+func (r *Router) showTIDownload() {
+	r.stopTicker()
+	r.window.Resize(fyne.NewSize(800, 480))
+
+	spinner := widget.NewActivity()
+	spinner.Start()
+
+	statusText := heading("Downloading threat intelligence…", 16, colorText)
+	sub := canvasMuted("Rules and ssdeep packs must finish before login.", colorMuted)
+	bar := widget.NewProgressBar()
+	bar.Min = 0
+	bar.Max = 100
+	bar.SetValue(0)
+	pctLabel := canvasMuted("0%", colorMuted)
+
+	logPanel, refreshLogs := newApprovalLogPanel(r, 12)
+
+	form := container.NewVBox(
+		img(resLogoFull, 220, 66),
+		vspace(16),
+		container.NewHBox(container.New(&fixedSize{w: 56, h: 56}, spinner)),
+		vspace(12),
+		statusText,
+		vspace(6),
+		sub,
+		vspace(10),
+		bar,
+		container.NewCenter(pctLabel),
+		vspace(10),
+		logPanel,
+	)
+	r.window.SetContent(r.authScreen(form, false))
+	_ = refreshLogs()
+
+	stop := make(chan struct{})
+	r.stopRefresh = stop
+	check := func() bool {
+		st, err := r.client.Status(r.ctx)
+		if err != nil {
+			return false
+		}
+		if !st.HasConfig {
+			fyne.Do(func() { r.showConfig() })
+			return true
+		}
+		if !st.Approved {
+			fyne.Do(func() { r.showApproval() })
+			return true
+		}
+		fyne.Do(func() {
+			bar.SetValue(st.DownloadPercent)
+			pctLabel.Text = fmt.Sprintf("%.0f%%", st.DownloadPercent)
+			pctLabel.Refresh()
+			if msg := strings.TrimSpace(st.DownloadMessage); msg != "" {
+				sub.Text = msg
+				sub.Refresh()
+			}
+		})
+		if st.ThreatIntelReady {
+			fyne.Do(func() {
+				statusText.Text = "Download complete"
+				statusText.Refresh()
+				sub.Text = "Continuing to login…"
+				sub.Refresh()
+				bar.SetValue(100)
+				r.showLogin()
+			})
+			return true
+		}
+		return false
+	}
+	go func() {
+		if check() {
+			return
+		}
+		logTick := time.NewTicker(2 * time.Second)
+		statusTick := time.NewTicker(1 * time.Second)
+		defer logTick.Stop()
+		defer statusTick.Stop()
+		for {
+			select {
+			case <-r.ctx.Done():
+				return
+			case <-stop:
+				return
+			case <-logTick.C:
+				refreshLogs()
+			case <-statusTick.C:
 				if check() {
 					return
 				}

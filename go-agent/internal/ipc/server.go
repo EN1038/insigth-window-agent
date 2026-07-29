@@ -75,11 +75,16 @@ func (s *Server) handleStatus(w http.ResponseWriter, r *http.Request) {
 	}
 	st := s.svc.GetSettings()
 	resp := StatusResponse{
-		HasConfig: s.svc.GetConfig() != nil,
-		Approved:  st.GetBool("approved"),
-		LoggedIn:  s.svc.IsLoggedIn(),
-		Online:    false, // use POST /v1/connection/test for server reachability (avoid blocking status)
-		AgentID:   st.Get("agent_id", ""),
+		HasConfig:        s.svc.GetConfig() != nil,
+		Approved:         st.GetBool("approved"),
+		ThreatIntelReady: st.GetBool(settings.KeyTIBootstrapDone),
+		DownloadMessage:  st.Get(settings.KeyTIDownloadMessage, ""),
+		LoggedIn:         s.svc.IsLoggedIn(),
+		Online:           false, // use POST /v1/connection/test for server reachability (avoid blocking status)
+		AgentID:          st.Get("agent_id", ""),
+	}
+	if p := strings.TrimSpace(st.Get(settings.KeyTIDownloadPercent, "0")); p != "" {
+		fmt.Sscanf(p, "%f", &resp.DownloadPercent)
 	}
 	if sr := s.svc.ScanRuntime(); sr != nil && sr.Manager != nil {
 		resp.Scanning = sr.Manager.IsScanning()

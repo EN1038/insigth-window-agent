@@ -41,6 +41,11 @@ const (
 	KeyStandaloneScan = "standalone_scan"
 	// ConfigUpdatedAt is unix seconds (UTC) for last-write-wins vs Center Control Agent.
 	KeyConfigUpdatedAt = "config_updated_at"
+	// TIBootstrapDone is set after the first post-approval rules+ssdeep download finishes
+	// with no remaining failed files (empty server lists count as done).
+	KeyTIBootstrapDone = "ti_bootstrap_done"
+	KeyTIDownloadPercent = "ti_download_percent"
+	KeyTIDownloadMessage = "ti_download_message"
 )
 
 // DefaultScanExtensions is the baseline on-demand / realtime file filter.
@@ -108,6 +113,9 @@ func (s *Store) setDefaults() {
 	def(KeyAuthorizedServiceStop, "false")
 	def(KeyStandaloneScan, "false")
 	def(KeyConfigUpdatedAt, "0")
+	def(KeyTIBootstrapDone, "false")
+	def(KeyTIDownloadPercent, "0")
+	def(KeyTIDownloadMessage, "")
 }
 
 func (s *Store) Load() error {
