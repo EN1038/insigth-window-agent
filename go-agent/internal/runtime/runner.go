@@ -327,6 +327,7 @@ func (r *Runner) startPostApproval(ctx context.Context) {
 			}
 			go r.configSyncLoop(ctx)
 			go r.tiSyncScheduleLoop(ctx)
+			go r.agentUpdateScheduleLoop(ctx)
 		}()
 	} else if r.Settings != nil {
 		r.Settings.Set(settings.KeyTIBootstrapDone, "true")

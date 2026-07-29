@@ -50,6 +50,16 @@ const (
 	KeyTIDownloadPercent = "ti_download_percent"
 	KeyTIDownloadMessage = "ti_download_message"
 	KeyTISyncBusy = "ti_sync_busy"
+	// OTA agent binary update (Center-assigned target version).
+	KeyAgentUpdateSchedule   = "agent_update_schedule"
+	KeyAgentVersionCurrent   = "agent_version_current"
+	KeyAgentVersionTarget    = "agent_version_target"
+	KeyAgentUpdateStatus     = "agent_update_status"
+	KeyAgentUpdateLastCheck  = "agent_update_last_check"
+	KeyAgentUpdateStagedPath = "agent_update_staged_path"
+	KeyAgentUpdateStagedSHA  = "agent_update_staged_sha256"
+	KeyAgentUpdatePending    = "agent_update_pending"
+	KeyLastAgentUpdateCheck  = "last_agent_update_check"
 )
 
 // DefaultScanExtensions is the baseline on-demand / realtime file filter.
@@ -122,6 +132,15 @@ func (s *Store) setDefaults() {
 	def(KeyTIDownloadPercent, "0")
 	def(KeyTIDownloadMessage, "")
 	def(KeyTISyncBusy, "false")
+	def(KeyAgentUpdateSchedule, "04:00")
+	def(KeyAgentVersionCurrent, "")
+	def(KeyAgentVersionTarget, "")
+	def(KeyAgentUpdateStatus, "")
+	def(KeyAgentUpdateLastCheck, "")
+	def(KeyAgentUpdateStagedPath, "")
+	def(KeyAgentUpdateStagedSHA, "")
+	def(KeyAgentUpdatePending, "false")
+	def(KeyLastAgentUpdateCheck, "")
 }
 
 func (s *Store) Load() error {

@@ -16,6 +16,7 @@ type serverConfigPayload struct {
 		USBProtection       any   `json:"usb_protection"`
 		BatchJobEveryDate   any   `json:"batchjob_everydate"`
 		TISyncEveryDate     any   `json:"ti_sync_everydate"`
+		AgentUpdateSchedule any   `json:"agent_update_schedule"`
 		SsdeepEnabled       any   `json:"ssdeep_enabled"`
 		SsdeepThreshold     any   `json:"ssdeep_threshold"`
 		SsdeepReportAPI     any   `json:"ssdeep_report_api"`
@@ -33,6 +34,7 @@ type serverConfigPayload struct {
 	USBProtection       any `json:"usb_protection"`
 	BatchJobEveryDate   any `json:"batchjob_everydate"`
 	TISyncEveryDate     any `json:"ti_sync_everydate"`
+	AgentUpdateSchedule any `json:"agent_update_schedule"`
 	ScanExtensions      any `json:"scan_extensions"`
 	Extentions          any `json:"extentions"` // Center typo / legacy key
 	ExclusionPaths      any `json:"exclusion_paths"`
@@ -85,6 +87,10 @@ func applyGetConfig(st *settings.Store, data json.RawMessage) error {
 	tiSync := firstNonNil(cfg.TISyncEveryDate, cfg.Agent.TISyncEveryDate)
 	if t := stringify(tiSync); t != "" {
 		st.Set(settings.KeyTISyncEveryDay, t)
+	}
+	updSched := firstNonNil(cfg.AgentUpdateSchedule, cfg.Agent.AgentUpdateSchedule)
+	if t := stringify(updSched); t != "" {
+		st.Set(settings.KeyAgentUpdateSchedule, t)
 	}
 
 	autoLogin := firstNonNil(cfg.AutoScanOnLogin, cfg.Agent.AutoScanOnLogin)

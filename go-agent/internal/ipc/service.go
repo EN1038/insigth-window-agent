@@ -20,6 +20,8 @@ type Service interface {
 	ScanRuntime() *runtime.ScanRuntime
 	PushSettingsToServer()
 	SyncThreatIntel() (rulesN, ssdeepN int, err error)
+	CheckAgentUpdate(autoInstall bool) error
+	InstallAssignedAgentUpdate() error
 	RulesInfo() RulesInfoResponse
 	QuarantineList() []QuarantineItem
 }

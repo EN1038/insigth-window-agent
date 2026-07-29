@@ -102,6 +102,18 @@ func (c *Client) SyncRules(ctx context.Context) error {
 	return c.post(ctx, "/v1/rules/sync", map[string]any{}, &out)
 }
 
+func (c *Client) CheckAgentUpdate(ctx context.Context) (OKResponse, error) {
+	var out OKResponse
+	err := c.post(ctx, "/v1/agent/update/check", map[string]any{}, &out)
+	return out, err
+}
+
+func (c *Client) InstallAgentUpdate(ctx context.Context) (OKResponse, error) {
+	var out OKResponse
+	err := c.post(ctx, "/v1/agent/update/install", map[string]any{}, &out)
+	return out, err
+}
+
 func (c *Client) InstallService(ctx context.Context) (OKResponse, error) {
 	var out OKResponse
 	err := c.post(ctx, "/v1/service/install", map[string]any{}, &out)

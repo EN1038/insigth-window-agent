@@ -227,6 +227,7 @@ func (h *Host) PushSettingsToServer() {
 		"log_level":             h.Settings.Get(settings.KeyLogLevel, "info"),
 		"cache_expiry_hours":    cacheHours,
 		"ti_sync_everydate":     h.Settings.Get(settings.KeyTISyncEveryDay, "03:00"),
+		"agent_update_schedule": h.Settings.Get(settings.KeyAgentUpdateSchedule, "04:00"),
 		"config_updated_at":     configUpdatedAtUnix(h.Settings),
 	}
 	_, _, _ = apiClient.UpdateConfig(batch, rtp, usb, extra)
@@ -237,6 +238,21 @@ func (h *Host) SyncThreatIntel() (rulesN, ssdeepN int, err error) {
 		return 0, 0, fmt.Errorf("runtime not ready")
 	}
 	return h.Runner.SyncThreatIntel()
+}
+
+func (h *Host) CheckAgentUpdate(autoInstall bool) error {
+	if h.Runner == nil {
+		return fmt.Errorf("runtime not ready")
+	}
+	return h.Runner.ReportAndCheckAgentUpdate(autoInstall)
+}
+
+func (h *Host) InstallAssignedAgentUpdate() error {
+	if h.Runner == nil {
+		return fmt.Errorf("runtime not ready")
+	}
+	// Force check + install of Center-assigned target.
+	return h.Runner.ReportAndCheckAgentUpdate(true)
 }
 
 func configUpdatedAtUnix(st *settings.Store) int64 {

@@ -38,6 +38,8 @@ func (s *Server) Listen(ctx context.Context, addr string) error {
 	mux.HandleFunc("/v1/scan/stop", s.handleScanStop)
 	mux.HandleFunc("/v1/scan/status", s.handleScanStatus)
 	mux.HandleFunc("/v1/rules/sync", s.handleRulesSync)
+	mux.HandleFunc("/v1/agent/update/check", s.handleAgentUpdateCheck)
+	mux.HandleFunc("/v1/agent/update/install", s.handleAgentUpdateInstall)
 	mux.HandleFunc("/v1/rules/info", s.handleRulesInfo)
 	mux.HandleFunc("/v1/quarantine", s.handleQuarantine)
 	mux.HandleFunc("/v1/history", s.handleHistory)
@@ -301,6 +303,38 @@ func (s *Server) handleRulesSync(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, OKResponse{OK: true, Message: "Sync started"})
 }
 
+func (s *Server) handleAgentUpdateCheck(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	if err := s.svc.CheckAgentUpdate(false); err != nil {
+		writeJSON(w, OKResponse{OK: false, Message: err.Error()})
+		return
+	}
+	st := s.svc.GetSettings()
+	msg := "Checked for agent update"
+	if st != nil {
+		msg = fmt.Sprintf("current=%s target=%s status=%s",
+			st.Get(settings.KeyAgentVersionCurrent, ""),
+			st.Get(settings.KeyAgentVersionTarget, ""),
+			st.Get(settings.KeyAgentUpdateStatus, ""),
+		)
+	}
+	writeJSON(w, OKResponse{OK: true, Message: msg})
+}
+
+func (s *Server) handleAgentUpdateInstall(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	go func() {
+		_ = s.svc.InstallAssignedAgentUpdate()
+	}()
+	writeJSON(w, OKResponse{OK: true, Message: "Agent update started"})
+}
+
 func (s *Server) handleRulesInfo(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodGet {
 		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
@@ -373,6 +407,10 @@ func settingsView(st *settings.Store) SettingsView {
 		AutoScanOnLogin:     st.GetBool(settings.KeyAutoScanOnLogin),
 		BatchJobEveryDay:    st.Get(settings.KeyBatchJobEveryDay, "02:00"),
 		TISyncEveryDay:      st.Get(settings.KeyTISyncEveryDay, "03:00"),
+		AgentUpdateSchedule: st.Get(settings.KeyAgentUpdateSchedule, "04:00"),
+		AgentVersionCurrent: st.Get(settings.KeyAgentVersionCurrent, ""),
+		AgentVersionTarget:  st.Get(settings.KeyAgentVersionTarget, ""),
+		AgentUpdateStatus:   st.Get(settings.KeyAgentUpdateStatus, ""),
 		ExclusionPaths:      strings.ReplaceAll(st.Get(settings.KeyExclusionPaths, ""), ";", "\n"),
 		ScanExtensions:      st.Get(settings.KeyScanExtensions, ""),
 		QuickScanPaths:      strings.ReplaceAll(st.Get(settings.KeyQuickScanPaths, ""), ";", "\n"),
@@ -402,6 +440,9 @@ func applySettings(st *settings.Store, req UpdateSettingsRequest) {
 	}
 	if req.TISyncEveryDay != "" {
 		st.Set(settings.KeyTISyncEveryDay, req.TISyncEveryDay)
+	}
+	if req.AgentUpdateSchedule != "" {
+		st.Set(settings.KeyAgentUpdateSchedule, req.AgentUpdateSchedule)
 	}
 	// UI always sends these; allow empty to clear exclusions.
 	{

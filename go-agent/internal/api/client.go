@@ -456,3 +456,100 @@ func (c *Client) DownloadProtectedFile(kind, path string, destPath string) error
 	}
 	return os.Rename(tmp, destPath)
 }
+
+type AgentUpdateCheck struct {
+	UpdateAvailable bool   `json:"update_available"`
+	CurrentVersion  string `json:"current_version"`
+	TargetVersion   string `json:"target_version"`
+	Package         *struct {
+		ID        int64  `json:"id"`
+		Version   string `json:"version"`
+		FileName  string `json:"file_name"`
+		Path      string `json:"path"`
+		SHA256    string `json:"sha256"`
+		SizeBytes int64  `json:"size_bytes"`
+		Kind      string `json:"kind"`
+	} `json:"package"`
+}
+
+func (c *Client) ReportAgentVersion(version, schedule string) (*Response, []byte, error) {
+	payload := map[string]any{
+		"ip_private":            sysinfo.LocalIPv4(),
+		"version":               version,
+		"agent_update_schedule": schedule,
+	}
+	return c.postJSON("reportAgentVersion", payload)
+}
+
+func (c *Client) CheckAgentUpdate(currentVersion string) (*Response, []byte, error) {
+	payload := map[string]any{
+		"ip_private":      sysinfo.LocalIPv4(),
+		"current_version": currentVersion,
+	}
+	return c.postJSON("checkAgentUpdate", payload)
+}
+
+func (c *Client) DownloadAgentPackageMeta(version string, packageID int64) (*Response, []byte, error) {
+	payload := map[string]any{
+		"ip_private": sysinfo.LocalIPv4(),
+	}
+	if strings.TrimSpace(version) != "" {
+		payload["version"] = version
+	}
+	if packageID > 0 {
+		payload["package_id"] = packageID
+	}
+	return c.postJSON("downloadAgentPackage", payload)
+}
+
+func (c *Client) ReportAgentUpdateStatus(status, message, currentVersion, targetVersion string) (*Response, []byte, error) {
+	payload := map[string]any{
+		"ip_private":      sysinfo.LocalIPv4(),
+		"status":          status,
+		"message":         message,
+		"current_version": currentVersion,
+		"target_version":  targetVersion,
+	}
+	return c.postJSON("reportAgentUpdateStatus", payload)
+}
+
+// DownloadProtectedFileMeta downloads an authenticated file and returns the server sha256.
+func (c *Client) DownloadProtectedFileMeta(kind, path, destPath string) (sha256Hex string, err error) {
+	payload := map[string]any{
+		"kind": kind,
+		"path": path,
+	}
+	resp, _, err := c.postJSON("downloadProtectedFile", payload)
+	if err != nil {
+		return "", err
+	}
+	if resp.StatusCode != 200 {
+		return "", fmt.Errorf("downloadProtectedFile status %d: %s", resp.StatusCode, resp.Error)
+	}
+	var body struct {
+		FileName   string `json:"file_name"`
+		ContentB64 string `json:"content_b64"`
+		SHA256     string `json:"sha256"`
+	}
+	if err := json.Unmarshal(resp.Data, &body); err != nil {
+		return "", err
+	}
+	if body.ContentB64 == "" {
+		return "", fmt.Errorf("empty file content")
+	}
+	raw, err := base64.StdEncoding.DecodeString(body.ContentB64)
+	if err != nil {
+		raw, err = base64.RawStdEncoding.DecodeString(body.ContentB64)
+		if err != nil {
+			return "", err
+		}
+	}
+	tmp := destPath + ".part"
+	if err := os.WriteFile(tmp, raw, 0o600); err != nil {
+		return "", err
+	}
+	if err := os.Rename(tmp, destPath); err != nil {
+		return "", err
+	}
+	return strings.TrimSpace(body.SHA256), nil
+}

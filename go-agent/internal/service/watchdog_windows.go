@@ -61,6 +61,7 @@ func runWatchdogLoop(ctx context.Context) error {
 		case <-ctx.Done():
 			return ctx.Err()
 		case <-t.C:
+			tryApplyPendingUpdate()
 			watchOnce()
 		}
 	}
@@ -68,6 +69,10 @@ func runWatchdogLoop(ctx context.Context) error {
 
 func watchOnce() {
 	if authorizedServiceStop() {
+		return
+	}
+	// While an update is applying, don't fight the restart.
+	if pendingUpdateInProgress() {
 		return
 	}
 	running, err := isServiceRunning(install.ServiceName)

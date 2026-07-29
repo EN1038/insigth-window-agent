@@ -443,6 +443,13 @@ func (r *Router) showSettings(setPage func(fyne.CanvasObject)) {
 	tiSync.SetText(st.TISyncEveryDay)
 	tiSync.SetPlaceHolder("HH:mm")
 
+	agentUpdSched := widget.NewEntry()
+	agentUpdSched.SetText(st.AgentUpdateSchedule)
+	if strings.TrimSpace(agentUpdSched.Text) == "" {
+		agentUpdSched.SetText("04:00")
+	}
+	agentUpdSched.SetPlaceHolder("HH:mm")
+
 	excl := widget.NewMultiLineEntry()
 	excl.SetText(st.ExclusionPaths)
 	excl.SetMinRowsVisible(3)
@@ -491,6 +498,9 @@ func (r *Router) showSettings(setPage func(fyne.CanvasObject)) {
 		vspace(8),
 		fieldLabel("Daily threat intelligence sync (rules + ssdeep, HH:mm)"),
 		tiSync,
+		vspace(8),
+		fieldLabel("Daily agent update check time (HH:mm)"),
+		agentUpdSched,
 		vspace(8),
 		fieldLabel("Excluded paths (one per line)"),
 		excl,
@@ -551,6 +561,66 @@ func (r *Router) showSettings(setPage func(fyne.CanvasObject)) {
 		container.NewBorder(nil, nil, container.NewVBox(label("Threat rules"), rulesVer), syncBtn),
 	))
 
+	curVer := orDash(st.AgentVersionCurrent)
+	if curVer == "-" {
+		curVer = "4.1.0"
+	}
+	tgtVer := orDash(st.AgentVersionTarget)
+	updStatus := orDash(st.AgentUpdateStatus)
+	checkBtn := widget.NewButtonWithIcon("Check update", theme.ViewRefreshIcon(), nil)
+	installBtn := widget.NewButtonWithIcon("Update now", theme.DownloadIcon(), nil)
+	checkBtn.OnTapped = func() {
+		checkBtn.Disable()
+		installBtn.Disable()
+		go func() {
+			out, err := r.client.CheckAgentUpdate(r.ctx)
+			fyne.Do(func() {
+				checkBtn.Enable()
+				installBtn.Enable()
+				if err != nil {
+					dialog.ShowError(err, r.window)
+					return
+				}
+				r.showSettings(setPage)
+				dialog.ShowInformation("Agent update", out.Message, r.window)
+			})
+		}()
+	}
+	installBtn.OnTapped = func() {
+		dialog.ShowConfirm("Install assigned version",
+			"Download and install the Center-assigned agent version now?\nThe watchdog will restart the agent service.",
+			func(ok bool) {
+				if !ok {
+					return
+				}
+				checkBtn.Disable()
+				installBtn.Disable()
+				go func() {
+					out, err := r.client.InstallAgentUpdate(r.ctx)
+					fyne.Do(func() {
+						checkBtn.Enable()
+						installBtn.Enable()
+						if err != nil {
+							dialog.ShowError(err, r.window)
+							return
+						}
+						r.showSettings(setPage)
+						dialog.ShowInformation("Agent update", out.Message, r.window)
+					})
+				}()
+			}, r.window)
+	}
+	installBtn.Importance = widget.HighImportance
+	updateCard := card(container.NewVBox(
+		sectionHeaderImg(resIconSet, "Agent update"),
+		vspace(4),
+		muted("Current: "+curVer+"  ·  Target: "+tgtVer),
+		vspace(4),
+		muted("Status: "+updStatus),
+		vspace(8),
+		container.NewGridWithColumns(2, checkBtn, installBtn),
+	))
+
 	save := widget.NewButtonWithIcon("Save settings", theme.DocumentSaveIcon(), func() {
 		if err := r.client.UpdateSettings(r.ctx, ipc.UpdateSettingsRequest{
 			RealtimeShield:      boolPtr(rt.Checked),
@@ -558,6 +628,7 @@ func (r *Router) showSettings(setPage func(fyne.CanvasObject)) {
 			AutoScanOnLogin:     boolPtr(auto.Checked),
 			BatchJobEveryDay:    batch.Text,
 			TISyncEveryDay:      tiSync.Text,
+			AgentUpdateSchedule: agentUpdSched.Text,
 			ExclusionPaths:      excl.Text,
 			ScanExtensions:      scanExt.Text,
 			QuickScanPaths:      quick.Text,
@@ -593,6 +664,7 @@ func (r *Router) showSettings(setPage func(fyne.CanvasObject)) {
 		ssdeepCard, vspace(6),
 		advanced, vspace(6),
 		rulesCard, vspace(6),
+		updateCard, vspace(6),
 		container.NewGridWithColumns(2, logout, save),
 	)
 	setPage(container.NewPadded(container.NewVScroll(body)))
