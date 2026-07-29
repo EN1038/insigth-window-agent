@@ -41,7 +41,11 @@ func NewHost(baseDir string) (*Host, error) {
 
 	st := settings.New(baseDir)
 	if err := st.Load(); err != nil {
-		return nil, err
+		// Recover from vault/KEK mismatch (e.g. older builds that rewrote vault.dat).
+		st = settings.New(baseDir)
+		if saveErr := st.Save(); saveErr != nil {
+			return nil, fmt.Errorf("settings load: %w (reset failed: %v)", err, saveErr)
+		}
 	}
 	snap := snapshot.New(baseDir)
 	_ = snap.Load()

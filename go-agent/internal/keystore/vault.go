@@ -31,28 +31,10 @@ func ActiveSiteKey() string {
 	return activeSiteKey
 }
 
-// EnsureKEK loads or creates a KEK. When an active site_key is set, derives KEK from it
-// (plan: encrypt TI/settings with site_key). Otherwise uses a DPAPI-wrapped random vault key.
+// EnsureKEK loads or creates the local DPAPI-backed vault KEK used for settings/config/history.
+// Site_key-derived keys are separate (DeriveKEKFromSiteKey) and must not replace this vault.
 func EnsureKEK(vaultPath string) ([]byte, error) {
-	if sk := ActiveSiteKey(); sk != "" {
-		return ensureSiteKeyKEK(vaultPath, sk)
-	}
 	return ensureRandomVaultKEK(vaultPath)
-}
-
-func ensureSiteKeyKEK(vaultPath, siteKey string) ([]byte, error) {
-	kek, err := DeriveKEKFromSiteKey(siteKey)
-	if err != nil {
-		return nil, err
-	}
-	if _, err := os.Stat(vaultPath); err != nil {
-		protected, perr := ProtectLocalMachine(kek)
-		if perr == nil {
-			_ = os.MkdirAll(filepath.Dir(vaultPath), 0o700)
-			_ = os.WriteFile(vaultPath, protected, 0o600)
-		}
-	}
-	return kek, nil
 }
 
 func ensureRandomVaultKEK(vaultPath string) ([]byte, error) {
