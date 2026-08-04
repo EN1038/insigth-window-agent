@@ -84,8 +84,7 @@ func RunConfirmExit(ctx context.Context, client *ipc.Client) error {
 	}
 	passEntry.OnSubmitted = func(string) { doConfirm() }
 
-	confirmBtn := widget.NewButton("CONFIRM EXIT", doConfirm)
-	confirmBtn.Importance = widget.DangerImportance
+	confirmBtn := newDangerButton("CONFIRM EXIT", doConfirm)
 	cancelBtn := widget.NewButton("Cancel", func() {
 		w.Close()
 		a.Quit()

@@ -4,7 +4,6 @@ package ui
 
 import (
 	"strings"
-	"time"
 
 	"fyne.io/fyne/v2"
 	"fyne.io/fyne/v2/container"
@@ -76,17 +75,10 @@ func (r *Router) forceShowNative() {
 	_, _, _ = procSetForegroundWindow.Call(hwnd)
 }
 
-// bringToFrontFromTray shows a hidden window. Call from tray (non-UI) thread only:
-// Window.Show schedules work onto the UI thread; calling it from RunNative deadlocks.
+// bringToFrontFromTray shows a hidden window. Prefer showWindowFromTray (app_windows.go)
+// from the Fyne main thread (tray menu Action) or via fyne.Do.
 func (r *Router) bringToFrontFromTray() {
-	if r.window == nil {
-		return
-	}
-	r.window.Show()
-	r.window.RequestFocus()
-	// Give doShowAgain a moment to run on the UI thread, then force Z-order.
-	time.Sleep(80 * time.Millisecond)
-	r.forceShowNative()
+	r.showWindowFromTray()
 }
 
 // showCredentialConfirm asks for email/password (same as login) before a sensitive action.

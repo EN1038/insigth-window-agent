@@ -126,6 +126,12 @@ func (c *Client) RulesInfo(ctx context.Context) (RulesInfoResponse, error) {
 	return out, err
 }
 
+func (c *Client) SsdeepInfo(ctx context.Context) (SsdeepInfoResponse, error) {
+	var out SsdeepInfoResponse
+	err := c.get(ctx, "/v1/ssdeep/info", &out)
+	return out, err
+}
+
 func (c *Client) Quarantine(ctx context.Context) ([]QuarantineItem, error) {
 	var out []QuarantineItem
 	err := c.get(ctx, "/v1/quarantine", &out)

@@ -22,7 +22,7 @@
 |----------|----------|
 | `dataInfo`, `loginAgent`, `checkedAgentApproved` | ลงทะเบียน / approve |
 | `getConfig`, `updateConfig` | config เครื่อง |
-| `getRule`, `downloadRuleSite`, `downloadRuleSiteComplete`, `updateRuleDownload` | YARA |
+| `getRule`, `downloadRuleSite`, `downloadRuleSiteComplete`, `updateRuleDownload`, `resetRuleDownload` | YARA (force/re-queue when local behind) |
 | `agentOnlineTimestamp` | heartbeat |
 | `sendLogYara` | เฉพาะ detection **engine = yara** |
 | `sendHash` | MD5 เฉพาะไฟล์ที่เจอจาก **YARA** |
@@ -278,7 +278,9 @@ Agent ใช้เทียบกับ `ssdeep_db_version` ใน settings ว�
 | `ssdeep_report_api` | 0/1 | อนุญาต `sendLogSsdeep` |
 | `ssdeep_db_version` | string | เทียบกับเครื่อง → trigger `downloadSsdeepSite` |
 | `quarantine_on_detect` | 0/1 | 0 = แจ้งเตือนอย่างเดียว (อนาคต) |
-| `send_ssdeep_candidate` | 0/1 | ให้ agent เรียก `sendSsdeepCandidate` |
+| `send_ssdeep_candidate` | 0/1 | ให้ agent เรียก `sendSsdeepCandidate` — **เปิดที่ Control Agent** (ค่าเริ่มต้น Off/`N`) เพื่อให้ Center auto-promote เข้า category pack |
+
+**Center auto-promote:** เมื่อรับ candidate แล้ว (ถ้า `SSDEEP_AUTO_PROMOTE=true`) จะจัดหมวด → merge เข้า pack → bump version → requeue agent download. Retry คิวค้าง: `php artisan ssdeep:promote-queued`
 
 ---
 
@@ -328,8 +330,8 @@ Agent ใช้เทียบกับ `ssdeep_db_version` ใน settings ว�
 
 [Server]
     → เก็บ log / dashboard
-    → VT worker จาก candidate
-    → อัปเดต signatures DB → version ใหม่ → agent ดึงรอบถัดไป
+    → sendSsdeepCandidate → SsdeepAutoPackService (categorize + merge pack + requeue Sync)
+    → agent ดึง pack รอบถัดไป
 ```
 
 ---

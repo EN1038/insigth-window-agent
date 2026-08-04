@@ -85,8 +85,7 @@ func RunConfirmStop(ctx context.Context, client *ipc.Client, onAuthorizedStop fu
 	}
 	passEntry.OnSubmitted = func(string) { doConfirm() }
 
-	confirmBtn := widget.NewButton("CONFIRM STOP PROTECTION", doConfirm)
-	confirmBtn.Importance = widget.DangerImportance
+	confirmBtn := newDangerButton("CONFIRM STOP PROTECTION", doConfirm)
 	cancelBtn := widget.NewButton("Cancel (keep protection running)", func() {
 		w.Close()
 		a.Quit()

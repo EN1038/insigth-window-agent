@@ -82,15 +82,15 @@ func applyGetConfig(st *settings.Store, data json.RawMessage) error {
 	}
 	batch := firstNonNil(cfg.BatchJobEveryDate, cfg.Agent.BatchJobEveryDate)
 	if b := stringify(batch); b != "" {
-		st.Set(settings.KeyBatchJobEveryDay, b)
+		st.Set(settings.KeyBatchJobEveryDay, strconv.Itoa(settings.NormalizeIntervalMinutes(b, settings.DefaultBatchIntervalMinutes)))
 	}
 	tiSync := firstNonNil(cfg.TISyncEveryDate, cfg.Agent.TISyncEveryDate)
 	if t := stringify(tiSync); t != "" {
-		st.Set(settings.KeyTISyncEveryDay, t)
+		st.Set(settings.KeyTISyncEveryDay, strconv.Itoa(settings.NormalizeIntervalMinutes(t, settings.DefaultTISyncIntervalMinutes)))
 	}
 	updSched := firstNonNil(cfg.AgentUpdateSchedule, cfg.Agent.AgentUpdateSchedule)
 	if t := stringify(updSched); t != "" {
-		st.Set(settings.KeyAgentUpdateSchedule, t)
+		st.Set(settings.KeyAgentUpdateSchedule, strconv.Itoa(settings.NormalizeIntervalMinutes(t, settings.DefaultAgentUpdateIntervalMinutes)))
 	}
 
 	autoLogin := firstNonNil(cfg.AutoScanOnLogin, cfg.Agent.AutoScanOnLogin)
@@ -127,9 +127,10 @@ func applyGetConfig(st *settings.Store, data json.RawMessage) error {
 	if v, ok := parseOnOff(ssdeepReport); ok {
 		st.Set(settings.KeySsdeepReportAPI, boolStr(v))
 	}
-	if version := stringify(cfg.SsdeepDBVersion); version != "" {
-		st.Set(settings.KeySsdeepDBVersion, version)
-	}
+	// Do NOT apply ssdeep_db_version from getConfig. Center advertises the
+	// assigned pack version there; writing it locally would make Sync skip
+	// downloads before packs are imported. Version is set only after a
+	// successful ssdeep pack import (see syncSsdeepFromServer).
 	quarantine := firstNonNil(cfg.QuarantineOnDetect, cfg.Agent.QuarantineOnDetect)
 	if v, ok := parseOnOff(quarantine); ok {
 		st.Set(settings.KeyQuarantineOnDetect, boolStr(v))

@@ -76,10 +76,15 @@ func (insiteTheme) Color(name fyne.ThemeColorName, _ fyne.ThemeVariant) color.Co
 		return color.NRGBA{R: 0x10, G: 0x16, B: 0x22, A: 0xff}
 	case theme.ColorNameSuccess:
 		return colorSuccess
-	case theme.ColorNameError, theme.ColorNameForegroundOnError:
+	case theme.ColorNameError:
 		return colorError
+	case theme.ColorNameForegroundOnError:
+		// DangerImportance buttons use Error as fill; text must contrast (white).
+		return colorOnAccent
 	case theme.ColorNameWarning:
 		return colorWarning
+	case theme.ColorNameForegroundOnWarning:
+		return colorOnAccent
 	case theme.ColorNameSelection:
 		return color.NRGBA{R: 0x2d, G: 0xd4, B: 0xbf, A: 0x40}
 	case theme.ColorNameScrollBar:

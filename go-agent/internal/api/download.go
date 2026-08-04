@@ -44,11 +44,22 @@ func (c *Client) DownloadFileWithProgress(url, destPath, phase string, fileIndex
 		})
 		if err := c.DownloadProtectedFile(kind, rel, destPath); err == nil {
 			return nil
+		} else {
+			// Prefer the authenticated error (e.g. 404 File not found). Falling through to
+			// /storage/rules/... only produces a misleading Laravel HTML 404 page.
+			return err
 		}
 	}
 
-	if strings.HasPrefix(url, "/") {
-		url = strings.TrimRight(c.cfg.SiteIP, "/") + url
+	if !strings.HasPrefix(url, "http://") && !strings.HasPrefix(url, "https://") {
+		base := strings.TrimRight(c.cfg.SiteIP, "/")
+		if strings.HasPrefix(url, "/") {
+			url = base + url
+		} else if strings.HasPrefix(url, "storage/") {
+			url = base + "/" + url
+		} else {
+			url = base + "/storage/rules/" + url
+		}
 	}
 	req, err := http.NewRequest("GET", url, nil)
 	if err != nil {

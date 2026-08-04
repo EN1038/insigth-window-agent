@@ -41,6 +41,7 @@ func (s *Server) Listen(ctx context.Context, addr string) error {
 	mux.HandleFunc("/v1/agent/update/check", s.handleAgentUpdateCheck)
 	mux.HandleFunc("/v1/agent/update/install", s.handleAgentUpdateInstall)
 	mux.HandleFunc("/v1/rules/info", s.handleRulesInfo)
+	mux.HandleFunc("/v1/ssdeep/info", s.handleSsdeepInfo)
 	mux.HandleFunc("/v1/quarantine", s.handleQuarantine)
 	mux.HandleFunc("/v1/history", s.handleHistory)
 	mux.HandleFunc("/v1/service/install", s.handleServiceInstall)
@@ -76,6 +77,18 @@ func (s *Server) handleStatus(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	st := s.svc.GetSettings()
+	online := false
+	if st != nil {
+		online = st.GetBool(settings.KeyCenterOnline)
+		// Stale after 3 minutes without a successful heartbeat/test.
+		if online {
+			if at := strings.TrimSpace(st.Get(settings.KeyCenterOnlineAt, "")); at != "" {
+				if t, err := time.Parse(time.RFC3339, at); err == nil && time.Since(t) > 3*time.Minute {
+					online = false
+				}
+			}
+		}
+	}
 	resp := StatusResponse{
 		HasConfig:        s.svc.GetConfig() != nil,
 		Approved:         st.GetBool("approved"),
@@ -83,7 +96,7 @@ func (s *Server) handleStatus(w http.ResponseWriter, r *http.Request) {
 		SyncBusy:         st.GetBool(settings.KeyTISyncBusy),
 		DownloadMessage:  st.Get(settings.KeyTIDownloadMessage, ""),
 		LoggedIn:         s.svc.IsLoggedIn(),
-		Online:           false, // use POST /v1/connection/test for server reachability (avoid blocking status)
+		Online:           online,
 		AgentID:          st.Get("agent_id", ""),
 	}
 	if p := strings.TrimSpace(st.Get(settings.KeyTIDownloadPercent, "0")); p != "" {
@@ -140,7 +153,8 @@ func (s *Server) handleConnectionTest(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
 		return
 	}
-	writeJSON(w, OKResponse{OK: s.svc.TestConnection()})
+	ok := s.svc.TestConnection()
+	writeJSON(w, OKResponse{OK: ok})
 }
 
 func (s *Server) handleLogin(w http.ResponseWriter, r *http.Request) {
@@ -343,6 +357,14 @@ func (s *Server) handleRulesInfo(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, s.svc.RulesInfo())
 }
 
+func (s *Server) handleSsdeepInfo(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	writeJSON(w, s.svc.SsdeepInfo())
+}
+
 func (s *Server) handleQuarantine(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodGet {
 		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
@@ -405,9 +427,9 @@ func settingsView(st *settings.Store) SettingsView {
 		RealtimeShield:      st.GetBool(settings.KeyRealtimeShield),
 		USBProtection:       st.GetBool(settings.KeyUSBProtection),
 		AutoScanOnLogin:     st.GetBool(settings.KeyAutoScanOnLogin),
-		BatchJobEveryDay:    st.Get(settings.KeyBatchJobEveryDay, "02:00"),
-		TISyncEveryDay:      st.Get(settings.KeyTISyncEveryDay, "03:00"),
-		AgentUpdateSchedule: st.Get(settings.KeyAgentUpdateSchedule, "04:00"),
+		BatchJobEveryDay:    strconv.Itoa(settings.NormalizeIntervalMinutes(st.Get(settings.KeyBatchJobEveryDay, ""), settings.DefaultBatchIntervalMinutes)),
+		TISyncEveryDay:      strconv.Itoa(settings.NormalizeIntervalMinutes(st.Get(settings.KeyTISyncEveryDay, ""), settings.DefaultTISyncIntervalMinutes)),
+		AgentUpdateSchedule: strconv.Itoa(settings.NormalizeIntervalMinutes(st.Get(settings.KeyAgentUpdateSchedule, ""), settings.DefaultAgentUpdateIntervalMinutes)),
 		AgentVersionCurrent: st.Get(settings.KeyAgentVersionCurrent, ""),
 		AgentVersionTarget:  st.Get(settings.KeyAgentVersionTarget, ""),
 		AgentUpdateStatus:   st.Get(settings.KeyAgentUpdateStatus, ""),
@@ -422,6 +444,10 @@ func settingsView(st *settings.Store) SettingsView {
 		LogLevel:            st.Get(settings.KeyLogLevel, "info"),
 		CacheExpiryHours:    st.Get(settings.KeyCacheExpiryHours, "168"),
 		RulesVersion:        st.Get(settings.KeyRulesVersion, ""),
+		ServerRulesCount:    st.Get(settings.KeyServerRulesCount, "0"),
+		LocalRulesCount:     st.Get(settings.KeyLocalRulesCount, "0"),
+		SsdeepDBVersion:     st.Get(settings.KeySsdeepDBVersion, ""),
+		LastTISyncRun:       st.Get(settings.KeyLastTISyncRun, ""),
 	}
 }
 
@@ -436,17 +462,17 @@ func applySettings(st *settings.Store, req UpdateSettingsRequest) {
 		st.Set(settings.KeyAutoScanOnLogin, boolStr(*req.AutoScanOnLogin))
 	}
 	if req.BatchJobEveryDay != "" {
-		st.Set(settings.KeyBatchJobEveryDay, req.BatchJobEveryDay)
+		st.Set(settings.KeyBatchJobEveryDay, strconv.Itoa(settings.NormalizeIntervalMinutes(req.BatchJobEveryDay, settings.DefaultBatchIntervalMinutes)))
 	}
 	if req.TISyncEveryDay != "" {
-		st.Set(settings.KeyTISyncEveryDay, req.TISyncEveryDay)
+		st.Set(settings.KeyTISyncEveryDay, strconv.Itoa(settings.NormalizeIntervalMinutes(req.TISyncEveryDay, settings.DefaultTISyncIntervalMinutes)))
 	}
 	if req.AgentUpdateSchedule != "" {
-		st.Set(settings.KeyAgentUpdateSchedule, req.AgentUpdateSchedule)
+		st.Set(settings.KeyAgentUpdateSchedule, strconv.Itoa(settings.NormalizeIntervalMinutes(req.AgentUpdateSchedule, settings.DefaultAgentUpdateIntervalMinutes)))
 	}
-	// UI always sends these; allow empty to clear exclusions.
-	{
-		normalized := strings.ReplaceAll(req.ExclusionPaths, "\r\n", ";")
+	// Path lists are pointers so partial updates (e.g. Overview TYPE SCAN) do not wipe them.
+	if req.ExclusionPaths != nil {
+		normalized := strings.ReplaceAll(*req.ExclusionPaths, "\r\n", ";")
 		normalized = strings.ReplaceAll(normalized, "\n", ";")
 		st.Set(settings.KeyExclusionPaths, normalized)
 	}
@@ -457,8 +483,8 @@ func applySettings(st *settings.Store, req UpdateSettingsRequest) {
 		st.Set(settings.KeyScanExtensions, normalized)
 		_ = st.MergeDefaultScanExtensions()
 	}
-	{
-		normalized := strings.ReplaceAll(req.QuickScanPaths, "\r\n", ";")
+	if req.QuickScanPaths != nil {
+		normalized := strings.ReplaceAll(*req.QuickScanPaths, "\r\n", ";")
 		normalized = strings.ReplaceAll(normalized, "\n", ";")
 		st.Set(settings.KeyQuickScanPaths, normalized)
 	}

@@ -12,7 +12,6 @@ import (
 	"github.com/sosecure/insite-agent/internal/config"
 	"github.com/sosecure/insite-agent/internal/crypto"
 	"github.com/sosecure/insite-agent/internal/keystore"
-	"github.com/sosecure/insite-agent/internal/securefs"
 	"github.com/sosecure/insite-agent/internal/storage"
 )
 
@@ -77,6 +76,32 @@ func (s *Store) SaveIndex(idx *Index) error {
 	return enc.Save(idx)
 }
 
+// FileCount returns how many encrypted rule files are registered in the index.
+func (s *Store) FileCount() int {
+	idx, err := s.LoadIndex()
+	if err != nil || idx == nil {
+		return 0
+	}
+	return len(idx.Files)
+}
+
+// PutIndexed stores one rule file and writes it into the index under ruleSet:relPath.
+func (s *Store) PutIndexed(ruleSetName, relPath string, plain []byte) error {
+	if ruleSetName == "" {
+		ruleSetName = "server"
+	}
+	idx, err := s.LoadIndex()
+	if err != nil {
+		return err
+	}
+	rec, err := s.Put(0, relPath, plain)
+	if err != nil {
+		return err
+	}
+	idx.Files[fmt.Sprintf("%s:%s", ruleSetName, normalizeRel(relPath))] = rec
+	return s.SaveIndex(idx)
+}
+
 // Put stores one rule file content encrypted as a blob on disk and updates the index.
 func (s *Store) Put(ruleID int64, relPath string, plain []byte) (Record, error) {
 	relPath = normalizeRel(relPath)
@@ -128,67 +153,96 @@ func (s *Store) Put(ruleID int64, relPath string, plain []byte) (Record, error) 
 }
 
 // Materialize decrypts all stored rule blobs to destRoot and returns entry .yar file paths.
-// This keeps YARA integration simple in the first rewrite: YARA expects files.
+// It deduplicates overlapping packs, skips unsupported modules, and prunes files that
+// fail to compile with the bundled yara64 so scans actually produce matches.
 func (s *Store) Materialize(destRoot string) ([]string, error) {
+	_, entries, err := s.MaterializeWithStats(destRoot)
+	return entries, err
+}
+
+// MaterializeWithStats is like Materialize but also returns selection/prune stats.
+func (s *Store) MaterializeWithStats(destRoot string) (MaterializeStats, []string, error) {
+	started := time.Now()
+	stats := MaterializeStats{}
+
 	idx, err := s.LoadIndex()
 	if err != nil {
-		return nil, err
+		return stats, nil, err
 	}
 	if len(idx.Files) == 0 {
-		return nil, fmt.Errorf("no rules in store")
+		return stats, nil, fmt.Errorf("no rules in store")
 	}
 
 	kek, err := keystore.EnsureKEK(s.paths.VaultPath)
 	if err != nil {
-		return nil, err
+		return stats, nil, err
 	}
 	key, err := crypto.DeriveSubkey(kek, "rules-blob")
 	if err != nil {
-		return nil, err
+		return stats, nil, err
 	}
 
 	if err := os.MkdirAll(destRoot, 0o700); err != nil {
-		return nil, err
+		return stats, nil, err
 	}
-	_ = securefs.RestrictDirToSystemAndAdmins(destRoot)
 
-	var entries []string
+	var written []string
+	seenRel := map[string]bool{}
 	for _, rec := range idx.Files {
 		blobPath := filepath.Join(s.paths.DataDir, "rules", "blobs", rec.Blob)
 		b, err := os.ReadFile(blobPath)
 		if err != nil {
-			return nil, err
+			return stats, nil, err
 		}
 		env, err := crypto.Unmarshal(b)
 		if err != nil {
-			return nil, err
+			return stats, nil, err
 		}
 		aad := []byte("rules-blob|v1|" + rec.RelPath)
 		plain, err := crypto.OpenAESGCM(key, env, aad)
 		if err != nil {
-			return nil, err
+			return stats, nil, err
 		}
 
-		outPath := filepath.Join(destRoot, filepath.FromSlash(rec.RelPath))
+		rel := normalizeRel(rec.RelPath)
+		if rel == "" || seenRel[strings.ToLower(rel)] {
+			continue
+		}
+		seenRel[strings.ToLower(rel)] = true
+
+		outPath := filepath.Join(destRoot, filepath.FromSlash(rel))
 		if err := os.MkdirAll(filepath.Dir(outPath), 0o700); err != nil {
-			return nil, err
+			return stats, nil, err
 		}
 		if err := os.WriteFile(outPath, plain, 0o600); err != nil {
-			return nil, err
+			return stats, nil, err
 		}
+		written = append(written, rel)
+	}
+	if len(written) == 0 {
+		return stats, nil, fmt.Errorf("no rule entry files materialized")
+	}
+	stats.StoredFiles = len(written)
 
-		base := strings.ToLower(filepath.Base(rec.RelPath))
-		if base == "rules.yar" || base == "index.yar" || base == "rules_unified.yar" {
-			entries = append(entries, outPath)
-		}
+	selected := buildScanIncludeList(destRoot, written)
+	beforePrune := len(selected)
+	if yaraExe := resolveBundledYara(s.paths.BaseDir); yaraExe != "" {
+		selected = pruneFailingIncludes(destRoot, yaraExe, selected)
+	} else if yaraExe := resolveBundledYara(filepath.Dir(s.paths.DataDir)); yaraExe != "" {
+		selected = pruneFailingIncludes(destRoot, yaraExe, selected)
 	}
-	if len(entries) == 0 {
-		// fallback: return all .yar files as entrypoints
-		for _, rec := range idx.Files {
-			entries = append(entries, filepath.Join(destRoot, filepath.FromSlash(rec.RelPath)))
-		}
+	stats.PrunedFiles = beforePrune - len(selected)
+	stats.SelectedFiles = len(selected)
+	if len(selected) == 0 {
+		return stats, nil, fmt.Errorf("no usable YARA rules after dedupe/prune (stored=%d)", len(written))
 	}
-	return entries, nil
+
+	allPath, err := writeInsiteAll(destRoot, selected)
+	if err != nil {
+		return stats, nil, err
+	}
+	stats.Duration = time.Since(started)
+	return stats, []string{allPath}, nil
 }
 
 func normalizeRel(p string) string {

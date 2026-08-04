@@ -16,8 +16,9 @@ import (
 
 // Signature is one fuzzy-hash entry (scan payload only — no SQLite).
 type Signature struct {
-	Name string `json:"n"`
-	Hash string `json:"h"`
+	Name   string `json:"n"`
+	Family string `json:"f,omitempty"`
+	Hash   string `json:"h"`
 }
 
 // Index is the encrypted catalog of block-size shards.
@@ -153,6 +154,74 @@ func (s *Store) ReplaceAll(byBlock map[int][]Signature) error {
 	return s.SaveIndex(idx)
 }
 
+// Clear wipes the encrypted ssdeep store (index + shards).
+func (s *Store) Clear() error {
+	_ = os.Remove(s.indexPath())
+	_ = clearDir(filepath.Join(s.root, "shards"))
+	return os.MkdirAll(filepath.Join(s.root, "shards"), 0o700)
+}
+
+// MergeSignatures merges sigs into the existing store, deduping by hash.
+func (s *Store) MergeSignatures(incoming []Signature) (int, error) {
+	byBlock := map[int][]Signature{}
+	idx, err := s.LoadIndex()
+	if err == nil && idx != nil {
+		for k := range idx.Blocks {
+			bs, _ := strconv.Atoi(k)
+			if bs <= 0 {
+				continue
+			}
+			list, err := s.LoadShard(bs)
+			if err != nil {
+				return 0, err
+			}
+			if len(list) > 0 {
+				byBlock[bs] = append(byBlock[bs], list...)
+			}
+		}
+	}
+	seen := map[string]struct{}{}
+	for bs, list := range byBlock {
+		for _, sig := range list {
+			h := strings.TrimSpace(sig.Hash)
+			if h == "" {
+				continue
+			}
+			seen[h] = struct{}{}
+			_ = bs
+		}
+	}
+	added := 0
+	for _, sig := range incoming {
+		h := strings.TrimSpace(sig.Hash)
+		if h == "" {
+			continue
+		}
+		if _, ok := seen[h]; ok {
+			continue
+		}
+		bs, ok := parseBlockSize(h)
+		if !ok {
+			continue
+		}
+		seen[h] = struct{}{}
+		name := strings.TrimSpace(sig.Name)
+		if name == "" {
+			name = "unknown"
+		}
+		byBlock[bs] = append(byBlock[bs], Signature{
+			Name:   name,
+			Family: strings.TrimSpace(sig.Family),
+			Hash:   h,
+		})
+		added++
+	}
+	if err := s.ReplaceAll(byBlock); err != nil {
+		return 0, err
+	}
+	return countMap(byBlock), nil
+}
+
 func (s *Store) Total() (int, error) {
 	idx, err := s.LoadIndex()
 	if err != nil {
@@ -173,10 +242,39 @@ func (s *Store) LegacySQLitePath() string {
 }
 
 // ImportJSONFile loads a JSON array of {name, ssdeep} (optional family) into encrypted shards.
+// Existing store content is replaced.
 func (s *Store) ImportJSONFile(path string) (int, error) {
-	b, err := os.ReadFile(path)
+	rows, err := readJSONSignatureRows(path)
 	if err != nil {
 		return 0, err
+	}
+	byBlock := map[int][]Signature{}
+	for _, sig := range rows {
+		bs, ok := parseBlockSize(sig.Hash)
+		if !ok {
+			continue
+		}
+		byBlock[bs] = append(byBlock[bs], sig)
+	}
+	if err := s.ReplaceAll(byBlock); err != nil {
+		return 0, err
+	}
+	return countMap(byBlock), nil
+}
+
+// ImportJSONFileMerge merges JSON signatures into the existing store (dedupe by hash).
+func (s *Store) ImportJSONFileMerge(path string) (int, error) {
+	rows, err := readJSONSignatureRows(path)
+	if err != nil {
+		return 0, err
+	}
+	return s.MergeSignatures(rows)
+}
+
+func readJSONSignatureRows(path string) ([]Signature, error) {
+	b, err := os.ReadFile(path)
+	if err != nil {
+		return nil, err
 	}
 	type row struct {
 		Name   string `json:"name"`
@@ -185,31 +283,26 @@ func (s *Store) ImportJSONFile(path string) (int, error) {
 	}
 	var rows []row
 	if err := json.Unmarshal(b, &rows); err != nil {
-		return 0, err
+		return nil, err
 	}
-	byBlock := map[int][]Signature{}
+	out := make([]Signature, 0, len(rows))
 	for _, r := range rows {
 		hash := strings.TrimSpace(r.Ssdeep)
 		if hash == "" {
 			continue
 		}
-		bs, ok := parseBlockSize(hash)
-		if !ok {
-			continue
-		}
 		name := strings.TrimSpace(r.Name)
-		if fam := strings.TrimSpace(r.Family); fam != "" {
-			name = name + " (" + fam + ")"
-		}
+		family := strings.TrimSpace(r.Family)
 		if name == "" {
-			name = "unknown"
+			if family != "" {
+				name = family
+			} else {
+				name = "unknown"
+			}
 		}
-		byBlock[bs] = append(byBlock[bs], Signature{Name: name, Hash: hash})
+		out = append(out, Signature{Name: name, Family: family, Hash: hash})
 	}
-	if err := s.ReplaceAll(byBlock); err != nil {
-		return 0, err
-	}
-	return countMap(byBlock), nil
+	return out, nil
 }
 
 func clearDir(dir string) error {

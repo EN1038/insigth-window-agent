@@ -95,6 +95,11 @@ func resolveClientCert(cfg *config.AgentConfig) (path, pass string) {
 		def := filepath.Join(config.DataBaseDir(), "Config", "Key", "client.p12")
 		if _, err := os.Stat(def); err == nil {
 			path = def
+		} else {
+			def2 := filepath.Join(config.InstallDir(), "Config", "Key", "client.p12")
+			if _, err := os.Stat(def2); err == nil {
+				path = def2
+			}
 		}
 	}
 	return path, pass
@@ -105,25 +110,36 @@ func loadPKCS12(path, password string) (*tls.Certificate, error) {
 	if err != nil {
 		return nil, err
 	}
-	priv, cert, ca, err := pkcs12.DecodeChain(b, password)
-	if err != nil {
-		// Fallback: some exporters use Decode only.
-		priv2, cert2, err2 := pkcs12.Decode(b, password)
-		if err2 != nil {
-			return nil, err
+	passwordsToTry := []string{password}
+	if password != "" {
+		passwordsToTry = append(passwordsToTry, "P@ssw0rd@Sosecure", "")
+	} else {
+		passwordsToTry = append(passwordsToTry, "P@ssw0rd@Sosecure", "", "sosecure", "P@ssw0rd", "123456", "client", "secret", "password")
+	}
+
+	var lastErr error
+	for _, pass := range passwordsToTry {
+		priv, cert, ca, err := pkcs12.DecodeChain(b, pass)
+		if err != nil {
+			priv2, cert2, err2 := pkcs12.Decode(b, pass)
+			if err2 != nil {
+				lastErr = err
+				continue
+			}
+			priv, cert, ca = priv2, cert2, nil
 		}
-		priv, cert, ca = priv2, cert2, nil
+		var chain [][]byte
+		chain = append(chain, cert.Raw)
+		for _, c := range ca {
+			chain = append(chain, c.Raw)
+		}
+		return &tls.Certificate{
+			Certificate: chain,
+			PrivateKey:  priv,
+			Leaf:        cert,
+		}, nil
 	}
-	var chain [][]byte
-	chain = append(chain, cert.Raw)
-	for _, c := range ca {
-		chain = append(chain, c.Raw)
-	}
-	return &tls.Certificate{
-		Certificate: chain,
-		PrivateKey:  priv,
-		Leaf:        cert,
-	}, nil
+	return nil, lastErr
 }
 
 func (c *Client) SetProgressFunc(fn ProgressFunc) {
@@ -173,7 +189,16 @@ func (c *Client) postJSON(endpoint string, body any) (*Response, []byte, error) 
 
 	var r Response
 	if err := json.Unmarshal(raw, &r); err != nil {
-		return nil, raw, fmt.Errorf("decode response: %w", err)
+		snip := strings.TrimSpace(string(raw))
+		if len(snip) > 80 {
+			snip = snip[:80] + "..."
+		}
+		snip = strings.ReplaceAll(snip, "\n", " ")
+		snip = strings.ReplaceAll(snip, "\r", " ")
+		if snip == "" {
+			snip = "empty body"
+		}
+		return nil, raw, fmt.Errorf("decode response (HTTP %d: %s): %w", resp.StatusCode, snip, err)
 	}
 	if r.Error == "" && r.StatusCode >= 400 {
 		r.Error = http.StatusText(r.StatusCode)
@@ -252,9 +277,17 @@ func (c *Client) GetRule() (*Response, []byte, error) {
 }
 
 // DownloadRuleSite returns list of files to download (path + rule_name + id).
+// When force is true, Center re-queues packs even if previously marked complete.
 func (c *Client) DownloadRuleSite() (*Response, []byte, error) {
+	return c.DownloadRuleSiteForce(false)
+}
+
+func (c *Client) DownloadRuleSiteForce(force bool) (*Response, []byte, error) {
 	payload := map[string]any{
 		"ip_private": sysinfo.LocalIPv4(),
+	}
+	if force {
+		payload["force"] = 1
 	}
 	return c.postJSON("downloadRuleSite", payload)
 }
@@ -264,6 +297,14 @@ func (c *Client) DownloadRuleSiteComplete(id int64) (*Response, []byte, error) {
 		"id": id,
 	}
 	return c.postJSON("downloadRuleSiteComplete", payload)
+}
+
+// ResetRuleDownload asks Center to re-queue all site rule packs for this agent.
+func (c *Client) ResetRuleDownload() (*Response, []byte, error) {
+	payload := map[string]any{
+		"ip_private": sysinfo.LocalIPv4(),
+	}
+	return c.postJSON("resetRuleDownload", payload)
 }
 
 func (c *Client) UpdateRuleDownload(agentID int64, ruleID int64) (*Response, []byte, error) {
@@ -341,11 +382,20 @@ func (c *Client) GetSsdeep(currentVersion string) (*Response, []byte, error) {
 }
 
 func (c *Client) DownloadSsdeepSite(currentVersion string) (*Response, []byte, error) {
+	return c.DownloadSsdeepSiteForce(currentVersion, false)
+}
+
+// DownloadSsdeepSiteForce asks Center for ssdeep packs. When force is true,
+// completed agent download rows are re-queued (same idea as DownloadRuleSiteForce).
+func (c *Client) DownloadSsdeepSiteForce(currentVersion string, force bool) (*Response, []byte, error) {
 	payload := map[string]any{
 		"ip_private": sysinfo.LocalIPv4(),
 	}
 	if strings.TrimSpace(currentVersion) != "" {
 		payload["current_version"] = currentVersion
+	}
+	if force {
+		payload["force"] = 1
 	}
 	return c.postJSON("downloadSsdeepSite", payload)
 }

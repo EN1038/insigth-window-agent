@@ -8,7 +8,58 @@ import (
 	"fyne.io/fyne/v2"
 	"fyne.io/fyne/v2/canvas"
 	"fyne.io/fyne/v2/container"
+	"fyne.io/fyne/v2/driver/desktop"
+	"fyne.io/fyne/v2/widget"
 )
+
+type dangerButton struct {
+	widget.BaseWidget
+	Text    string
+	OnTap   func()
+	rect    *canvas.Rectangle
+	txt     *canvas.Text
+	hovered bool
+}
+
+func newDangerButton(text string, onTap func()) *dangerButton {
+	b := &dangerButton{
+		Text:  text,
+		OnTap: onTap,
+	}
+	b.rect = canvas.NewRectangle(colorError)
+	b.rect.CornerRadius = 8
+	b.txt = canvas.NewText(text, colorOnAccent)
+	b.txt.TextStyle = fyne.TextStyle{Bold: true}
+	b.txt.TextSize = 14
+	b.txt.Alignment = fyne.TextAlignCenter
+	b.ExtendBaseWidget(b)
+	return b
+}
+
+func (b *dangerButton) CreateRenderer() fyne.WidgetRenderer {
+	c := container.NewStack(b.rect, container.NewCenter(b.txt))
+	return widget.NewSimpleRenderer(c)
+}
+
+func (b *dangerButton) Tapped(*fyne.PointEvent) {
+	if b.OnTap != nil {
+		b.OnTap()
+	}
+}
+
+func (b *dangerButton) MouseIn(*desktop.MouseEvent) {
+	b.hovered = true
+	b.rect.FillColor = color.NRGBA{R: 0xdc, G: 0x26, B: 0x26, A: 0xff}
+	b.rect.Refresh()
+}
+
+func (b *dangerButton) MouseOut() {
+	b.hovered = false
+	b.rect.FillColor = colorError
+	b.rect.Refresh()
+}
+
+func (b *dangerButton) MouseMoved(*desktop.MouseEvent) {}
 
 // card wraps content in a rounded, bordered surface panel.
 func card(content fyne.CanvasObject) *fyne.Container {
@@ -108,6 +159,27 @@ func (f fixedWidth) MinSize(objs []fyne.CanvasObject) fyne.Size {
 }
 
 func (f fixedWidth) Layout(objs []fyne.CanvasObject, s fyne.Size) {
+	for _, o := range objs {
+		o.Resize(s)
+		o.Move(fyne.NewPos(0, 0))
+	}
+}
+
+// flexWidth lets content fill the parent width while reporting MinWidth=0 so
+// long labels cannot stretch the main window (Fyne grows the window to MinSize).
+type flexWidth struct{}
+
+func (flexWidth) MinSize(objs []fyne.CanvasObject) fyne.Size {
+	var h float32
+	for _, o := range objs {
+		if m := o.MinSize(); m.Height > h {
+			h = m.Height
+		}
+	}
+	return fyne.NewSize(0, h)
+}
+
+func (flexWidth) Layout(objs []fyne.CanvasObject, s fyne.Size) {
 	for _, o := range objs {
 		o.Resize(s)
 		o.Move(fyne.NewPos(0, 0))

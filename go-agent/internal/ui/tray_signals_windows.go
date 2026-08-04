@@ -16,19 +16,30 @@ const (
 	uiQuitSignal = "ui.quit"
 )
 
+// uiSignalDir is a per-user runtime folder (not the ACL-hardened ProgramData\Data
+// tree). Cross-process UI signals (second launch → show, confirm-exit → quit)
+// must be writable by the logged-in user.
+func uiSignalDir() string {
+	base := os.Getenv("LOCALAPPDATA")
+	if base == "" {
+		base = os.TempDir()
+	}
+	dir := filepath.Join(base, config.AppFolderName, "runtime")
+	_ = os.MkdirAll(dir, 0o700)
+	return dir
+}
+
 func uiSignalPath(name string) string {
-	return filepath.Join(config.DataBaseDir(), "Data", name)
+	return filepath.Join(uiSignalDir(), name)
 }
 
 func requestUIShow() error {
 	p := uiSignalPath(uiShowSignal)
-	_ = os.MkdirAll(filepath.Dir(p), 0o700)
 	return os.WriteFile(p, []byte(time.Now().Format(time.RFC3339Nano)), 0o600)
 }
 
 func requestUIQuit() error {
 	p := uiSignalPath(uiQuitSignal)
-	_ = os.MkdirAll(filepath.Dir(p), 0o700)
 	return os.WriteFile(p, []byte(time.Now().Format(time.RFC3339Nano)), 0o600)
 }
 

@@ -425,11 +425,64 @@ func (r *Runner) startScanSubsystem(ctx context.Context) {
 	r.mu.Unlock()
 
 	r.Scan = NewScanRuntime(r.BaseDir, r.Settings, r.Snapshot, r.API, r.History, r.Rules)
+	if r.Scan != nil && r.Scan.Manager != nil {
+		r.Scan.Manager.OnScanIdle = func() {
+			// Drain deferred auto TI sync / agent update as soon as scan ends.
+			r.tickTISyncSchedule()
+			r.tickAgentUpdateSchedule()
+		}
+	}
 	go r.Scan.Run(ctx)
 	_ = r.History.Append("scan.runtime", "scan subsystem started (scheduler, watcher, usb)", nil)
 }
 
+func (r *Runner) scanningNow() bool {
+	r.mu.Lock()
+	sr := r.Scan
+	r.mu.Unlock()
+	return sr != nil && sr.Manager != nil && sr.Manager.IsScanning()
+}
+
+func (r *Runner) ensureAutoScheduleDefaults() {
+	if r.Settings == nil {
+		return
+	}
+	changed := false
+	ti := strings.TrimSpace(r.Settings.Get(settings.KeyTISyncEveryDay, ""))
+	if ti == "" || strings.Contains(ti, ":") {
+		r.Settings.Set(settings.KeyTISyncEveryDay, strconv.Itoa(settings.DefaultTISyncIntervalMinutes))
+		changed = true
+	} else {
+		n := settings.NormalizeIntervalMinutes(ti, settings.DefaultTISyncIntervalMinutes)
+		if strconv.Itoa(n) != ti {
+			r.Settings.Set(settings.KeyTISyncEveryDay, strconv.Itoa(n))
+			changed = true
+		}
+	}
+	upd := strings.TrimSpace(r.Settings.Get(settings.KeyAgentUpdateSchedule, ""))
+	if upd == "" || strings.Contains(upd, ":") {
+		r.Settings.Set(settings.KeyAgentUpdateSchedule, strconv.Itoa(settings.DefaultAgentUpdateIntervalMinutes))
+		changed = true
+	} else {
+		n := settings.NormalizeIntervalMinutes(upd, settings.DefaultAgentUpdateIntervalMinutes)
+		if strconv.Itoa(n) != upd {
+			r.Settings.Set(settings.KeyAgentUpdateSchedule, strconv.Itoa(n))
+			changed = true
+		}
+	}
+	batch := strings.TrimSpace(r.Settings.Get(settings.KeyBatchJobEveryDay, ""))
+	if batch == "" || strings.Contains(batch, ":") {
+		r.Settings.Set(settings.KeyBatchJobEveryDay, strconv.Itoa(settings.DefaultBatchIntervalMinutes))
+		changed = true
+	}
+	if changed {
+		_ = r.Settings.Save()
+		_ = r.History.Append("config.ok", "auto schedules normalized (TI/rules+ssdeep, agent update, batch)", nil)
+	}
+}
+
 func (r *Runner) tiSyncScheduleLoop(ctx context.Context) {
+	r.ensureAutoScheduleDefaults()
 	t := time.NewTicker(1 * time.Minute)
 	defer t.Stop()
 	for {
@@ -452,25 +505,24 @@ func (r *Runner) tickTISyncSchedule() {
 	if r.Settings.GetBool(settings.KeyTISyncBusy) {
 		return
 	}
-	schedule := r.Settings.Get(settings.KeyTISyncEveryDay, "03:00")
-	parts := strings.Split(schedule, ":")
-	if len(parts) < 2 {
-		return
-	}
-	hour, err1 := strconv.Atoi(strings.TrimSpace(parts[0]))
-	minute, err2 := strconv.Atoi(strings.TrimSpace(parts[1]))
-	if err1 != nil || err2 != nil {
-		return
-	}
+	r.ensureAutoScheduleDefaults()
+	mins := settings.NormalizeIntervalMinutes(
+		r.Settings.Get(settings.KeyTISyncEveryDay, ""),
+		settings.DefaultTISyncIntervalMinutes,
+	)
+	last := r.Settings.Get(settings.KeyLastTISyncRun, "")
 	now := time.Now()
-	if now.Hour() != hour || now.Minute() != minute {
+	if !settings.IntervalDue(last, mins, now) {
 		return
 	}
-	today := now.Format("2006-01-02")
-	if r.Settings.Get(settings.KeyLastTISyncRun, "") == today {
+	// Do not pull rules/ssdeep while a scan is running; keep interval due until idle.
+	if r.scanningNow() {
+		_ = r.History.Append("ti.defer", "TI sync deferred until scan finishes", map[string]any{
+			"phase": "sync",
+		})
 		return
 	}
-	r.Settings.Set(settings.KeyLastTISyncRun, today)
+	r.Settings.Set(settings.KeyLastTISyncRun, settings.FormatIntervalRunStamp(now))
 	_ = r.Settings.Save()
 	_, _, _ = r.SyncThreatIntel()
 }
@@ -479,6 +531,10 @@ func (r *Runner) tickTISyncSchedule() {
 func (r *Runner) SyncThreatIntel() (rulesN, ssdeepN int, err error) {
 	if r.API == nil {
 		return 0, 0, fmt.Errorf("not connected")
+	}
+	if r.scanningNow() {
+		_ = r.History.Append("ti.defer", "TI sync blocked: scan in progress", nil)
+		return 0, 0, fmt.Errorf("scan in progress — sync will run after the scan finishes")
 	}
 	_ = r.History.Append("download.progress", "Syncing threat intelligence…", map[string]any{"phase": "sync", "percent": 0})
 	_ = r.syncConfigFromServer()
@@ -496,7 +552,7 @@ func (r *Runner) SyncThreatIntel() (rulesN, ssdeepN int, err error) {
 	if ssdeepN > 0 {
 		r.Settings.Set(keyLastSsdeepSync, time.Now().Format(time.RFC3339))
 	}
-	r.Settings.Set(settings.KeyLastTISyncRun, time.Now().Format("2006-01-02"))
+	r.Settings.Set(settings.KeyLastTISyncRun, settings.FormatIntervalRunStamp(time.Now()))
 	_ = r.Settings.Save()
 	r.Settings.Set(settings.KeyTIBootstrapDone, "true")
 	r.Settings.Set(settings.KeyTIDownloadPercent, "100")
@@ -504,6 +560,9 @@ func (r *Runner) SyncThreatIntel() (rulesN, ssdeepN int, err error) {
 	_ = r.Settings.Save()
 	_ = r.History.Append("download.progress", fmt.Sprintf("Sync done (rules=%d ssdeep=%d)", rulesN, ssdeepN), map[string]any{
 		"phase": "sync", "percent": 100, "rules": rulesN, "ssdeep": ssdeepN,
+	})
+	_ = r.History.Append("ui.notify", fmt.Sprintf("Synced rules=%d ssdeep=%d", rulesN, ssdeepN), map[string]any{
+		"kind": "ti_sync",
 	})
 	return rulesN, ssdeepN, nil
 }
@@ -549,14 +608,30 @@ func (r *Runner) doHeartbeat(isLogin bool) {
 	}
 	resp, raw, err := r.API.AgentOnlineTimestamp(isLogin)
 	if err != nil {
+		r.setCenterOnline(false)
 		_ = r.History.Append("api.error", "heartbeat: "+err.Error(), nil)
 		return
 	}
-	if resp.StatusCode != 200 {
+	if resp.StatusCode != 200 && resp.StatusCode != 0 {
+		r.setCenterOnline(false)
 		_ = r.History.Append("api.warn", fmt.Sprintf("heartbeat status=%d body=%s", resp.StatusCode, compact(raw)), nil)
 		return
 	}
+	r.setCenterOnline(true)
 	_ = r.History.Append("heartbeat.ok", "heartbeat ok", nil)
+}
+
+func (r *Runner) setCenterOnline(ok bool) {
+	if r.Settings == nil {
+		return
+	}
+	if ok {
+		r.Settings.Set(settings.KeyCenterOnline, "true")
+		r.Settings.Set(settings.KeyCenterOnlineAt, time.Now().Format(time.RFC3339))
+	} else {
+		r.Settings.Set(settings.KeyCenterOnline, "false")
+	}
+	_ = r.Settings.Save()
 }
 
 func parseApprovedAgentID(data json.RawMessage) (approved bool, agentID int64) {

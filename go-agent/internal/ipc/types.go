@@ -75,6 +75,10 @@ type SettingsView struct {
 	LogLevel            string `json:"log_level"`
 	CacheExpiryHours    string `json:"cache_expiry_hours"`
 	RulesVersion        string `json:"rules_version"`
+	ServerRulesCount    string `json:"server_rules_count"`
+	LocalRulesCount     string `json:"local_rules_count"`
+	SsdeepDBVersion     string `json:"ssdeep_db_version"`
+	LastTISyncRun       string `json:"last_ti_sync_run"`
 }
 
 type UpdateSettingsRequest struct {
@@ -84,9 +88,9 @@ type UpdateSettingsRequest struct {
 	BatchJobEveryDay    string `json:"batchjob_everydate,omitempty"`
 	TISyncEveryDay      string `json:"ti_sync_everydate,omitempty"`
 	AgentUpdateSchedule string `json:"agent_update_schedule,omitempty"`
-	ExclusionPaths      string `json:"exclusion_paths,omitempty"`
+	ExclusionPaths      *string `json:"exclusion_paths,omitempty"`
 	ScanExtensions      string `json:"scan_extensions,omitempty"`
-	QuickScanPaths      string `json:"quick_scan_paths,omitempty"`
+	QuickScanPaths      *string `json:"quick_scan_paths,omitempty"`
 	SsdeepEnabled       *bool  `json:"ssdeep_enabled,omitempty"`
 	SsdeepThreshold     string `json:"ssdeep_threshold,omitempty"`
 	SsdeepReportAPI     *bool  `json:"ssdeep_report_api,omitempty"`
@@ -103,9 +107,21 @@ type HistoryEvent struct {
 }
 
 type RulesInfoResponse struct {
+	Version      string `json:"version"`
+	Count        int    `json:"count"`
+	ServerCount  int    `json:"server_count"`
+	LocalCount   int    `json:"local_count"`
+	UpdatedAt    string `json:"updated_at"`
+	BehindServer bool   `json:"behind_server"`
+}
+
+type SsdeepInfoResponse struct {
+	Enabled   bool   `json:"enabled"`
 	Version   string `json:"version"`
-	Count     int    `json:"count"`
+	Total     int    `json:"total"`
+	Shards    int    `json:"shards"`
 	UpdatedAt string `json:"updated_at"`
+	Threshold string `json:"threshold"`
 }
 
 type QuarantineItem struct {

@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 
 	"github.com/sosecure/insite-agent/internal/config"
@@ -15,6 +16,13 @@ const (
 	KeyYaraRulesPath    = "yara_rules_path"
 	KeyYaraEnginePath   = "yara_engine_path"
 	KeyRulesVersion     = "rules_version"
+	// YARA catalog counts from Center getRule vs local encrypted store.
+	KeyServerRulesCount = "server_rules_count"
+	KeyLocalRulesCount  = "local_rules_count"
+	// KeyServerRuleFilesCount stores unique/pack file count from Center (not rule_names).
+	KeyServerRuleFilesCount = "server_rule_files_count"
+	KeyCenterOnline   = "center_online"
+	KeyCenterOnlineAt = "center_online_at"
 	KeyQuarantinePath   = "quarantine_path"
 	KeyLogLevel         = "log_level"
 	KeyScanExtensions   = "scan_extensions"
@@ -24,11 +32,11 @@ const (
 	KeyAutoScanOnLogin  = "auto_scan_on_login"
 	KeyUSBProtection    = "usb_protection"
 	KeyRealtimeShield   = "realtime_shield"
+	// Daily / interval schedule keys (minutes as decimal string; legacy HH:mm normalized on read).
 	KeyBatchJobEveryDay = "batchjob_everydate"
 	KeyLastBatchJobRun  = "last_batchjob_run"
-	// Daily local HH:mm for rules + ssdeep pack sync (Center/Client mirrored).
-	KeyTISyncEveryDay = "ti_sync_everydate"
-	KeyLastTISyncRun  = "last_ti_sync_run"
+	KeyTISyncEveryDay   = "ti_sync_everydate"
+	KeyLastTISyncRun    = "last_ti_sync_run"
 	KeyAPISecret        = "api_secret"
 	// Ssdeep secondary engine: runs only on files YARA did not flag.
 	KeySsdeepEnabled   = "ssdeep_enabled"
@@ -107,6 +115,11 @@ func (s *Store) setDefaults() {
 	def(KeyYaraRulesPath, "") // rules served from encrypted store (Data/rules/*.blobenc)
 	def(KeyYaraEnginePath, filepath.Join(config.InstallDir(), "Engine", "Yara", "yara64.exe"))
 	def(KeyRulesVersion, "1.1")
+	def(KeyServerRulesCount, "0")
+	def(KeyLocalRulesCount, "0")
+	def(KeyServerRuleFilesCount, "0")
+	def(KeyCenterOnline, "false")
+	def(KeyCenterOnlineAt, "")
 	def(KeyQuarantinePath, filepath.Join(s.baseDir, "Quarantine"))
 	def(KeyLogLevel, "info")
 	def(KeyScanExtensions, DefaultScanExtensions)
@@ -116,8 +129,8 @@ func (s *Store) setDefaults() {
 	def(KeyAutoScanOnLogin, "true")
 	def(KeyUSBProtection, "true")
 	def(KeyRealtimeShield, "true")
-	def(KeyBatchJobEveryDay, "02:00")
-	def(KeyTISyncEveryDay, "03:00")
+	def(KeyBatchJobEveryDay, strconv.Itoa(DefaultBatchIntervalMinutes))
+	def(KeyTISyncEveryDay, strconv.Itoa(DefaultTISyncIntervalMinutes))
 	def(KeyAPISecret, "")
 	def(KeySsdeepEnabled, "true")
 	def(KeySsdeepThreshold, "85")
@@ -132,7 +145,7 @@ func (s *Store) setDefaults() {
 	def(KeyTIDownloadPercent, "0")
 	def(KeyTIDownloadMessage, "")
 	def(KeyTISyncBusy, "false")
-	def(KeyAgentUpdateSchedule, "04:00")
+	def(KeyAgentUpdateSchedule, strconv.Itoa(DefaultAgentUpdateIntervalMinutes))
 	def(KeyAgentVersionCurrent, "")
 	def(KeyAgentVersionTarget, "")
 	def(KeyAgentUpdateStatus, "")
@@ -279,11 +292,35 @@ func (s *Store) QuickScanPaths() []string {
 		return nil
 	}
 	parts := strings.Split(raw, ";")
+	seen := map[string]struct{}{}
 	out := make([]string, 0, len(parts))
-	for _, p := range parts {
-		p = strings.TrimSpace(os.ExpandEnv(p))
-		if p != "" {
-			out = append(out, p)
+	add := func(p string) {
+		p = strings.TrimSpace(p)
+		if p == "" {
+			return
+		}
+		key := strings.ToLower(p)
+		if _, ok := seen[key]; ok {
+			return
+		}
+		seen[key] = struct{}{}
+		out = append(out, p)
+	}
+
+	// When running as SYSTEM, expand user-scoped templates against each
+	// interactive profile so Downloads/Desktop/Temp hit real user folders.
+	profiles := quickScanProfileEnvs()
+	for _, tmpl := range parts {
+		tmpl = strings.TrimSpace(tmpl)
+		if tmpl == "" {
+			continue
+		}
+		if len(profiles) == 0 || !pathNeedsUserEnv(tmpl) {
+			add(os.ExpandEnv(tmpl))
+			continue
+		}
+		for _, env := range profiles {
+			add(expandQuickPath(tmpl, env))
 		}
 	}
 	return out

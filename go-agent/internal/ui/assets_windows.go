@@ -52,6 +52,9 @@ var assetIconHash []byte
 //go:embed assets/icon_batch.png
 var assetIconBatch []byte
 
+//go:embed assets/icon_quick_scan.png
+var assetIconQuickScan []byte
+
 //go:embed assets/icon_conn.png
 var assetIconConn []byte
 
@@ -78,6 +81,7 @@ var (
 	resIconYara  = fyne.NewStaticResource("icon_yara.png", assetIconYara)
 	resIconHash  = fyne.NewStaticResource("icon_hash.png", assetIconHash)
 	resIconBatch = fyne.NewStaticResource("icon_batch.png", assetIconBatch)
+	resIconQuick = fyne.NewStaticResource("icon_quick_scan.png", assetIconQuickScan)
 	resIconConn  = fyne.NewStaticResource("icon_conn.png", assetIconConn)
 	resIconRT    = fyne.NewStaticResource("icon_realtime.png", assetIconRealtime)
 	resIconUSB   = fyne.NewStaticResource("icon_usb.png", assetIconUSB)

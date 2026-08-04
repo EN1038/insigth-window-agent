@@ -30,12 +30,13 @@ type pendingUpdatePayload struct {
 }
 
 func (r *Runner) agentUpdateScheduleLoop(ctx context.Context) {
+	r.ensureAutoScheduleDefaults()
 	t := time.NewTicker(1 * time.Minute)
 	defer t.Stop()
-	// Report version once shortly after start.
+	// Report version once shortly after start (install deferred if scanning).
 	go func() {
 		time.Sleep(5 * time.Second)
-		_ = r.ReportAndCheckAgentUpdate(false)
+		_ = r.ReportAndCheckAgentUpdate(true)
 	}()
 	for {
 		select {
@@ -54,25 +55,21 @@ func (r *Runner) tickAgentUpdateSchedule() {
 	if !r.Settings.GetBool(keyApproved) {
 		return
 	}
-	schedule := r.Settings.Get(settings.KeyAgentUpdateSchedule, "04:00")
-	parts := strings.Split(schedule, ":")
-	if len(parts) < 2 {
-		return
-	}
-	hour, err1 := strconv.Atoi(strings.TrimSpace(parts[0]))
-	minute, err2 := strconv.Atoi(strings.TrimSpace(parts[1]))
-	if err1 != nil || err2 != nil {
-		return
-	}
+	r.ensureAutoScheduleDefaults()
+	mins := settings.NormalizeIntervalMinutes(
+		r.Settings.Get(settings.KeyAgentUpdateSchedule, ""),
+		settings.DefaultAgentUpdateIntervalMinutes,
+	)
+	last := r.Settings.Get(settings.KeyLastAgentUpdateCheck, "")
 	now := time.Now()
-	if now.Hour() != hour || now.Minute() != minute {
+	if !settings.IntervalDue(last, mins, now) {
 		return
 	}
-	today := now.Format("2006-01-02")
-	if r.Settings.Get(settings.KeyLastAgentUpdateCheck, "") == today {
+	if r.scanningNow() {
+		_ = r.History.Append("update.defer", "Agent update check deferred until scan finishes", nil)
 		return
 	}
-	r.Settings.Set(settings.KeyLastAgentUpdateCheck, today)
+	r.Settings.Set(settings.KeyLastAgentUpdateCheck, settings.FormatIntervalRunStamp(now))
 	_ = r.Settings.Save()
 	_ = r.ReportAndCheckAgentUpdate(true)
 }
@@ -85,8 +82,18 @@ func (r *Runner) ReportAndCheckAgentUpdate(autoInstall bool) error {
 	}
 	current := version.AgentVersion
 	r.Settings.Set(settings.KeyAgentVersionCurrent, current)
-	schedule := r.Settings.Get(settings.KeyAgentUpdateSchedule, "04:00")
+	schedule := strconv.Itoa(settings.NormalizeIntervalMinutes(
+		r.Settings.Get(settings.KeyAgentUpdateSchedule, ""),
+		settings.DefaultAgentUpdateIntervalMinutes,
+	))
 	_, _, _ = r.API.ReportAgentVersion(current, schedule)
+
+	// Always allow version reporting; only block download/install while scanning.
+	if autoInstall && r.scanningNow() {
+		r.setAgentUpdateStatus("deferred", "Update deferred until scan finishes")
+		_ = r.History.Append("update.defer", "Agent update download deferred until scan finishes", nil)
+		return nil
+	}
 
 	r.setAgentUpdateStatus("checking", "")
 	_, _, _ = r.API.ReportAgentUpdateStatus("checking", "Checking for agent update", current, "")
@@ -146,6 +153,11 @@ func (r *Runner) ReportAndCheckAgentUpdate(autoInstall bool) error {
 	}
 
 	r.setAgentUpdateStatus("available", "Update available: "+check.TargetVersion)
+	if r.History != nil {
+		_ = r.History.Append("ui.notify", "Update available "+check.TargetVersion, map[string]any{
+			"kind": "agent_update",
+		})
+	}
 	if !autoInstall {
 		return nil
 	}
@@ -156,6 +168,11 @@ func (r *Runner) ReportAndCheckAgentUpdate(autoInstall bool) error {
 func (r *Runner) DownloadAndStageAgentUpdate(targetVersion string, packageID int64, relPath, expectedSHA, kind string) error {
 	if r.API == nil || r.Settings == nil {
 		return fmt.Errorf("not connected")
+	}
+	if r.scanningNow() {
+		r.setAgentUpdateStatus("deferred", "Update deferred until scan finishes")
+		_ = r.History.Append("update.defer", "Agent update download deferred until scan finishes", nil)
+		return fmt.Errorf("scan in progress — agent update deferred")
 	}
 	current := version.AgentVersion
 	if kind == "" {
@@ -208,13 +225,13 @@ func (r *Runner) DownloadAndStageAgentUpdate(targetVersion string, packageID int
 		msg := fmt.Sprintf("sha256 mismatch expected=%s got=%s", expectedSHA, fileSHA)
 		r.setAgentUpdateStatus("failed", msg)
 		_, _, _ = r.API.ReportAgentUpdateStatus("failed", msg, current, targetVersion)
-		return fmt.Errorf(msg)
+		return fmt.Errorf("%s", msg)
 	}
 	if gotSHA != "" && !strings.EqualFold(gotSHA, fileSHA) {
 		_ = os.Remove(staged)
 		msg := "downloaded content sha256 mismatch"
 		r.setAgentUpdateStatus("failed", msg)
-		return fmt.Errorf(msg)
+		return fmt.Errorf("%s", msg)
 	}
 
 	r.Settings.Set(settings.KeyAgentUpdateStagedPath, staged)

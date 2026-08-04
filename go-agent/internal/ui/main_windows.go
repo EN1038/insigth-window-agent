@@ -7,6 +7,7 @@ import (
 	"image"
 	"image/color"
 	"math"
+	"strconv"
 	"strings"
 	"time"
 
@@ -21,7 +22,9 @@ import (
 
 	"github.com/sosecure/insite-agent/internal/config"
 	"github.com/sosecure/insite-agent/internal/ipc"
+	"github.com/sosecure/insite-agent/internal/settings"
 	"github.com/sosecure/insite-agent/internal/sysinfo"
+	"github.com/sosecure/insite-agent/internal/version"
 )
 
 // ---------------------------------------------------------------------------
@@ -32,6 +35,7 @@ func (r *Router) showMain() {
 	r.stopTicker()
 	r.window.SetPadded(false)
 	r.window.Resize(fyne.NewSize(1100, 650))
+	r.window.SetFixedSize(true)
 	r.window.CenterOnScreen()
 
 	pageHost := container.NewStack()
@@ -60,12 +64,18 @@ func (r *Router) showMain() {
 		t := time.NewTicker(3 * time.Second)
 		defer t.Stop()
 		refreshHeader()
+		if r.notifyRefresh != nil {
+			r.notifyRefresh()
+		}
 		for {
 			select {
 			case <-r.ctx.Done():
 				return
 			case <-t.C:
 				refreshHeader()
+				if r.notifyRefresh != nil {
+					r.notifyRefresh()
+				}
 			}
 		}
 	}()
@@ -115,8 +125,11 @@ func (r *Router) buildTopChrome() fyne.CanvasObject {
 	bg := canvas.NewRectangle(color.NRGBA{R: 0x00, G: 0x00, B: 0x00, A: 0xcc})
 	// Hide (not Close): Close destroys the window; tray Open can no longer restore it.
 	closeBtn := chromeCloseButton(func() { r.window.Hide() })
+	bell, refreshBell := r.buildNotifyBell()
+	r.notifyRefresh = refreshBell
+	right := container.NewHBox(bell, hspace(6), closeBtn)
 	drag := container.NewMax(newDragBar(func() uintptr { return r.windowHWND() }))
-	return draggableTopBar(bg, 36, hspace(1), closeBtn, drag)
+	return draggableTopBar(bg, 36, hspace(1), right, drag)
 }
 
 func (r *Router) buildStatsBar() (fyne.CanvasObject, func()) {
@@ -187,8 +200,8 @@ func (r *Router) buildStatsBar() (fyne.CanvasObject, func()) {
 
 func (r *Router) showOverview(setPage func(fyne.CanvasObject)) {
 	// LEFT COLUMN — scan controls (legacy OverviewPage left stack)
-	fullScan := newScanActionButton(resIconScan, "FULL SCAN", true, 80, func() {
-		resp, err := r.client.StartScan(r.ctx, "full", "")
+	startScan := func(scanType, path string) {
+		resp, err := r.client.StartScan(r.ctx, scanType, path)
 		if err != nil {
 			dialog.ShowError(err, r.window)
 			return
@@ -200,36 +213,53 @@ func (r *Router) showOverview(setPage func(fyne.CanvasObject)) {
 			}
 			dialog.ShowInformation("Scan", msg, r.window)
 		}
+	}
+	fullScan := newScanActionButton(resIconScan, "FULL SCAN", true, 80, func() {
+		startScan("full", "")
+	})
+	quickScan := newScanActionButton(resIconQuick, "QUICK SCAN", false, 50, func() {
+		startScan("quick", "")
 	})
 	customScan := newScanActionButton(resIconSet, "CUSTOM SCAN", false, 50, func() {
 		dialog.ShowFolderOpen(func(u fyne.ListableURI, err error) {
 			if err != nil || u == nil {
 				return
 			}
-			resp, e := r.client.StartScan(r.ctx, "custom", u.Path())
-			if e != nil {
-				dialog.ShowError(e, r.window)
-				return
-			}
-			if !resp.OK {
-				msg := resp.Message
-				if strings.TrimSpace(msg) == "" {
-					msg = "Cannot start scan"
-				}
-				dialog.ShowInformation("Scan", msg, r.window)
-			}
+			startScan("custom", u.Path())
 		}, r.window)
 	})
 
-	typeGroup := widget.NewRadioGroup([]string{"REAL TIME", "ON-DEMAND"}, func(string) {})
+	st, _ := r.client.GetSettings(r.ctx)
+	typeGroup := widget.NewRadioGroup([]string{"REAL TIME", "ON-DEMAND"}, nil)
 	typeGroup.Horizontal = false
-	typeGroup.SetSelected("REAL TIME")
+	if st.RealtimeShield {
+		typeGroup.SetSelected("REAL TIME")
+	} else {
+		typeGroup.SetSelected("ON-DEMAND")
+	}
+	typeGroup.OnChanged = func(sel string) {
+		wantRT := sel == "REAL TIME"
+		if err := r.client.UpdateSettings(r.ctx, ipc.UpdateSettingsRequest{
+			RealtimeShield: boolPtr(wantRT),
+		}); err != nil {
+			// Revert UI on failure.
+			if wantRT {
+				typeGroup.SetSelected("ON-DEMAND")
+			} else {
+				typeGroup.SetSelected("REAL TIME")
+			}
+			dialog.ShowError(err, r.window)
+			return
+		}
+	}
 
 	stopCtrl := newStopScanControl(func() { _ = r.client.StopScan(r.ctx) })
 
 	leftCol := container.NewVBox(
 		fullScan,
-		vspace(14),
+		vspace(8),
+		quickScan,
+		vspace(8),
 		customScan,
 		vspace(20),
 		container.NewCenter(heading("TYPE SCAN", 10, colorMuted)),
@@ -239,7 +269,7 @@ func (r *Router) showOverview(setPage func(fyne.CanvasObject)) {
 		container.NewCenter(stopCtrl),
 	)
 	leftScroll := container.NewVScroll(leftCol)
-	const overviewH = float32(488)
+	const overviewH = float32(520)
 	leftPanel := card(container.New(&fixedHeight{h: overviewH}, leftScroll))
 
 	// RIGHT COLUMN — metrics + ring + live log inside one card
@@ -304,10 +334,11 @@ func (r *Router) showOverview(setPage func(fyne.CanvasObject)) {
 	)
 	rightCard := card(container.NewPadded(container.NewPadded(rightCardBody)))
 
-	tools := container.NewGridWithColumns(3,
+	tools := container.NewGridWithColumns(4,
 		toolCard(resIconLog, "VIEW LOGS", func() { r.showViewLogs() }),
 		toolCard(resIconYara, "YARA RULES", func() { r.showYaraRules() }),
 		toolCard(resIconHash, "HASH", func() { r.showHashTool() }),
+		toolCard(resIconBatch, "SSDEEP", func() { r.showSsdeepTool() }),
 	)
 
 	rightCol := container.NewVBox(
@@ -355,7 +386,7 @@ func (r *Router) showOverview(setPage func(fyne.CanvasObject)) {
 	}
 	go func() {
 		refresh()
-		t := time.NewTicker(2 * time.Second)
+		t := time.NewTicker(250 * time.Millisecond)
 		defer t.Stop()
 		for {
 			select {
@@ -435,20 +466,17 @@ func (r *Router) showSettings(setPage func(fyne.CanvasObject)) {
 	auto := widget.NewCheck("", nil)
 	auto.SetChecked(st.AutoScanOnLogin)
 
-	batch := widget.NewEntry()
-	batch.SetText(st.BatchJobEveryDay)
-	batch.SetPlaceHolder("HH:mm")
+	batchIdx := settings.IntervalSelectIndex(st.BatchJobEveryDay, settings.DefaultBatchIntervalMinutes)
+	tiIdx := settings.IntervalSelectIndex(st.TISyncEveryDay, settings.DefaultTISyncIntervalMinutes)
+	updIdx := settings.IntervalSelectIndex(st.AgentUpdateSchedule, settings.DefaultAgentUpdateIntervalMinutes)
+	labels := settings.IntervalPresetLabels()
 
-	tiSync := widget.NewEntry()
-	tiSync.SetText(st.TISyncEveryDay)
-	tiSync.SetPlaceHolder("HH:mm")
-
-	agentUpdSched := widget.NewEntry()
-	agentUpdSched.SetText(st.AgentUpdateSchedule)
-	if strings.TrimSpace(agentUpdSched.Text) == "" {
-		agentUpdSched.SetText("04:00")
-	}
-	agentUpdSched.SetPlaceHolder("HH:mm")
+	batch := widget.NewSelect(labels, nil)
+	batch.SetSelectedIndex(batchIdx)
+	tiSync := widget.NewSelect(labels, nil)
+	tiSync.SetSelectedIndex(tiIdx)
+	agentUpdSched := widget.NewSelect(labels, nil)
+	agentUpdSched.SetSelectedIndex(updIdx)
 
 	excl := widget.NewMultiLineEntry()
 	excl.SetText(st.ExclusionPaths)
@@ -475,11 +503,6 @@ func (r *Router) showSettings(setPage func(fyne.CanvasObject)) {
 	threshold.SetText(st.SsdeepThreshold)
 	threshold.SetPlaceHolder("85")
 
-	logLevel := widget.NewEntry()
-	logLevel.SetText(st.LogLevel)
-	cacheHours := widget.NewEntry()
-	cacheHours.SetText(st.CacheExpiryHours)
-
 	protection := card(container.NewVBox(
 		sectionHeaderImg(resIconRT, "Protection"),
 		vspace(4),
@@ -491,15 +514,15 @@ func (r *Router) showSettings(setPage func(fyne.CanvasObject)) {
 	))
 
 	schedule := card(container.NewVBox(
-		sectionHeaderImg(resIconBatch, "Scheduled scan & scope"),
+		sectionHeaderImg(resIconBatch, "Scheduled scan & sync"),
 		vspace(4),
-		fieldLabel("Daily batch scan time (HH:mm)"),
+		fieldLabel("Batch scan interval"),
 		batch,
 		vspace(8),
-		fieldLabel("Daily threat intelligence sync (rules + ssdeep, HH:mm)"),
+		fieldLabel("Threat intelligence sync (rules + ssdeep)"),
 		tiSync,
 		vspace(8),
-		fieldLabel("Daily agent update check time (HH:mm)"),
+		fieldLabel("Agent update check interval"),
 		agentUpdSched,
 		vspace(8),
 		fieldLabel("Excluded paths (one per line)"),
@@ -524,25 +547,18 @@ func (r *Router) showSettings(setPage func(fyne.CanvasObject)) {
 		divider(),
 		toggleRowImg(resIconConn, "Quarantine on detect", "Isolate matched files", quarantine),
 		divider(),
-		toggleRowImg(resIconConn, "Send ssdeep candidate", "Queue unknown samples", sendCand),
+		toggleRowImg(resIconConn, "Send ssdeep candidate", "Send fuzzy hashes to Center for auto pack update (default off)", sendCand),
 	))
 
-	advanced := card(container.NewVBox(
-		sectionHeaderImg(resIconSet, "Advanced"),
-		vspace(4),
-		fieldLabel("Log level"),
-		logLevel,
-		vspace(6),
-		fieldLabel("Cache expiry (hours)"),
-		cacheHours,
-	))
-
-	rulesVer := muted("Version " + orDash(st.RulesVersion))
+	rulesVer := muted(fmt.Sprintf("local=%s  server=%s  ver=%s",
+		orDash(st.LocalRulesCount), orDash(st.ServerRulesCount), orDash(st.RulesVersion)))
 	syncBtn := widget.NewButtonWithIcon("Sync now", theme.DownloadIcon(), nil)
 	syncBtn.OnTapped = func() {
 		syncBtn.Disable()
+		syncBtn.SetText("Syncing...")
 		r.runThreatIntelSyncUI(func(err error, msg string) {
 			syncBtn.Enable()
+			syncBtn.SetText("Sync now")
 			if err != nil {
 				dialog.ShowError(err, r.window)
 				return
@@ -563,7 +579,7 @@ func (r *Router) showSettings(setPage func(fyne.CanvasObject)) {
 
 	curVer := orDash(st.AgentVersionCurrent)
 	if curVer == "-" {
-		curVer = "4.1.0"
+		curVer = version.AgentVersion
 	}
 	tgtVer := orDash(st.AgentVersionTarget)
 	updStatus := orDash(st.AgentUpdateStatus)
@@ -572,11 +588,13 @@ func (r *Router) showSettings(setPage func(fyne.CanvasObject)) {
 	checkBtn.OnTapped = func() {
 		checkBtn.Disable()
 		installBtn.Disable()
+		checkBtn.SetText("Checking...")
 		go func() {
 			out, err := r.client.CheckAgentUpdate(r.ctx)
 			fyne.Do(func() {
 				checkBtn.Enable()
 				installBtn.Enable()
+				checkBtn.SetText("Check update")
 				if err != nil {
 					dialog.ShowError(err, r.window)
 					return
@@ -595,11 +613,22 @@ func (r *Router) showSettings(setPage func(fyne.CanvasObject)) {
 				}
 				checkBtn.Disable()
 				installBtn.Disable()
+				installBtn.SetText("Downloading...")
+
+				progressMsg := canvasMuted("Downloading agent update package from Center...", colorMuted)
+				progressBar := widget.NewProgressBarInfinite()
+				loadingContent := container.NewVBox(progressMsg, vspace(10), progressBar)
+				loadingDlg := dialog.NewCustomWithoutButtons("Downloading Agent Update", container.NewPadded(loadingContent), r.window)
+				loadingDlg.Resize(fyne.NewSize(440, 140))
+				loadingDlg.Show()
+
 				go func() {
 					out, err := r.client.InstallAgentUpdate(r.ctx)
 					fyne.Do(func() {
+						loadingDlg.Hide()
 						checkBtn.Enable()
 						installBtn.Enable()
+						installBtn.SetText("Update now")
 						if err != nil {
 							dialog.ShowError(err, r.window)
 							return
@@ -622,23 +651,28 @@ func (r *Router) showSettings(setPage func(fyne.CanvasObject)) {
 	))
 
 	save := widget.NewButtonWithIcon("Save settings", theme.DocumentSaveIcon(), func() {
+		intervalAt := func(sel *widget.Select, def int) string {
+			idx := sel.SelectedIndex()
+			if idx < 0 || idx >= len(settings.IntervalPresets) {
+				return strconv.Itoa(def)
+			}
+			return strconv.Itoa(settings.IntervalPresets[idx])
+		}
 		if err := r.client.UpdateSettings(r.ctx, ipc.UpdateSettingsRequest{
 			RealtimeShield:      boolPtr(rt.Checked),
 			USBProtection:       boolPtr(usb.Checked),
 			AutoScanOnLogin:     boolPtr(auto.Checked),
-			BatchJobEveryDay:    batch.Text,
-			TISyncEveryDay:      tiSync.Text,
-			AgentUpdateSchedule: agentUpdSched.Text,
-			ExclusionPaths:      excl.Text,
+			BatchJobEveryDay:    intervalAt(batch, settings.DefaultBatchIntervalMinutes),
+			TISyncEveryDay:      intervalAt(tiSync, settings.DefaultTISyncIntervalMinutes),
+			AgentUpdateSchedule: intervalAt(agentUpdSched, settings.DefaultAgentUpdateIntervalMinutes),
+			ExclusionPaths:      strPtr(excl.Text),
 			ScanExtensions:      scanExt.Text,
-			QuickScanPaths:      quick.Text,
+			QuickScanPaths:      strPtr(quick.Text),
 			SsdeepEnabled:       boolPtr(ssdeepOn.Checked),
 			SsdeepThreshold:     threshold.Text,
 			SsdeepReportAPI:     boolPtr(ssdeepReport.Checked),
 			QuarantineOnDetect:  boolPtr(quarantine.Checked),
 			SendSsdeepCandidate: boolPtr(sendCand.Checked),
-			LogLevel:            logLevel.Text,
-			CacheExpiryHours:    cacheHours.Text,
 		}); err != nil {
 			dialog.ShowError(err, r.window)
 			return
@@ -647,7 +681,7 @@ func (r *Router) showSettings(setPage func(fyne.CanvasObject)) {
 	})
 	save.Importance = widget.HighImportance
 
-	logout := widget.NewButtonWithIcon("Sign out", theme.LogoutIcon(), func() {
+	logout := newDangerButton("Sign out", func() {
 		dialog.ShowConfirm("Sign out", "Sign out of this agent?", func(ok bool) {
 			if !ok {
 				return
@@ -656,18 +690,16 @@ func (r *Router) showSettings(setPage func(fyne.CanvasObject)) {
 			r.showLogin()
 		}, r.window)
 	})
-	logout.Importance = widget.DangerImportance
 
 	body := container.NewVBox(
 		protection, vspace(6),
 		schedule, vspace(6),
 		ssdeepCard, vspace(6),
-		advanced, vspace(6),
 		rulesCard, vspace(6),
 		updateCard, vspace(6),
 		container.NewGridWithColumns(2, logout, save),
 	)
-	setPage(container.NewPadded(container.NewVScroll(body)))
+	setPage(container.NewPadded(container.NewVScroll(container.New(&flexWidth{}, body))))
 }
 
 // ---------------------------------------------------------------------------
@@ -675,76 +707,158 @@ func (r *Router) showSettings(setPage func(fyne.CanvasObject)) {
 // ---------------------------------------------------------------------------
 
 func (r *Router) showAbout(setPage func(fyne.CanvasObject)) {
+	// Re-lock size: long Info labels previously inflated MinSize and grew the window,
+	// leaving an empty dark strip on the right.
+	r.window.SetFixedSize(true)
+	r.window.Resize(fyne.NewSize(1100, 650))
+
+	onlineNow, _ := r.client.TestConnection(r.ctx)
 	status, _ := r.client.Status(r.ctx)
 	cfg, _ := r.client.GetConfig(r.ctx)
 	rulesInfo, _ := r.client.RulesInfo(r.ctx)
+	ssdeepInfo, _ := r.client.SsdeepInfo(r.ctx)
+	st, _ := r.client.GetSettings(r.ctx)
 	scan, _ := r.client.ScanStatus(r.ctx)
 
-	online := "OFFLINE"
-	if status.Online {
-		online = "ONLINE"
+	onlineLbl := "OFFLINE"
+	onlineColor := colorError
+	// Same source as header: live TestConnection updates cache; Status.Online reads it.
+	if onlineNow || status.Online {
+		onlineLbl = "ONLINE"
+		onlineColor = colorSuccess
 	}
-	scanning := "IDLE"
+	scanningLbl := "IDLE"
+	scanColor := colorMuted
 	if scan.Scanning {
-		scanning = "SCANNING (" + titleCase(scan.ScanType) + ")"
+		scanningLbl = "SCANNING"
+		scanColor = colorWarning
 	}
 
-	dataDir := config.DataBaseDir()
-	installDir := config.InstallDir()
+	dataDir := truncateText(config.DataBaseDir(), 56)
+	installDir := truncateText(config.InstallDir(), 56)
+	siteName := orDash(cfg.SiteName)
+	if siteName != "—" {
+		siteName = strings.ToUpper(siteName)
+	}
+
+	ssdeepHashes := "—"
+	if ssdeepInfo.Total > 0 {
+		ssdeepHashes = fmt.Sprintf("%d hashes · %d shards", ssdeepInfo.Total, ssdeepInfo.Shards)
+	} else if ssdeepInfo.Shards > 0 {
+		ssdeepHashes = fmt.Sprintf("%d shards loaded", ssdeepInfo.Shards)
+	}
+	ssdeepVer := orDash(ssdeepInfo.Version)
+	if ssdeepVer == "—" {
+		ssdeepVer = orDash(st.SsdeepDBVersion)
+	}
+
+	statusPill := func(caption, value string, c color.Color) fyne.CanvasObject {
+		val := heading(value, 14, c)
+		return card(container.NewPadded(container.NewVBox(
+			heading(caption, 9, colorMuted),
+			vspace(2),
+			val,
+		)))
+	}
+
+	heroLeft := container.NewVBox(
+		heading("Threat inSight", 22, colorText),
+		vspace(4),
+		muted("Endpoint protection · YARA + ssdeep"),
+		vspace(10),
+		container.NewHBox(
+			card(container.NewPadded(heading("v"+version.AgentVersion, 12, colorAccentCyan))),
+			hspace(8),
+			card(container.NewPadded(heading("Agent "+orDash(status.AgentID), 12, colorText))),
+		),
+	)
+	hero := card(container.NewPadded(container.NewBorder(nil, nil,
+		container.NewCenter(img(resLogoAbout, 200, 72)),
+		nil,
+		container.NewPadded(heroLeft),
+	)))
+
+	pills := container.NewGridWithColumns(3,
+		statusPill("CONNECTION", onlineLbl, onlineColor),
+		statusPill("SCAN", scanningLbl, scanColor),
+		statusPill("TI SYNC", shortStamp(st.LastTISyncRun), colorText),
+	)
+
+	deviceCard := card(container.NewPadded(container.NewVBox(
+		sectionHeaderImg(resIconStat, "Device"),
+		vspace(8),
+		infoRow("Agent ID", orDash(status.AgentID)),
+		divider(),
+		infoRow("OS", truncateText(sysinfo.OsDescription(), 40)),
+		divider(),
+		infoRow("Edition", "Go agent"),
+	)))
+
+	yaraCount := fmt.Sprintf("%d", rulesInfo.Count)
+	if rulesInfo.Count == 0 && rulesInfo.LocalCount > 0 {
+		yaraCount = fmt.Sprintf("%d", rulesInfo.LocalCount)
+	}
+
+	rulesCard := card(container.NewPadded(container.NewVBox(
+		sectionHeaderImg(resIconYara, "Threat intelligence"),
+		vspace(8),
+		infoRow("YARA version", truncateText(orDash(rulesInfo.Version), 28)),
+		divider(),
+		infoRow("YARA rules", yaraCount),
+		divider(),
+		infoRow("Ssdeep DB", truncateText(ssdeepVer, 28)),
+		divider(),
+		infoRow("Ssdeep loaded", ssdeepHashes),
+		divider(),
+		infoRow("Rules updated", truncateText(orDash(rulesInfo.UpdatedAt), 28)),
+	)))
+
+	siteCard := card(container.NewPadded(container.NewVBox(
+		sectionHeaderImg(resIconConn, "Site"),
+		vspace(8),
+		infoRow("Name", truncateText(siteName, 40)),
+		divider(),
+		infoRow("Center", truncateText(orDash(cfg.SiteIP), 40)),
+		divider(),
+		infoRow("Site ID", truncateText(orDash(cfg.SiteID), 36)),
+	)))
+
+	pathsCard := card(container.NewPadded(container.NewVBox(
+		sectionHeaderImg(resIconInfo, "Paths"),
+		vspace(8),
+		infoRow("Data", dataDir),
+		divider(),
+		infoRow("Install", installDir),
+	)))
+
+	grid := container.NewGridWithColumns(2, deviceCard, rulesCard, siteCard, pathsCard)
 
 	body := container.NewVBox(
-		vspace(10),
-		container.NewCenter(img(resLogoAbout, 300, 110)),
+		hero,
 		vspace(12),
-		card(container.NewVBox(
-			sectionHeaderImg(resIconStat, "Device & status"),
-			vspace(6),
-			infoRow("Agent ID", orDash(status.AgentID)),
-			divider(),
-			infoRow("Connection", online),
-			divider(),
-			infoRow("Scan", scanning),
-		)),
-		vspace(10),
-		card(container.NewVBox(
-			sectionHeaderImg(resIconYara, "Threat rules"),
-			vspace(6),
-			infoRow("Rules version", orDash(rulesInfo.Version)),
-			divider(),
-			infoRow("Rules count", fmt.Sprintf("%d", rulesInfo.Count)),
-			divider(),
-			infoRow("Updated at", orDash(rulesInfo.UpdatedAt)),
-		)),
-		vspace(10),
-		card(container.NewVBox(
-			sectionHeaderImg(resIconConn, "Site config"),
-			vspace(6),
-			infoRow("Site name", orDash(cfg.SiteName)),
-			divider(),
-			infoRow("Site IP", orDash(cfg.SiteIP)),
-			divider(),
-			infoRow("Site ID", orDash(cfg.SiteID)),
-		)),
-		vspace(10),
-		card(container.NewVBox(
-			sectionHeaderImg(resIconInfo, "About"),
-			vspace(6),
-			infoRow("Edition", "Go rewrite"),
-			divider(),
-			infoRow("Platform", "Windows Server 2012 R2 and newer"),
-			divider(),
-			infoRow("Engine", "YARA rules + real-time monitor"),
-			divider(),
-			infoRow("Version", "4"),
-			divider(),
-			infoRow("Data directory", dataDir),
-			divider(),
-			infoRow("Install directory", installDir),
-		)),
+		pills,
+		vspace(12),
+		grid,
 		vspace(16),
 		container.NewCenter(muted("© SOSECURE · Threat inSight")),
+		vspace(8),
 	)
-	setPage(container.NewPadded(container.NewVScroll(container.NewCenter(container.New(&fixedWidth{w: 460}, body)))))
+	// flexWidth: fill the content pane, but never report a huge MinWidth.
+	setPage(container.NewPadded(container.NewVScroll(container.New(&flexWidth{}, body))))
+}
+
+func shortStamp(t string) string {
+	t = strings.TrimSpace(t)
+	if t == "" {
+		return "—"
+	}
+	if len(t) >= 16 {
+		if t[10] == 'T' {
+			return strings.Replace(t[5:16], "T", " ", 1)
+		}
+		return t[5:16]
+	}
+	return t
 }
 
 // ---------------------------------------------------------------------------

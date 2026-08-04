@@ -21,6 +21,7 @@ import (
 	"fyne.io/fyne/v2/widget"
 
 	"github.com/sosecure/insite-agent/internal/ipc"
+	"github.com/sosecure/insite-agent/internal/version"
 )
 
 const appTitle = "SOSECURE Threat inSight"
@@ -76,8 +77,9 @@ type Router struct {
 	ctx      context.Context
 	embedded bool
 
-	stopRefresh chan struct{}
-	hwnd        atomic.Uintptr
+	stopRefresh   chan struct{}
+	hwnd          atomic.Uintptr
+	notifyRefresh func()
 }
 
 func (r *Router) setupTrayAndCloseBehavior() {
@@ -158,6 +160,19 @@ func (r *Router) stopTicker() {
 }
 
 func (r *Router) showFlow() {
+	r.stopTicker()
+	st, err := r.client.Status(r.ctx)
+	if err != nil {
+		r.window.SetContent(r.errorScreen("Cannot reach the agent service.\n" + err.Error()))
+		return
+	}
+	// Always open on the Site config screen first (Server IP / Site Code / Site Key).
+	_ = st
+	r.showConfig()
+}
+
+// continueAfterConfig resumes approval → TI download → login → main.
+func (r *Router) continueAfterConfig() {
 	r.stopTicker()
 	st, err := r.client.Status(r.ctx)
 	if err != nil {
@@ -246,7 +261,7 @@ func (r *Router) authBottomBar(showConn bool) (fyne.CanvasObject, func()) {
 		canvasMuted("Powered By : ", colorText),
 		heading("SOSECURE", 12, colorAccentCyan),
 	)
-	version := canvasMuted("Version : 4", colorMuted)
+	versionLbl := canvasMuted("Version : "+version.AgentVersion, colorMuted)
 
 	var left fyne.CanvasObject
 	var starter func()
@@ -261,7 +276,7 @@ func (r *Router) authBottomBar(showConn bool) (fyne.CanvasObject, func()) {
 
 	row := container.NewBorder(nil, nil,
 		container.NewHBox(hspace(6), container.NewCenter(left)),
-		container.NewHBox(container.NewCenter(version), hspace(6)),
+		container.NewHBox(container.NewCenter(versionLbl), hspace(6)),
 		container.NewCenter(poweredBy),
 	)
 	return container.NewStack(bg, container.NewVBox(layout.NewSpacer(), row, layout.NewSpacer())), starter
@@ -316,7 +331,7 @@ func (r *Router) showAboutDialog() {
 		container.NewCenter(img(resLogoAbout, 240, 90)),
 		vspace(6),
 		container.NewCenter(muted("Endpoint threat detection agent")),
-		container.NewCenter(muted("Edition: Go rewrite  ·  Version 4")),
+		container.NewCenter(muted("Edition: Go rewrite  ·  Version "+version.AgentVersion)),
 		container.NewCenter(muted("© SOSECURE · Threat inSight")),
 	)
 	dialog.ShowCustom("About SOSECURE", "Close", container.NewPadded(body), r.window)
@@ -382,11 +397,11 @@ func (r *Router) showConfig() {
 			status.Refresh()
 			return
 		}
-		r.showApproval()
+		r.continueAfterConfig()
 	})
 	saveBtn.Importance = widget.HighImportance
 
-	form := container.NewVBox(
+	formItems := []fyne.CanvasObject{
 		img(resLogoFull, 220, 66),
 		vspace(24),
 		fieldLabel("Server IP"),
@@ -399,9 +414,18 @@ func (r *Router) showConfig() {
 		authField(keyEntry),
 		vspace(20),
 		tallButton(saveBtn),
-		vspace(8),
-		status,
-	)
+	}
+
+	// If site credentials already exist, allow skipping re-entry.
+	if st, err := r.client.Status(r.ctx); err == nil && st.HasConfig {
+		cont := widget.NewButton("CONTINUE WITH SAVED SITE", func() { r.continueAfterConfig() })
+		formItems = append(formItems, vspace(8), tallButton(cont))
+		status.Text = "Enter new site details, or continue with the saved site"
+		status.Refresh()
+	}
+
+	formItems = append(formItems, vspace(8), status)
+	form := container.NewVBox(formItems...)
 	r.window.SetContent(r.authScreen(form, true))
 }
 
@@ -709,7 +733,9 @@ func newApprovalLogPanel(r *Router, maxLines int) (fyne.CanvasObject, func() []i
 				Kind:    "api.error",
 				Message: "Cannot read activity log: " + err.Error(),
 			}}
-			logList.Refresh()
+			fyne.Do(func() {
+				logList.Refresh()
+			})
 			return logEvents
 		}
 		filtered := filterConnectionEvents(ev, maxLines)
@@ -721,7 +747,9 @@ func newApprovalLogPanel(r *Router, maxLines int) (fyne.CanvasObject, func() []i
 			}}
 		}
 		logEvents = filtered
-		logList.Refresh()
+		fyne.Do(func() {
+			logList.Refresh()
+		})
 		return logEvents
 	}
 
@@ -797,7 +825,7 @@ func approvalStatusFromEvents(events []ipc.HistoryEvent) (headline, detail strin
 		case e.Kind == "approve.wait":
 			hasApproveWait = true
 			latestMsg = e.Message
-		case strings.HasPrefix(e.Kind, "api.error"), e.Kind == "api.warn":
+		case strings.HasPrefix(e.Kind, "api.error"):
 			hasAPIError = true
 			if !hasApproveWait {
 				latestMsg = e.Message
@@ -895,7 +923,10 @@ func toggleRow(title, sub string, check *widget.Check) fyne.CanvasObject {
 }
 
 func infoRow(k, v string) fyne.CanvasObject {
-	return container.NewBorder(nil, nil, muted(k), label(v))
+	v = truncateText(strings.TrimSpace(v), 64)
+	key := muted(k)
+	val := label(v)
+	return container.NewBorder(nil, nil, container.New(&fixedWidth{w: 118}, key), nil, val)
 }
 
 func divider() fyne.CanvasObject {
@@ -905,6 +936,8 @@ func divider() fyne.CanvasObject {
 }
 
 func boolPtr(v bool) *bool { return &v }
+
+func strPtr(v string) *string { return &v }
 
 func orDash(s string) string {
 	if strings.TrimSpace(s) == "" {

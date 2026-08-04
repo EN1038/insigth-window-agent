@@ -72,20 +72,51 @@ func writeScanListUTF16(path string, files []string) error {
 }
 
 func buildRuleArgs(entries []string) []string {
-	if len(entries) == 1 {
-		return []string{entries[0]}
+	// Prefer a single primary ruleset. Passing multiple files with
+	// Custom:/Master: namespaces makes this yara64 build emit errors and
+	// drop real matches (observed: 0 hits with 2 entries, many hits with rules.yar alone).
+	if preferred := preferRuleEntrypoint(entries); preferred != "" {
+		return []string{preferred}
 	}
-	var args []string
-	for i, e := range entries {
-		ns := fmt.Sprintf("R%d", i)
-		if i == 0 {
-			ns = "Custom"
-		} else if i == 1 {
-			ns = "Master"
+	if len(entries) == 0 {
+		return nil
+	}
+	return []string{entries[0]}
+}
+
+func preferRuleEntrypoint(entries []string) string {
+	if len(entries) == 0 {
+		return ""
+	}
+	priority := []string{"_insite_all.yar", "rules_unified.yar", "index.yar", "rules.yar"}
+	byBase := map[string]string{}
+	for _, e := range entries {
+		byBase[strings.ToLower(filepath.Base(e))] = e
+	}
+	for _, name := range priority {
+		if p, ok := byBase[name]; ok {
+			if st, err := os.Stat(p); err == nil && st.Size() > 0 {
+				return p
+			}
 		}
-		args = append(args, fmt.Sprintf(`%s:"%s"`, ns, e))
 	}
-	return args
+	// Fallback: largest .yar entry (skip tiny stubs).
+	best := ""
+	var bestSize int64
+	for _, e := range entries {
+		st, err := os.Stat(e)
+		if err != nil || st.Size() <= 64 {
+			continue
+		}
+		if st.Size() > bestSize {
+			bestSize = st.Size()
+			best = e
+		}
+	}
+	if best != "" {
+		return best
+	}
+	return entries[0]
 }
 
 func parseYaraOutput(output string) []Match {
@@ -93,7 +124,15 @@ func parseYaraOutput(output string) []Match {
 	scanner := bufio.NewScanner(strings.NewReader(output))
 	for scanner.Scan() {
 		line := strings.TrimSpace(scanner.Text())
-		if line == "" || strings.HasPrefix(line, "warning:") {
+		if line == "" {
+			continue
+		}
+		lower := strings.ToLower(line)
+		if strings.HasPrefix(lower, "warning:") || strings.HasPrefix(lower, "error:") || strings.HasPrefix(lower, "error ") {
+			continue
+		}
+		// Compile diagnostics look like: C:\path\file.yar(12): error: ...
+		if strings.Contains(lower, "): error") || strings.Contains(lower, "): warning") {
 			continue
 		}
 		idx := strings.Index(line, " ")
@@ -102,6 +141,13 @@ func parseYaraOutput(output string) []Match {
 		}
 		rule := line[:idx]
 		path := strings.Trim(strings.TrimSpace(line[idx+1:]), `"`)
+		if rule == "" || path == "" {
+			continue
+		}
+		// Defensive: never treat compiler chatter as a match path.
+		if strings.HasPrefix(strings.ToLower(path), "error:") || strings.HasPrefix(strings.ToLower(path), "warning:") {
+			continue
+		}
 		matches = append(matches, Match{Rule: rule, FilePath: path})
 	}
 	return matches
@@ -109,25 +155,29 @@ func parseYaraOutput(output string) []Match {
 
 func ResolveYaraPath(baseDir, configured string) string {
 	installDir := config.InstallDir()
-	candidates := []string{configured}
-	if configured == "" {
-		candidates = nil
+	var candidates []string
+	if configured != "" {
+		candidates = append(candidates, configured)
 	}
+	parentDir := filepath.Dir(baseDir)
+	grandParentDir := filepath.Dir(parentDir)
+
 	candidates = append(candidates,
-		filepath.Join(installDir, "yara64.exe"),
-		filepath.Join(installDir, "Engine", "Yara", "yara64.exe"),
-		filepath.Join(baseDir, "yara64.exe"),
 		filepath.Join(baseDir, "Engine", "Yara", "yara64.exe"),
+		filepath.Join(baseDir, "yara64.exe"),
+		filepath.Join(parentDir, "Engine", "Yara", "yara64.exe"),
+		filepath.Join(grandParentDir, "Engine", "Yara", "yara64.exe"),
+		filepath.Join(installDir, "Engine", "Yara", "yara64.exe"),
+		filepath.Join(installDir, "yara64.exe"),
+		`C:\Program Files\SOSECURE\SOSECURE Threat inSight\Engine\Yara\yara64.exe`,
 	)
 	for _, p := range candidates {
+		p = strings.TrimSpace(p)
 		if p != "" {
 			if _, err := os.Stat(p); err == nil {
 				return p
 			}
 		}
 	}
-	if configured != "" {
-		return configured
-	}
-	return filepath.Join(installDir, "Engine", "Yara", "yara64.exe")
+	return filepath.Join(baseDir, "Engine", "Yara", "yara64.exe")
 }

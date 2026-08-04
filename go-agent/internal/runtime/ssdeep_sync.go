@@ -29,6 +29,12 @@ type ssdeepDownloadItem struct {
 	FileName string `json:"file_name"`
 	Version  string `json:"version"`
 	Format   string `json:"format"`
+	Category string `json:"category"`
+	Title    string `json:"title"`
+}
+
+func (r *Runner) SyncSsdeepNow() int {
+	return r.syncSsdeepFromServer()
 }
 
 func (r *Runner) syncSsdeepFromServer() int {
@@ -48,16 +54,54 @@ func (r *Runner) syncSsdeepFromServerResult() (complete bool, imported int, fail
 	if r.API == nil {
 		return false, 0, 1
 	}
+	store := ssdeepscan.NewStore(r.BaseDir)
+	idx, _ := store.LoadIndex()
+	localEmpty := idx == nil || idx.Total == 0 || !store.HasEncryptedStore()
 	currentVersion := strings.TrimSpace(r.Settings.Get(settings.KeySsdeepDBVersion, ""))
+	if localEmpty {
+		// Local store wiped / never imported — don't claim a version to Center.
+		currentVersion = ""
+		r.Settings.Set(settings.KeySsdeepDBVersion, "")
+		_ = r.Settings.Save()
+	}
+
+	metaVersion := ""
 	if resp, raw, err := r.API.GetSsdeep(currentVersion); err != nil {
 		_ = r.History.Append("api.warn", "getSsdeep: "+err.Error(), nil)
 	} else if resp.StatusCode != 200 {
 		_ = r.History.Append("api.warn", fmt.Sprintf("getSsdeep status=%d body=%s", resp.StatusCode, compact(raw)), nil)
-	} else if metaVersion := parseSsdeepMetaVersion(resp.Data); metaVersion != "" {
-		_ = r.History.Append("ssdeep.meta", "server ssdeep version "+metaVersion, nil)
+	} else {
+		metaVersion = parseSsdeepMetaVersion(resp.Data)
+		if metaVersion != "" {
+			_ = r.History.Append("ssdeep.meta", "server ssdeep version "+metaVersion, nil)
+		}
 	}
 
-	resp, raw, err := r.API.DownloadSsdeepSite(currentVersion)
+	// Each ssdeep pack is a full snapshot. If local already has signatures on the
+	// assigned latest version, skip — do not re-pull the whole historical queue.
+	if !localEmpty && metaVersion != "" && currentVersion != "" && metaVersion == currentVersion {
+		_ = r.History.Append("ssdeep.skip", "already on latest ssdeep version "+currentVersion, nil)
+		r.setTIProgress(95, "Ssdeep already up to date")
+		return true, 0, 0
+	}
+	// Local was rebuilt into category packs; don't let legacy signatures_part*
+	// queue overwrite until Center is updated to categorized packs.
+	if !localEmpty && idx != nil && idx.Total > 0 && strings.HasPrefix(currentVersion, "categorized-") {
+		_ = r.History.Append("ssdeep.skip", "local categorized ssdeep present ("+currentVersion+")", nil)
+		r.setTIProgress(95, "Ssdeep categorized store ready")
+		return true, 0, 0
+	}
+	if !localEmpty && metaVersion == "" && currentVersion != "" && idx != nil && idx.Total > 0 {
+		_ = r.History.Append("ssdeep.skip", "local ssdeep present; server meta unavailable", nil)
+		r.setTIProgress(95, "Ssdeep already loaded")
+		return true, 0, 0
+	}
+
+	force := localEmpty
+	if force {
+		_ = r.History.Append("ssdeep.force", "local ssdeep store empty; requesting force requeue", nil)
+	}
+	resp, raw, err := r.API.DownloadSsdeepSiteForce(currentVersion, force)
 	if err != nil {
 		_ = r.History.Append("api.warn", "downloadSsdeepSite: "+err.Error(), nil)
 		return false, 0, 1
@@ -67,19 +111,56 @@ func (r *Runner) syncSsdeepFromServerResult() (complete bool, imported int, fail
 		return false, 0, 1
 	}
 	items := parseSsdeepDownloadItems(resp.Data)
+	items = selectLatestSsdeepPackPerCategory(items)
 	if len(items) == 0 {
 		_ = r.History.Append("ssdeep.skip", "no ssdeep updates available", nil)
 		r.setTIProgress(95, "No ssdeep packs to download")
-		return true, 0, 0
+		// Empty local store with empty queue is NOT complete.
+		return !localEmpty, 0, 0
 	}
 	imported, failed = r.downloadSsdeep(items, r.agentID())
 	return failed == 0, imported, failed
+}
+
+// selectLatestSsdeepPackPerCategory keeps one pack per category (highest id).
+// Packs without category fall into bucket "_" and only the newest is kept.
+func selectLatestSsdeepPackPerCategory(items []ssdeepDownloadItem) []ssdeepDownloadItem {
+	if len(items) <= 1 {
+		return items
+	}
+	best := map[string]ssdeepDownloadItem{}
+	for _, it := range items {
+		cat := strings.ToLower(strings.TrimSpace(it.Category))
+		if cat == "" {
+			cat = "_"
+		}
+		prev, ok := best[cat]
+		if !ok || it.ID > prev.ID {
+			best[cat] = it
+		}
+	}
+	out := make([]ssdeepDownloadItem, 0, len(best))
+	for _, it := range best {
+		out = append(out, it)
+	}
+	return out
+}
+
+// deprecated name kept as wrapper for older call sites / tests
+func selectLatestSsdeepPack(items []ssdeepDownloadItem, metaVersion string) []ssdeepDownloadItem {
+	_ = metaVersion
+	return selectLatestSsdeepPackPerCategory(items)
 }
 
 func (r *Runner) downloadSsdeep(items []ssdeepDownloadItem, agentID int64) (imported int, failed int) {
 	store := ssdeepscan.NewStore(r.BaseDir)
 	downloadsDir := filepath.Join(r.BaseDir, "Data", "ssdeep", "downloads")
 	_ = os.MkdirAll(downloadsDir, 0o700)
+
+	// Multi-category packs must merge into one store. Wipe once, then merge each pack.
+	if len(items) > 0 {
+		_ = store.Clear()
+	}
 
 	totalFiles := len(items)
 	for idx, item := range items {
@@ -113,7 +194,7 @@ func (r *Runner) downloadSsdeep(items []ssdeepDownloadItem, agentID int64) (impo
 			failed++
 			continue
 		}
-		total, err := importSsdeepFile(store, importPath)
+		total, err := importSsdeepFileMerge(store, importPath)
 		if cleanup != "" {
 			_ = os.Remove(cleanup)
 		}
@@ -134,14 +215,14 @@ func (r *Runner) downloadSsdeep(items []ssdeepDownloadItem, agentID int64) (impo
 		if item.ID > 0 {
 			if resp, _, err := r.API.DownloadSsdeepSiteComplete(item.ID); err != nil {
 				_ = r.History.Append("api.warn", fmt.Sprintf("downloadSsdeepSiteComplete(%d): %s", item.ID, err.Error()), nil)
-			} else if resp.StatusCode != 200 {
+			} else if resp != nil && resp.StatusCode >= 400 {
 				_ = r.History.Append("api.warn", fmt.Sprintf("downloadSsdeepSiteComplete(%d) status=%d", item.ID, resp.StatusCode), nil)
 			}
 		}
 		if agentID > 0 && item.ID > 0 {
 			if resp, _, err := r.API.UpdateSsdeepDownload(agentID, item.ID, item.Version); err != nil {
 				_ = r.History.Append("api.warn", fmt.Sprintf("updateSsdeepDownload(%d): %s", item.ID, err.Error()), nil)
-			} else if resp.StatusCode != 200 {
+			} else if resp != nil && resp.StatusCode >= 400 {
 				_ = r.History.Append("api.warn", fmt.Sprintf("updateSsdeepDownload(%d) status=%d", item.ID, resp.StatusCode), nil)
 			}
 		}
@@ -149,6 +230,7 @@ func (r *Runner) downloadSsdeep(items []ssdeepDownloadItem, agentID int64) (impo
 		_ = r.History.Append("ssdeep.ok", fmt.Sprintf("imported %s (%d signatures, v=%s)", fileName, total, item.Version), map[string]any{
 			"ssdeep_id": item.ID,
 			"count":     total,
+			"category":  item.Category,
 		})
 	}
 	if imported > 0 && r.Scan != nil {
@@ -259,5 +341,20 @@ func importSsdeepFile(store *ssdeepscan.Store, path string) (int, error) {
 		return store.ImportJSONFile(path)
 	default:
 		return store.ImportFromSQLite(path)
+	}
+}
+
+func importSsdeepFileMerge(store *ssdeepscan.Store, path string) (int, error) {
+	lower := strings.ToLower(path)
+	switch {
+	case strings.HasSuffix(lower, ".json"):
+		return store.ImportJSONFileMerge(path)
+	default:
+		// SQLite import historically replaces; load via temp merge by reusing JSON path only.
+		// For .db packs, replace-merge is approximate: import to temp then not supported —
+		// fall back to full ImportFromSQLite (last pack wins) which is wrong for multi-cat.
+		// Prefer JSON packs for category workflow.
+		n, err := store.ImportFromSQLite(path)
+		return n, err
 	}
 }

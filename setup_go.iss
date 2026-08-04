@@ -7,8 +7,8 @@
 [Setup]
 AppId={{A3C8F2E1-9B4D-4E7A-8C1F-2D5E6A9B0C3D}
 AppName=SOSECURE Threat inSight
-AppVersion=4.0.0.0
-AppVerName=SOSECURE Threat inSight 4.0 (Go)
+AppVersion=5.6.0.0
+AppVerName=SOSECURE Threat inSight 5.6 (Go)
 AppPublisher=SOSECURE
 AppPublisherURL=https://sosecure.co.th/
 DefaultDirName={autopf}\SOSECURE\Threat inSight
@@ -20,9 +20,9 @@ UninstallDisplayIcon={app}\app.ico
 WizardStyle=modern
 LicenseFile=LICENSE.txt
 OutputDir=Output
-OutputBaseFilename=SOSECURE_Threat_inSight_Go_Setup_v4.0.0
+OutputBaseFilename=SOSECURE_Threat_inSight_Go_Setup_v5.6.0
 Compression=lzma2/ultra64
-SolidCompression=yes
+SolidCompression=no
 MinVersion=6.3
 
 [Languages]
@@ -40,12 +40,13 @@ Source: "Engine\Mesa\opengl32.dll"; DestDir: "{app}"; Flags: ignoreversion
 Source: "Engine\Mesa\libgallium_wgl.dll"; DestDir: "{app}"; Flags: ignoreversion
 Source: "Engine\Mesa\insite-agent.exe.local"; DestDir: "{app}"; Flags: ignoreversion skipifsourcedoesntexist
 Source: "Engine\Yara\yara64.exe"; DestDir: "{app}\Engine\Yara"; Flags: ignoreversion
-; Bundled rules are imported into encrypted store on first run (-mode upgrade), then wiped from disk.
-Source: "Engine\Yara\rules.yar"; DestDir: "{app}\Engine\Yara"; Flags: ignoreversion
-Source: "Engine\Yara\rules_unified.yar"; DestDir: "{app}\Engine\Yara"; Flags: ignoreversion
+; Bundled rules are optional — Center sync / sealed store is the source of truth.
+Source: "Engine\Yara\rules.yar"; DestDir: "{app}\Engine\Yara"; Flags: ignoreversion skipifsourcedoesntexist
+Source: "Engine\Yara\rules_unified.yar"; DestDir: "{app}\Engine\Yara"; Flags: ignoreversion skipifsourcedoesntexist
 Source: "app.ico"; DestDir: "{app}"; Flags: ignoreversion
 Source: "Config\Key\config.json"; DestDir: "{app}\Config\Key"; Flags: onlyifdoesntexist ignoreversion skipifsourcedoesntexist
-Source: "Config\Key\config.json.example"; DestDir: "{app}\Config\Key"; Flags: onlyifdoesntexist ignoreversion skipifsourcedoesntexist
+Source: "Config\Key\client.p12"; DestDir: "{app}\Config\Key"; Flags: ignoreversion skipifsourcedoesntexist
+Source: "Config\Key\client.p12"; DestDir: "{commonappdata}\SOSECURE Threat inSight\Config\Key"; Flags: ignoreversion skipifsourcedoesntexist
 
 [Icons]
 Name: "{group}\SOSECURE Threat inSight"; Filename: "{app}\insite-agent.exe"; Parameters: "-mode ui"; IconFilename: "{app}\app.ico"

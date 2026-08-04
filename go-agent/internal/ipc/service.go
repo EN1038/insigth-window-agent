@@ -23,5 +23,6 @@ type Service interface {
 	CheckAgentUpdate(autoInstall bool) error
 	InstallAssignedAgentUpdate() error
 	RulesInfo() RulesInfoResponse
+	SsdeepInfo() SsdeepInfoResponse
 	QuarantineList() []QuarantineItem
 }

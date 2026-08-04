@@ -28,6 +28,9 @@ type Manager struct {
 	Rules      *rules.Store
 	Quarantine *quarantine.Store
 
+	// OnScanIdle runs after a scan completes or is stopped (async, may be nil).
+	OnScanIdle func()
+
 	scanner *Scanner
 	ssdeep  *ssdeepscan.Matcher
 
@@ -100,8 +103,9 @@ func (m *Manager) StartAutoScan()   { m.start(ScanAuto, "", true) }
 func (m *Manager) StartSilentScan(path string) { m.start(ScanSilent, path, false) }
 
 func (m *Manager) StartCustomScan(path string) {
-	scanAll := len(strings.TrimSpace(path)) <= 3
-	m.start(ScanCustom, path, scanAll)
+	// Always force a full pass for user-picked paths (and short USB roots).
+	// Incremental snapshot skip made CUSTOM SCAN look "stuck" (total>0, scanned=0).
+	m.start(ScanCustom, path, true)
 }
 
 func (m *Manager) StopScan() {
@@ -157,9 +161,7 @@ func (m *Manager) scanWork(scanType ScanType, customPath string, scanAll bool, s
 
 	m.mu.Lock()
 	rulePaths := append([]string(nil), m.rulePaths...)
-	ruleTempDir := m.ruleTempDir
 	m.mu.Unlock()
-	defer rules.WipeMaterializedDir(ruleTempDir)
 
 	m.sendScanLog(APIMode(scanType, result.ScanSource), scanStartDescription(m), "start")
 
@@ -262,19 +264,35 @@ func (m *Manager) scanWork(scanType ScanType, customPath string, scanAll bool, s
 	})
 
 	_ = m.Snapshot.Save()
-	_ = m.History.Append("scan.end", fmt.Sprintf("scan %s: %d threats", result.Status, result.ThreatsFound), map[string]any{
+	_ = m.History.Append("scan.end", fmt.Sprintf(
+		"scan %s: scanned=%d skipped=%d total=%d threats=%d",
+		result.Status, result.FilesScanned, result.FilesSkipped, result.TotalFound, result.ThreatsFound), map[string]any{
 		"scanned": result.FilesScanned,
 		"skipped": result.FilesSkipped,
 		"total":   result.TotalFound,
+		"threats": result.ThreatsFound,
 		"yara":    countThreatsByEngine(result.Threats, "yara"),
 		"ssdeep":  countThreatsByEngine(result.Threats, "ssdeep"),
+	})
+	_ = m.History.Append("ui.notify", fmt.Sprintf(
+		"Scan %s — scanned %d, skipped %d, threats %d",
+		result.Status, result.FilesScanned, result.FilesSkipped, result.ThreatsFound), map[string]any{
+		"kind":    "scan",
+		"scanned": result.FilesScanned,
+		"skipped": result.FilesSkipped,
+		"threats": result.ThreatsFound,
 	})
 
 	yaraN := countThreatsByEngine(result.Threats, "yara")
 	ssdeepN := countThreatsByEngine(result.Threats, "ssdeep")
-	desc := fmt.Sprintf("Scan %s: %d files, %d threats (yara=%d ssdeep=%d)",
-		result.Status, result.TotalFound, result.ThreatsFound, yaraN, ssdeepN)
+	desc := fmt.Sprintf("Scan %s: scanned=%d skipped=%d total=%d threats=%d (yara=%d ssdeep=%d)",
+		result.Status, result.FilesScanned, result.FilesSkipped, result.TotalFound, result.ThreatsFound, yaraN, ssdeepN)
 	m.sendScanLog(APIMode(scanType, result.ScanSource), desc, "end")
+
+	if m.OnScanIdle != nil {
+		cb := m.OnScanIdle
+		go cb()
+	}
 }
 
 func countThreatsByEngine(threats []Threat, engine string) int {
@@ -359,7 +377,7 @@ func (m *Manager) processBatch(batch []FileItem, rulePaths []string, result *Res
 			threats.Add(1)
 			th := Threat{
 				Path:     item.Path,
-				Rule:     ssdeepscan.RuleLabel(hit.Name, hit.Score),
+				Rule:     ssdeepscan.RuleLabelWithFamily(hit.Name, hit.Family, hit.Score),
 				ScanType: scanType,
 				Engine:   "ssdeep",
 				Score:    hit.Score,
@@ -377,11 +395,14 @@ func (m *Manager) processBatch(batch []FileItem, rulePaths []string, result *Res
 			LastScanResult: status,
 			LastScanUnix:   now.Unix(),
 		})
-		scanned.Add(1)
+		scannedCount := scanned.Add(1)
 		m.setStatus(func(s *StatusInfo) {
-			s.Scanned = int(scanned.Load())
+			s.Scanned = int(scannedCount)
 			s.Threats = int(threats.Load())
 		})
+		if scannedCount%3 == 1 || status == "infected" {
+			_ = m.History.Append("scan.item", "Scanning: "+filepath.Base(item.Path), map[string]any{"path": item.Path})
+		}
 	}
 
 	if len(batchThreats) > 0 {
@@ -606,7 +627,9 @@ func (m *Manager) ensureRules() error {
 
 	version := m.Settings.Get(settings.KeyRulesVersion, "")
 	if version != "" && version == m.ruleCache && len(m.rulePaths) > 0 {
-		return nil
+		if _, err := os.Stat(m.rulePaths[0]); err == nil {
+			return nil
+		}
 	}
 	if m.ruleTempDir != "" {
 		_ = rules.WipeMaterializedDir(m.ruleTempDir)

@@ -28,8 +28,9 @@ func New(manager *scan.Manager, st *settings.Store) *Watcher {
 }
 
 func (w *Watcher) Run(ctx context.Context) {
-	t := time.NewTicker(30 * time.Second)
+	t := time.NewTicker(2 * time.Second)
 	defer t.Stop()
+	w.syncEnabled()
 	for {
 		select {
 		case <-ctx.Done():
@@ -107,8 +108,7 @@ func (w *Watcher) handle(filePath string, debounce map[string]time.Time) {
 	if err != nil || st.IsDir() {
 		return
 	}
-	ext := strings.ToLower(filepath.Ext(filePath))
-	if ext == "" || ext == ".dat" || ext == ".yar" || ext == ".tmp" {
+	if !w.shouldScanPath(filePath) {
 		return
 	}
 	if strings.Contains(strings.ToLower(filePath), `\data\`) {
@@ -120,6 +120,25 @@ func (w *Watcher) handle(filePath string, debounce map[string]time.Time) {
 	}
 	debounce[filePath] = now
 	w.manager.StartSilentScan(filePath)
+}
+
+// shouldScanPath mirrors on-demand ScanExtensions so realtime and custom scan
+// agree. Always skip engine temp / rule artifacts.
+func (w *Watcher) shouldScanPath(filePath string) bool {
+	ext := strings.ToLower(filepath.Ext(filePath))
+	if ext == "" || ext == ".tmp" || ext == ".yar" {
+		return false
+	}
+	allowed := w.settings.ScanExtensions()
+	if len(allowed) == 0 {
+		return true
+	}
+	for _, a := range allowed {
+		if a == ext {
+			return true
+		}
+	}
+	return false
 }
 
 func (w *Watcher) watchDirs() []string {

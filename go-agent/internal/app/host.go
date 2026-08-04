@@ -5,8 +5,10 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"sync"
+	"time"
 
 	"github.com/sosecure/insite-agent/internal/api"
 	"github.com/sosecure/insite-agent/internal/config"
@@ -152,10 +154,26 @@ func (h *Host) TestConnection() bool {
 	apiClient := h.API
 	h.mu.RUnlock()
 	if apiClient == nil {
+		h.setCenterOnlineCached(false)
 		return false
 	}
 	resp, _, err := apiClient.AgentOnlineTimestamp(false)
-	return err == nil && resp != nil && resp.StatusCode == 200
+	ok := err == nil && resp != nil && (resp.StatusCode == 200 || resp.StatusCode == 0)
+	h.setCenterOnlineCached(ok)
+	return ok
+}
+
+func (h *Host) setCenterOnlineCached(ok bool) {
+	if h.Settings == nil {
+		return
+	}
+	if ok {
+		h.Settings.Set(settings.KeyCenterOnline, "true")
+		h.Settings.Set(settings.KeyCenterOnlineAt, time.Now().Format(time.RFC3339))
+	} else {
+		h.Settings.Set(settings.KeyCenterOnline, "false")
+	}
+	_ = h.Settings.Save()
 }
 
 func (h *Host) Login(email, password string) (bool, string, string) {
@@ -201,7 +219,7 @@ func (h *Host) PushSettingsToServer() {
 	if h.Settings.GetBool(settings.KeyRealtimeShield) {
 		rtp = 1
 	}
-	batch := h.Settings.Get(settings.KeyBatchJobEveryDay, "02:00")
+	batch := strconv.Itoa(settings.NormalizeIntervalMinutes(h.Settings.Get(settings.KeyBatchJobEveryDay, ""), settings.DefaultBatchIntervalMinutes))
 
 	flagInt := func(key string) int {
 		if h.Settings.GetBool(key) {
@@ -226,8 +244,8 @@ func (h *Host) PushSettingsToServer() {
 		"quick_scan_paths":      h.Settings.Get(settings.KeyQuickScanPaths, ""),
 		"log_level":             h.Settings.Get(settings.KeyLogLevel, "info"),
 		"cache_expiry_hours":    cacheHours,
-		"ti_sync_everydate":     h.Settings.Get(settings.KeyTISyncEveryDay, "03:00"),
-		"agent_update_schedule": h.Settings.Get(settings.KeyAgentUpdateSchedule, "04:00"),
+		"ti_sync_everydate":     strconv.Itoa(settings.NormalizeIntervalMinutes(h.Settings.Get(settings.KeyTISyncEveryDay, ""), settings.DefaultTISyncIntervalMinutes)),
+		"agent_update_schedule": strconv.Itoa(settings.NormalizeIntervalMinutes(h.Settings.Get(settings.KeyAgentUpdateSchedule, ""), settings.DefaultAgentUpdateIntervalMinutes)),
 		"config_updated_at":     configUpdatedAtUnix(h.Settings),
 	}
 	_, _, _ = apiClient.UpdateConfig(batch, rtp, usb, extra)
