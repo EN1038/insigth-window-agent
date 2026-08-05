@@ -137,7 +137,7 @@ func FuzzyHashFile(path string) string {
 	return strings.TrimSpace(hash)
 }
 
-func (m *Matcher) ScanCleanFiles(paths []string, sizes map[string]int64, stopped func() bool) ([]Match, error) {
+func (m *Matcher) ScanCleanFiles(paths []string, sizes map[string]int64, stopped func() bool, onProgress func(done int, path string)) ([]Match, error) {
 	if len(paths) == 0 {
 		return nil, nil
 	}
@@ -149,9 +149,12 @@ func (m *Matcher) ScanCleanFiles(paths []string, sizes map[string]int64, stopped
 	defer m.mu.Unlock()
 
 	var out []Match
-	for _, path := range paths {
+	for i, path := range paths {
 		if stopped != nil && stopped() {
 			break
+		}
+		if onProgress != nil {
+			onProgress(i+1, path)
 		}
 		size := sizes[path]
 		if size == 0 {

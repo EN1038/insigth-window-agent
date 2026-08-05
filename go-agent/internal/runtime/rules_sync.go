@@ -9,6 +9,7 @@ import (
 	"strings"
 
 	"github.com/sosecure/insite-agent/internal/rules"
+	"github.com/sosecure/insite-agent/internal/securefs"
 	"github.com/sosecure/insite-agent/internal/settings"
 )
 
@@ -171,14 +172,19 @@ func (r *Runner) syncRulesFromServerResult(fallbackRaw json.RawMessage) (complet
 		items = parseRuleDownloadItems(fallbackRaw)
 		useOfficial = false
 		if len(items) == 0 {
-			if listOK || serverFileCount > 0 {
-				_ = r.History.Append("rules.skip", "no rules available to sync", nil)
-				r.setTIProgress(45, "YARA rules: no packs on server — continuing to ssdeep")
+			if localCount > 0 {
+				_ = r.History.Append("rules.skip", fmt.Sprintf(
+					"no new YARA packs from Center; continuing with local store (%d files)", localCount), nil)
+				r.setTIProgress(45, fmt.Sprintf("YARA rules ready (%d files)", localCount))
 				return true, 0, 0
 			}
+			// Empty local store must NOT count as complete — otherwise bootstrap
+			// finishes and scans fail with "no rules in store".
+			_ = r.History.Append("rules.warn", "no YARA packs available and local store empty — will retry", nil)
+			r.setTIProgress(45, "Waiting for YARA packs from Center…")
 			if err != nil {
 				_ = r.History.Append("api.warn", "downloadRuleSite: "+err.Error(), nil)
-			} else if resp != nil {
+			} else if resp != nil && !listOK {
 				_ = r.History.Append("api.warn", fmt.Sprintf("downloadRuleSite status=%d body=%s", resp.StatusCode, compact(raw)), nil)
 			}
 			return false, 0, 1
@@ -342,7 +348,7 @@ func (r *Runner) downloadRules(items []ruleDownloadItem, agentID int64, useOffic
 		}
 		if err != nil {
 			_ = r.History.Append("rules.error", fmt.Sprintf("import %s: %s", fileName, err.Error()), nil)
-			_ = os.Remove(localPath)
+			_ = securefs.WipeAndRemove(localPath)
 			failed++
 			continue
 		}
@@ -371,7 +377,7 @@ func (r *Runner) downloadRules(items []ruleDownloadItem, agentID int64, useOffic
 			}
 		}
 
-		_ = os.Remove(localPath)
+		_ = securefs.WipeAndRemove(localPath)
 		imported++
 		_ = r.History.Append("rules.ok", fmt.Sprintf("imported %s (%d files, v=%s)", fileName, ruleCount, version), map[string]any{
 			"rule_id": item.ID,

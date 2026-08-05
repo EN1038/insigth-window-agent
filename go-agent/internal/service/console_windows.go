@@ -33,17 +33,31 @@ func runConsole() error {
 }
 
 func ensureHost(ctx context.Context, baseDir string) (*app.Host, *ipc.Client, error) {
+	// Shared local IPC token (created by service/host; UI must present it).
+	tok, _ := ipc.EnsureLocalToken(baseDir)
 	client := ipc.NewClient(ipc.DefaultAddr)
+	if tok != "" {
+		client.SetToken(tok)
+	}
+
 	pingCtx, cancel := context.WithTimeout(ctx, 2*time.Second)
 	err := client.Health(pingCtx)
 	cancel()
 	if err == nil {
+		// Service already running — reload token in case Ensure created a new one
+		// that doesn't match the service's token (rare). Prefer existing file.
+		if existing, loadErr := ipc.LoadLocalToken(baseDir); loadErr == nil && existing != "" {
+			client.SetToken(existing)
+		}
 		return nil, client, nil
 	}
 
 	host, err := app.NewHost(baseDir)
 	if err != nil {
 		return nil, nil, err
+	}
+	if existing, loadErr := ipc.LoadLocalToken(baseDir); loadErr == nil && existing != "" {
+		client.SetToken(existing)
 	}
 	go func() { _ = host.Start(ctx) }()
 

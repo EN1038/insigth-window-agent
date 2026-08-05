@@ -99,20 +99,22 @@ func applyGetConfig(st *settings.Store, data json.RawMessage) error {
 	}
 
 	excl := firstNonNil(cfg.ExclusionPaths, cfg.Agent.ExclusionPaths)
-	if s := normalizePathList(stringify(excl)); s != "" {
-		st.Set(settings.KeyExclusionPaths, s)
+	if excl != nil {
+		st.Set(settings.KeyExclusionPaths, normalizePathList(stringify(excl)))
 	}
 
 	// Prefer explicit scan_extensions; fall back to Center extentions list.
 	extSrc := firstNonNil(cfg.ScanExtensions, cfg.Agent.ScanExtensions, cfg.Extentions)
-	if ext := parseExtensions(extSrc); ext != "" {
-		st.Set(settings.KeyScanExtensions, ext)
+	if extSrc != nil {
+		if ext := parseExtensions(extSrc); ext != "" {
+			st.Set(settings.KeyScanExtensions, ext)
+		}
 	}
 	_ = st.MergeDefaultScanExtensions()
 
 	quick := firstNonNil(cfg.QuickScanPaths, cfg.Agent.QuickScanPaths)
-	if s := normalizePathList(stringify(quick)); s != "" {
-		st.Set(settings.KeyQuickScanPaths, s)
+	if quick != nil {
+		st.Set(settings.KeyQuickScanPaths, normalizePathList(stringify(quick)))
 	}
 
 	ssdeepOn := firstNonNil(cfg.SsdeepEnabled, cfg.Agent.SsdeepEnabled)

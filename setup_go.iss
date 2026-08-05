@@ -43,6 +43,9 @@ Source: "Engine\Yara\yara64.exe"; DestDir: "{app}\Engine\Yara"; Flags: ignorever
 ; Bundled rules are optional — Center sync / sealed store is the source of truth.
 Source: "Engine\Yara\rules.yar"; DestDir: "{app}\Engine\Yara"; Flags: ignoreversion skipifsourcedoesntexist
 Source: "Engine\Yara\rules_unified.yar"; DestDir: "{app}\Engine\Yara"; Flags: ignoreversion skipifsourcedoesntexist
+; Offline ssdeep seed (encrypted into ProgramData on seal / first service start).
+Source: "go-agent\bundled\ssdeep\signatures.db"; DestDir: "{app}\bundled\ssdeep"; Flags: ignoreversion skipifsourcedoesntexist
+Source: "go-agent\bundled\rules\*"; DestDir: "{app}\bundled\rules"; Flags: ignoreversion recursesubdirs createallsubdirs skipifsourcedoesntexist
 Source: "app.ico"; DestDir: "{app}"; Flags: ignoreversion
 Source: "Config\Key\config.json"; DestDir: "{app}\Config\Key"; Flags: onlyifdoesntexist ignoreversion skipifsourcedoesntexist
 Source: "Config\Key\client.p12"; DestDir: "{app}\Config\Key"; Flags: ignoreversion skipifsourcedoesntexist
@@ -56,6 +59,7 @@ Name: "{userstartup}\SOSECURE Threat inSight"; Filename: "{app}\insite-agent.exe
 
 [Run]
 Filename: "{app}\insite-agent.exe"; Parameters: "-mode upgrade"; StatusMsg: "Installing Windows Service..."; Flags: runhidden waituntilterminated
+Filename: "{app}\insite-agent.exe"; Parameters: "-mode seal"; StatusMsg: "Sealing bundled threat intelligence..."; Flags: runhidden waituntilterminated
 Filename: "{app}\insite-agent.exe"; Parameters: "-mode ui"; Description: "Open SOSECURE Threat inSight"; Flags: nowait postinstall skipifsilent
 
 [UninstallRun]
@@ -65,7 +69,12 @@ Filename: "{sys}\taskkill.exe"; Parameters: "/F /IM insight.sosecure.legacy.exe"
 Filename: "{sys}\taskkill.exe"; Parameters: "/F /IM sosecure-engine.exe"; Flags: runhidden
 
 [UninstallDelete]
+; Program files under {app} are removed by Inno automatically.
+; Also wipe leftover logs in install dir and persistent ProgramData / per-user runtime.
 Type: filesandordirs; Name: "{app}\Logs"
+Type: filesandordirs; Name: "{commonappdata}\SOSECURE Threat inSight"
+Type: filesandordirs; Name: "{localappdata}\SOSECURE Threat inSight"
+Type: filesandordirs; Name: "{userappdata}\SOSECURE Threat inSight"
 
 [Code]
 function InitializeSetup(): Boolean;

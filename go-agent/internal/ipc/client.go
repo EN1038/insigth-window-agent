@@ -7,11 +7,15 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"strings"
 	"time"
+
+	"github.com/sosecure/insite-agent/internal/config"
 )
 
 type Client struct {
 	base   string
+	token  string
 	client *http.Client
 }
 
@@ -19,12 +23,21 @@ func NewClient(addr string) *Client {
 	if addr == "" {
 		addr = DefaultAddr
 	}
-	return &Client{
+	c := &Client{
 		base: "http://" + addr,
 		client: &http.Client{
 			Timeout: 30 * time.Second,
 		},
 	}
+	if tok, err := LoadLocalToken(config.DataBaseDir()); err == nil {
+		c.token = tok
+	}
+	return c
+}
+
+// SetToken overrides the local IPC auth token (tests / custom base dir).
+func (c *Client) SetToken(token string) {
+	c.token = strings.TrimSpace(token)
 }
 
 func (c *Client) Health(ctx context.Context) error {
@@ -166,6 +179,9 @@ func (c *Client) post(ctx context.Context, path string, body any, out any) error
 }
 
 func (c *Client) do(req *http.Request, out any) error {
+	if c.token != "" {
+		req.Header.Set(tokenHeader, c.token)
+	}
 	resp, err := c.client.Do(req)
 	if err != nil {
 		return err

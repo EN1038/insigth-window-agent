@@ -12,6 +12,7 @@ import (
 
 	"github.com/sosecure/insite-agent/internal/settings"
 	"github.com/sosecure/insite-agent/internal/ssdeepscan"
+	"github.com/sosecure/insite-agent/internal/securefs"
 )
 
 const keyLastSsdeepSync = "last_ssdeep_sync"
@@ -77,6 +78,13 @@ func (r *Runner) syncSsdeepFromServerResult() (complete bool, imported int, fail
 		}
 	}
 
+	// Local store already filled (bundled seal / prior import) but version never
+	// tagged — adopt Center getSsdeep version so UI / skip-logic see it.
+	if !localEmpty && currentVersion == "" && metaVersion != "" {
+		r.adoptSsdeepDBVersion(metaVersion)
+		currentVersion = metaVersion
+	}
+
 	// Each ssdeep pack is a full snapshot. If local already has signatures on the
 	// assigned latest version, skip — do not re-pull the whole historical queue.
 	if !localEmpty && metaVersion != "" && currentVersion != "" && metaVersion == currentVersion {
@@ -96,6 +104,13 @@ func (r *Runner) syncSsdeepFromServerResult() (complete bool, imported int, fail
 		r.setTIProgress(95, "Ssdeep already loaded")
 		return true, 0, 0
 	}
+	// Local signatures exist but neither side has a version string yet.
+	if !localEmpty && idx != nil && idx.Total > 0 && currentVersion == "" && metaVersion == "" {
+		r.adoptSsdeepDBVersion("bundled")
+		_ = r.History.Append("ssdeep.skip", fmt.Sprintf("local ssdeep present (%d signatures)", idx.Total), nil)
+		r.setTIProgress(95, fmt.Sprintf("Ssdeep ready (%d signatures)", idx.Total))
+		return true, 0, 0
+	}
 
 	force := localEmpty
 	if force {
@@ -104,22 +119,62 @@ func (r *Runner) syncSsdeepFromServerResult() (complete bool, imported int, fail
 	resp, raw, err := r.API.DownloadSsdeepSiteForce(currentVersion, force)
 	if err != nil {
 		_ = r.History.Append("api.warn", "downloadSsdeepSite: "+err.Error(), nil)
+		if !localEmpty {
+			r.setTIProgress(95, "Ssdeep using local store (Center unreachable)")
+			return true, 0, 0
+		}
 		return false, 0, 1
 	}
 	if resp.StatusCode != 200 {
 		_ = r.History.Append("api.warn", fmt.Sprintf("downloadSsdeepSite status=%d body=%s", resp.StatusCode, compact(raw)), nil)
+		if !localEmpty {
+			r.setTIProgress(95, "Ssdeep using local store (Center error)")
+			return true, 0, 0
+		}
 		return false, 0, 1
 	}
 	items := parseSsdeepDownloadItems(resp.Data)
 	items = selectLatestSsdeepPackPerCategory(items)
 	if len(items) == 0 {
 		_ = r.History.Append("ssdeep.skip", "no ssdeep updates available", nil)
+		if localEmpty {
+			r.setTIProgress(95, "Waiting for ssdeep packs from Center (or bundled seal)…")
+			return false, 0, 1
+		}
+		// Queue empty (already downloaded) but keep Center version for UI.
+		if metaVersion != "" {
+			r.adoptSsdeepDBVersion(metaVersion)
+		}
 		r.setTIProgress(95, "No ssdeep packs to download")
-		// Empty local store with empty queue is NOT complete.
-		return !localEmpty, 0, 0
+		return true, 0, 0
 	}
 	imported, failed = r.downloadSsdeep(items, r.agentID())
+	if imported > 0 {
+		if strings.TrimSpace(r.Settings.Get(settings.KeySsdeepDBVersion, "")) == "" && metaVersion != "" {
+			r.adoptSsdeepDBVersion(metaVersion)
+		}
+	}
+	if failed > 0 && !localEmpty && imported == 0 {
+		// Keep usable local signatures instead of blocking the UI forever.
+		_ = r.History.Append("ssdeep.warn", "ssdeep pack download failed; keeping local store", nil)
+		r.setTIProgress(95, "Ssdeep using local store (download failed)")
+		return true, 0, failed
+	}
 	return failed == 0, imported, failed
+}
+
+func (r *Runner) adoptSsdeepDBVersion(version string) {
+	version = strings.TrimSpace(version)
+	if version == "" || r.Settings == nil {
+		return
+	}
+	cur := strings.TrimSpace(r.Settings.Get(settings.KeySsdeepDBVersion, ""))
+	if cur == version {
+		return
+	}
+	r.Settings.Set(settings.KeySsdeepDBVersion, version)
+	_ = r.Settings.Save()
+	_ = r.History.Append("ssdeep.version", "ssdeep db version "+version, nil)
 }
 
 // selectLatestSsdeepPackPerCategory keeps one pack per category (highest id).
@@ -190,15 +245,15 @@ func (r *Runner) downloadSsdeep(items []ssdeepDownloadItem, agentID int64) (impo
 		importPath, cleanup, err := prepareSsdeepImportFile(localPath)
 		if err != nil {
 			_ = r.History.Append("ssdeep.error", fmt.Sprintf("prepare %s: %s", fileName, err.Error()), nil)
-			_ = os.Remove(localPath)
+			_ = securefs.WipeAndRemove(localPath)
 			failed++
 			continue
 		}
 		total, err := importSsdeepFileMerge(store, importPath)
 		if cleanup != "" {
-			_ = os.Remove(cleanup)
+			_ = securefs.WipeAndRemove(cleanup)
 		}
-		_ = os.Remove(localPath)
+		_ = securefs.WipeAndRemove(localPath)
 		if err != nil {
 			_ = r.History.Append("ssdeep.error", fmt.Sprintf("import %s: %s", fileName, err.Error()), nil)
 			failed++
@@ -320,11 +375,11 @@ func prepareSsdeepImportFile(path string) (importPath string, cleanupPath string
 			_, copyErr := io.Copy(out, rc)
 			closeErr := out.Close()
 			if copyErr != nil {
-				_ = os.Remove(tmpPath)
+				_ = securefs.WipeAndRemove(tmpPath)
 				return "", "", copyErr
 			}
 			if closeErr != nil {
-				_ = os.Remove(tmpPath)
+				_ = securefs.WipeAndRemove(tmpPath)
 				return "", "", closeErr
 			}
 			return tmpPath, tmpPath, nil

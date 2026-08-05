@@ -11,6 +11,7 @@ import (
 	"time"
 
 	"github.com/sosecure/insite-agent/internal/config"
+	"github.com/sosecure/insite-agent/internal/securefs"
 	"golang.org/x/sys/windows/svc"
 	"golang.org/x/sys/windows/svc/mgr"
 )
@@ -95,7 +96,9 @@ func startService(m *mgr.Mgr, name string) error {
 	return s.Start()
 }
 
-// Uninstall stops and removes main + watchdog services.
+// Uninstall stops and removes main + watchdog services, then wipes all
+// persistent agent data (site config, logs, rules, history, quarantine, etc.)
+// so a later install starts completely clean.
 func Uninstall() error {
 	_ = stopService(WatchdogServiceName)
 	_ = stopService(ServiceName)
@@ -110,7 +113,34 @@ func Uninstall() error {
 	if err := uninstallService(m, ServiceName); err != nil {
 		return err
 	}
+	_ = wipePersistentData()
 	return nil
+}
+
+func wipePersistentData() error {
+	var first error
+	record := func(err error) {
+		if err != nil && !os.IsNotExist(err) && first == nil {
+			first = err
+		}
+	}
+
+	// Canonical store: %ProgramData%\SOSECURE Threat inSight
+	// (config.enc, settings, history, rules, ssdeep, quarantine, IPC token, logs)
+	pd := os.Getenv("ProgramData")
+	if pd == "" {
+		pd = `C:\ProgramData`
+	}
+	record(securefs.WipeTree(filepath.Join(pd, config.AppFolderName)))
+
+	// Per-user UI runtime signals (best-effort; uninstall often runs as admin).
+	if la := os.Getenv("LOCALAPPDATA"); la != "" {
+		record(securefs.WipeTree(filepath.Join(la, config.AppFolderName)))
+	}
+	if ra := os.Getenv("APPDATA"); ra != "" {
+		record(securefs.WipeTree(filepath.Join(ra, config.AppFolderName)))
+	}
+	return first
 }
 
 // UpgradeFromLegacy stops legacy services/processes and installs the Go services.

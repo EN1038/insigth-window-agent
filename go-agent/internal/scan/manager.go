@@ -1,6 +1,8 @@
-package scan
+﻿package scan
 
 import (
+	"crypto/rand"
+	"encoding/hex"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -12,6 +14,7 @@ import (
 	"github.com/sosecure/insite-agent/internal/api"
 	"github.com/sosecure/insite-agent/internal/history"
 	"github.com/sosecure/insite-agent/internal/quarantine"
+	"github.com/sosecure/insite-agent/internal/reportq"
 	"github.com/sosecure/insite-agent/internal/rules"
 	"github.com/sosecure/insite-agent/internal/settings"
 	"github.com/sosecure/insite-agent/internal/snapshot"
@@ -27,6 +30,7 @@ type Manager struct {
 	History    *history.Store
 	Rules      *rules.Store
 	Quarantine *quarantine.Store
+	ReportQ    *reportq.Queue
 
 	// OnScanIdle runs after a scan completes or is stopped (async, may be nil).
 	OnScanIdle func()
@@ -34,13 +38,14 @@ type Manager struct {
 	scanner *Scanner
 	ssdeep  *ssdeepscan.Matcher
 
-	mu          sync.Mutex
-	running     atomic.Bool
-	stopCh      chan struct{}
-	scanAll     bool
-	ruleCache   string
-	rulePaths   []string
-	ruleTempDir string
+	mu            sync.Mutex
+	running       atomic.Bool
+	stopCh        chan struct{}
+	scanAll       bool
+	ruleCache     string
+	rulePaths     []string
+	ruleTempDir   string
+	pendingSilent []string
 
 	statusMu sync.RWMutex
 	status   StatusInfo
@@ -66,7 +71,7 @@ func (m *Manager) setStatus(fn func(*StatusInfo)) {
 	fn(&m.status)
 }
 
-func NewManager(baseDir string, st *settings.Store, snap *snapshot.Store, apiClient *api.Client, hist *history.Store, ruleStore *rules.Store, quar *quarantine.Store) *Manager {
+func NewManager(baseDir string, st *settings.Store, snap *snapshot.Store, apiClient *api.Client, hist *history.Store, ruleStore *rules.Store, quar *quarantine.Store, rq *reportq.Queue) *Manager {
 	yaraPath := ResolveYaraPath(baseDir, st.Get(settings.KeyYaraEnginePath, ""))
 	threshold := readSsdeepThreshold(st)
 	return &Manager{
@@ -77,6 +82,7 @@ func NewManager(baseDir string, st *settings.Store, snap *snapshot.Store, apiCli
 		History:    hist,
 		Rules:      ruleStore,
 		Quarantine: quar,
+		ReportQ:    rq,
 		scanner:    NewScanner(yaraPath),
 		ssdeep:     ssdeepscan.NewMatcher(baseDir, threshold),
 	}
@@ -97,15 +103,40 @@ func (m *Manager) IsScanning() bool {
 	return m.running.Load()
 }
 
-func (m *Manager) StartQuickScan()  { m.start(ScanQuick, "", false) }
-func (m *Manager) StartFullScan()   { m.start(ScanFull, "", true) }
-func (m *Manager) StartAutoScan()   { m.start(ScanAuto, "", true) }
-func (m *Manager) StartSilentScan(path string) { m.start(ScanSilent, path, false) }
+const maxPendingSilent = 200
 
-func (m *Manager) StartCustomScan(path string) {
+// Start* methods return false when a scan is already running (except silent,
+// which is queued). Callers must not assume work started on a false return.
+
+func (m *Manager) StartQuickScan() bool {
+	// Always force a full pass for quick paths. Snapshot skip made QUICK SCAN
+	// finish immediately (scanned=0) when files were previously scanned.
+	return m.start(ScanQuick, "", true, SourceManual)
+}
+
+func (m *Manager) StartScheduledQuickScan() bool {
+	return m.start(ScanQuick, "", true, SourceSchedule)
+}
+
+func (m *Manager) StartLoginQuickScan() bool {
+	return m.start(ScanQuick, "", true, SourceLogin)
+}
+
+func (m *Manager) StartFullScan() bool { return m.start(ScanFull, "", true, SourceManual) }
+func (m *Manager) StartAutoScan() bool { return m.start(ScanAuto, "", true, SourceManual) }
+
+func (m *Manager) StartSilentScan(path string) bool {
+	return m.start(ScanSilent, path, false, SourceRealtime)
+}
+
+func (m *Manager) StartCustomScan(path string) bool {
 	// Always force a full pass for user-picked paths (and short USB roots).
 	// Incremental snapshot skip made CUSTOM SCAN look "stuck" (total>0, scanned=0).
-	m.start(ScanCustom, path, true)
+	source := SourceManual
+	if len(strings.TrimSpace(path)) <= 3 {
+		source = SourceUSB
+	}
+	return m.start(ScanCustom, path, true, source)
 }
 
 func (m *Manager) StopScan() {
@@ -117,11 +148,14 @@ func (m *Manager) StopScan() {
 	}
 }
 
-func (m *Manager) start(scanType ScanType, customPath string, scanAll bool) {
+func (m *Manager) start(scanType ScanType, customPath string, scanAll bool, source string) bool {
 	m.mu.Lock()
 	if m.running.Load() {
+		if scanType == ScanSilent && strings.TrimSpace(customPath) != "" {
+			m.enqueueSilentLocked(customPath)
+		}
 		m.mu.Unlock()
-		return
+		return false
 	}
 	m.running.Store(true)
 	m.scanAll = scanAll
@@ -129,32 +163,89 @@ func (m *Manager) start(scanType ScanType, customPath string, scanAll bool) {
 	stopCh := m.stopCh
 	m.mu.Unlock()
 
-	go m.scanWork(scanType, customPath, scanAll, stopCh)
+	go m.scanWork(scanType, customPath, scanAll, source, stopCh)
+	return true
 }
 
-func (m *Manager) scanWork(scanType ScanType, customPath string, scanAll bool, stopCh <-chan struct{}) {
-	defer m.running.Store(false)
+func (m *Manager) enqueueSilentLocked(path string) {
+	path = strings.TrimSpace(path)
+	if path == "" {
+		return
+	}
+	key := strings.ToLower(path)
+	for _, p := range m.pendingSilent {
+		if strings.ToLower(p) == key {
+			return
+		}
+	}
+	if len(m.pendingSilent) >= maxPendingSilent {
+		m.pendingSilent = m.pendingSilent[1:]
+	}
+	m.pendingSilent = append(m.pendingSilent, path)
+}
 
+func (m *Manager) drainSilentQueue() {
+	m.mu.Lock()
+	if len(m.pendingSilent) == 0 {
+		m.mu.Unlock()
+		return
+	}
+	path := m.pendingSilent[0]
+	m.pendingSilent = m.pendingSilent[1:]
+	m.mu.Unlock()
+	_ = m.StartSilentScan(path)
+}
+
+func (m *Manager) scanWork(scanType ScanType, customPath string, scanAll bool, source string, stopCh <-chan struct{}) {
+	defer func() {
+		m.running.Store(false)
+		m.drainSilentQueue()
+		if m.OnScanIdle != nil {
+			cb := m.OnScanIdle
+			go cb()
+		}
+	}()
+
+	if source == "" {
+		source = SourceManual
+	}
 	result := Result{
 		ScanType:     scanType,
 		RulesVersion: m.Settings.Get(settings.KeyRulesVersion, "1.1"),
 		StartTime:    time.Now(),
-		ScanSource:   "Manual",
+		ScanSource:   source,
 	}
+	verbose := scanType != ScanSilent
+	phaseMsg := fmt.Sprintf("Starting %s scan…", scanType)
 	m.setStatus(func(s *StatusInfo) {
-		*s = StatusInfo{Scanning: true, ScanType: string(scanType), Status: "running"}
+		*s = StatusInfo{
+			Scanning: true,
+			ScanType: string(scanType),
+			Status:   "discovering",
+			Message:  phaseMsg,
+		}
 	})
-	if scanType == ScanCustom && len(strings.TrimSpace(customPath)) <= 3 {
-		result.ScanSource = "USB"
+	if scanType == ScanCustom && source != SourceUSB && len(strings.TrimSpace(customPath)) <= 3 {
+		result.ScanSource = SourceUSB
+		source = SourceUSB
 	}
 
 	_ = m.History.Append("scan.start", fmt.Sprintf("scan started: %s", scanType), map[string]any{
-		"mode": APIMode(scanType, result.ScanSource),
+		"mode":   APIMode(scanType, source),
+		"source": source,
 	})
+	if verbose {
+		_ = m.History.Append("scan.progress", phaseMsg, nil)
+	}
 
 	if err := m.ensureRules(); err != nil {
 		result.Status = "error"
 		result.EndTime = time.Now()
+		m.setStatus(func(s *StatusInfo) {
+			s.Scanning = false
+			s.Status = "error"
+			s.Message = "Rules not ready: " + err.Error()
+		})
 		_ = m.History.Append("scan.error", "rules materialize: "+err.Error(), nil)
 		return
 	}
@@ -163,10 +254,55 @@ func (m *Manager) scanWork(scanType ScanType, customPath string, scanAll bool, s
 	rulePaths := append([]string(nil), m.rulePaths...)
 	m.mu.Unlock()
 
-	m.sendScanLog(APIMode(scanType, result.ScanSource), scanStartDescription(m), "start")
+	runID := newScanRunID()
+	if verbose {
+		m.setStatus(func(s *StatusInfo) {
+			s.Status = "discovering"
+			s.Message = "Notifying Center…"
+		})
+	}
+	m.sendScanLog(APIMode(scanType, source), scanStartDescription(m), "start", runID)
 
 	queue := NewQueue(queueCap)
 	var totalFound, scanned, skipped, threats atomic.Int64
+	var lastProgressLog, lastStatusTick atomic.Int64
+	lastProgressLog.Store(time.Now().UnixNano())
+	lastStatusTick.Store(time.Now().UnixNano())
+	const statusTick = int64(150 * time.Millisecond)
+	const progressTick = int64(1200 * time.Millisecond)
+	publishDiscover := func(pathOrDir string, force bool) {
+		if !verbose {
+			return
+		}
+		n := totalFound.Load()
+		sc := scanned.Load()
+		nowNano := time.Now().UnixNano()
+		prev := lastStatusTick.Load()
+		if !force && nowNano-prev < statusTick {
+			return
+		}
+		if !lastStatusTick.CompareAndSwap(prev, nowNano) && !force {
+			return
+		}
+		skipN := int(skipped.Load())
+		base := filepath.Base(pathOrDir)
+		m.setStatus(func(s *StatusInfo) {
+			s.Total = int(n)
+			s.Skipped = skipN
+			// Discovery and scan workers run concurrently — don't clobber active scan UX.
+			if sc > 0 || s.Status == "scanning" {
+				s.Status = "scanning"
+				s.Scanned = int(sc)
+				s.Message = fmt.Sprintf("Scanning… %d / %d", sc, n)
+				return
+			}
+			s.Status = "discovering"
+			s.Message = fmt.Sprintf("Discovering files… %d found", n)
+			if base != "" && base != "." {
+				s.CurrentFile = base
+			}
+		})
+	}
 	stopped := func() bool {
 		select {
 		case <-stopCh:
@@ -178,16 +314,30 @@ func (m *Manager) scanWork(scanType ScanType, customPath string, scanAll bool, s
 
 	go func() {
 		defer queue.Complete()
-		enum := NewEnumerator(m.Settings, scanAll)
+		// Full/Auto ignore extension filters so the pass is not artificially narrow.
+		allExt := scanType == ScanFull || scanType == ScanAuto
+		enum := NewEnumerator(m.Settings, scanAll, allExt)
+		enum.OnDirectory = func(dir string) {
+			if stopped() {
+				return
+			}
+			publishDiscover(dir, false)
+		}
 		enum.OnFile = func(item FileItem) {
 			if stopped() {
 				enum.Stop()
 				return
 			}
-			totalFound.Add(1)
-			m.setStatus(func(s *StatusInfo) {
-				s.Total = int(totalFound.Load())
-			})
+			n := totalFound.Add(1)
+			publishDiscover(item.Path, n == 1)
+			nowNano := time.Now().UnixNano()
+			prev := lastProgressLog.Load()
+			if verbose && (n == 1 || nowNano-prev > progressTick) && lastProgressLog.CompareAndSwap(prev, nowNano) {
+				_ = m.History.Append("scan.progress", fmt.Sprintf("Discovering files… %d found", n), map[string]any{
+					"total": n,
+					"path":  item.Path,
+				})
+			}
 			if !scanAll && scanType != ScanSilent {
 				if rec, ok := m.Snapshot.Get(item.Path); ok {
 					if !rec.NeedsRescan(item.Size, item.LastWriteUnix, result.RulesVersion) {
@@ -219,6 +369,20 @@ func (m *Manager) scanWork(scanType ScanType, customPath string, scanAll bool, s
 		default:
 			enum.EnumerateAllFixedDrives()
 		}
+		if verbose {
+			n := totalFound.Load()
+			sc := scanned.Load()
+			m.setStatus(func(s *StatusInfo) {
+				s.Status = "scanning"
+				s.Total = int(n)
+				s.Scanned = int(sc)
+				s.Skipped = int(skipped.Load())
+				s.Message = fmt.Sprintf("Scanning… %d / %d", sc, n)
+			})
+			_ = m.History.Append("scan.progress", fmt.Sprintf("Discovery done — scanning %d files", n), map[string]any{
+				"total": n,
+			})
+		}
 	}()
 
 	active := atomic.Int32{}
@@ -237,7 +401,7 @@ func (m *Manager) scanWork(scanType ScanType, customPath string, scanAll bool, s
 		b := batch
 		go func() {
 			defer active.Add(-1)
-			m.processBatch(b, rulePaths, &result, scanType, &scanned, &threats, stopped)
+			m.processBatch(b, rulePaths, &result, scanType, &scanned, &totalFound, &threats, stopped)
 		}()
 	}
 	for active.Load() > 0 {
@@ -255,12 +419,14 @@ func (m *Manager) scanWork(scanType ScanType, customPath string, scanAll bool, s
 		result.Status = "completed"
 	}
 	m.setStatus(func(s *StatusInfo) {
-		s.Scanning = false
+		s.Scanning = true
 		s.Scanned = int(scanned.Load())
 		s.Skipped = int(skipped.Load())
 		s.Total = int(totalFound.Load())
 		s.Threats = int(threats.Load())
-		s.Status = result.Status
+		s.Status = "finalizing"
+		s.Message = "Saving results…"
+		s.CurrentFile = ""
 	})
 
 	_ = m.Snapshot.Save()
@@ -273,6 +439,7 @@ func (m *Manager) scanWork(scanType ScanType, customPath string, scanAll bool, s
 		"threats": result.ThreatsFound,
 		"yara":    countThreatsByEngine(result.Threats, "yara"),
 		"ssdeep":  countThreatsByEngine(result.Threats, "ssdeep"),
+		"source":  source,
 	})
 	_ = m.History.Append("ui.notify", fmt.Sprintf(
 		"Scan %s — scanned %d, skipped %d, threats %d",
@@ -287,13 +454,24 @@ func (m *Manager) scanWork(scanType ScanType, customPath string, scanAll bool, s
 	ssdeepN := countThreatsByEngine(result.Threats, "ssdeep")
 	desc := fmt.Sprintf("Scan %s: scanned=%d skipped=%d total=%d threats=%d (yara=%d ssdeep=%d)",
 		result.Status, result.FilesScanned, result.FilesSkipped, result.TotalFound, result.ThreatsFound, yaraN, ssdeepN)
-	m.sendScanLog(APIMode(scanType, result.ScanSource), desc, "end")
+	m.setStatus(func(s *StatusInfo) {
+		s.Status = "finalizing"
+		s.Message = "Updating Center…"
+	})
+	m.sendScanLog(APIMode(scanType, source), desc, "end", runID)
 
-	if m.OnScanIdle != nil {
-		cb := m.OnScanIdle
-		go cb()
-	}
+	m.setStatus(func(s *StatusInfo) {
+		s.Scanning = false
+		s.Scanned = result.FilesScanned
+		s.Skipped = result.FilesSkipped
+		s.Total = result.TotalFound
+		s.Threats = result.ThreatsFound
+		s.Status = result.Status
+		s.Message = fmt.Sprintf("Scan %s — %d scanned, %d threats", result.Status, result.FilesScanned, result.ThreatsFound)
+		s.CurrentFile = ""
+	})
 }
+
 
 func countThreatsByEngine(threats []Threat, engine string) int {
 	n := 0
@@ -309,7 +487,7 @@ func countThreatsByEngine(threats []Threat, engine string) int {
 	return n
 }
 
-func (m *Manager) processBatch(batch []FileItem, rulePaths []string, result *Result, scanType ScanType, scanned, threats *atomic.Int64, stopped func() bool) {
+func (m *Manager) processBatch(batch []FileItem, rulePaths []string, result *Result, scanType ScanType, scanned, totalFound, threats *atomic.Int64, stopped func() bool) {
 	if len(batch) == 0 || stopped() {
 		return
 	}
@@ -323,7 +501,25 @@ func (m *Manager) processBatch(batch []FileItem, rulePaths []string, result *Res
 		sizes[item.Path] = item.Size
 	}
 
+	already := int(scanned.Load())
+	totalHint := int(totalFound.Load())
+	m.setStatus(func(s *StatusInfo) {
+		s.Status = "scanning"
+		s.Scanned = already
+		s.Total = totalHint
+		s.Threats = int(threats.Load())
+		s.Message = fmt.Sprintf("Analyzing with YARA… %d files", len(paths))
+		s.CurrentFile = filepath.Base(paths[0])
+	})
+	stopPulse := m.pulseStatus(func(elapsed time.Duration) {
+		m.setStatus(func(s *StatusInfo) {
+			s.Status = "scanning"
+			s.Message = fmt.Sprintf("Analyzing with YARA… %d files (%ds)", len(paths), int(elapsed.Seconds()))
+		})
+	}, 500*time.Millisecond)
+
 	matches, err := m.scanner.ScanBatch(rulePaths, paths)
+	stopPulse()
 	if err != nil {
 		_ = m.History.Append("scan.error", "yara batch: "+err.Error(), nil)
 		return
@@ -344,7 +540,18 @@ func (m *Manager) processBatch(batch []FileItem, rulePaths []string, result *Res
 	}
 	ssdeepHits := map[string]ssdeepscan.Match{}
 	if m.ssdeepEnabled() && len(cleanPaths) > 0 && m.ssdeep != nil {
-		hits, serr := m.ssdeep.ScanCleanFiles(cleanPaths, sizes, stopped)
+		m.setStatus(func(s *StatusInfo) {
+			s.Status = "scanning"
+			s.Message = fmt.Sprintf("Fuzzy hashing… 0 / %d", len(cleanPaths))
+			s.CurrentFile = filepath.Base(cleanPaths[0])
+		})
+		hits, serr := m.ssdeep.ScanCleanFiles(cleanPaths, sizes, stopped, func(done int, path string) {
+			m.setStatus(func(s *StatusInfo) {
+				s.Status = "scanning"
+				s.Message = fmt.Sprintf("Fuzzy hashing… %d / %d", done, len(cleanPaths))
+				s.CurrentFile = filepath.Base(path)
+			})
+		})
 		if serr != nil {
 			_ = m.History.Append("scan.error", "ssdeep batch: "+serr.Error(), nil)
 		} else {
@@ -372,7 +579,7 @@ func (m *Manager) processBatch(batch []FileItem, rulePaths []string, result *Res
 				batchThreats = append(batchThreats, th)
 			}
 		} else if hit, ok := ssdeepHits[key]; ok {
-			// Second pass only: YARA clean + ssdeep hit → still one file / one threat count.
+			// Second pass only: YARA clean + ssdeep hit â†’ still one file / one threat count.
 			status = "infected"
 			threats.Add(1)
 			th := Threat{
@@ -396,29 +603,99 @@ func (m *Manager) processBatch(batch []FileItem, rulePaths []string, result *Res
 			LastScanUnix:   now.Unix(),
 		})
 		scannedCount := scanned.Add(1)
+		totalN := int(totalFound.Load())
+		threatN := int(threats.Load())
 		m.setStatus(func(s *StatusInfo) {
+			s.Status = "scanning"
 			s.Scanned = int(scannedCount)
-			s.Threats = int(threats.Load())
+			s.Total = totalN
+			s.Threats = threatN
+			s.Message = fmt.Sprintf("Scanning… %d / %d", scannedCount, totalN)
+			s.CurrentFile = filepath.Base(item.Path)
 		})
-		if scannedCount%3 == 1 || status == "infected" {
-			_ = m.History.Append("scan.item", "Scanning: "+filepath.Base(item.Path), map[string]any{"path": item.Path})
+		// Prefer status updates for live UX; history is sparse (encrypted I/O).
+		if status == "infected" || scannedCount == 1 || scannedCount%40 == 0 {
+			_ = m.History.Append("scan.item", "Scanning: "+filepath.Base(item.Path), map[string]any{
+				"path":    item.Path,
+				"scanned": scannedCount,
+				"total":   totalN,
+			})
 		}
 	}
 
 	if len(batchThreats) > 0 {
+		uniq := uniqueThreatPaths(batchThreats)
+		m.setStatus(func(s *StatusInfo) {
+			s.Status = "finalizing"
+			s.Message = fmt.Sprintf("Reporting %d detections…", len(uniq))
+			s.CurrentFile = ""
+		})
+		_ = m.History.Append("scan.progress", fmt.Sprintf("Reporting %d detections…", len(uniq)), nil)
+		stopPulse := m.pulseStatus(func(elapsed time.Duration) {
+			m.setStatus(func(s *StatusInfo) {
+				s.Status = "finalizing"
+				s.Message = fmt.Sprintf("Reporting %d detections… (%ds)", len(uniq), int(elapsed.Seconds()))
+			})
+		}, 500*time.Millisecond)
 		m.reportThreats(batchThreats)
-		seen := map[string]bool{}
-		for _, th := range batchThreats {
-			key := strings.ToLower(th.Path)
-			if seen[key] {
-				continue
-			}
-			seen[key] = true
-			if m.shouldQuarantine() && m.Quarantine != nil {
+		stopPulse()
+
+		if m.shouldQuarantine() && m.Quarantine != nil {
+			for i, th := range uniq {
+				if stopped() {
+					return
+				}
+				m.setStatus(func(s *StatusInfo) {
+					s.Status = "finalizing"
+					s.Message = fmt.Sprintf("Quarantining… %d / %d", i+1, len(uniq))
+					s.CurrentFile = filepath.Base(th.Path)
+				})
 				_ = m.Quarantine.Isolate(th.Path, th.Rule)
 			}
 		}
 	}
+}
+
+// pulseStatus calls tick on an interval until the returned stop func is called.
+func (m *Manager) pulseStatus(tick func(elapsed time.Duration), every time.Duration) func() {
+	if every <= 0 {
+		every = 500 * time.Millisecond
+	}
+	done := make(chan struct{})
+	start := time.Now()
+	go func() {
+		t := time.NewTicker(every)
+		defer t.Stop()
+		for {
+			select {
+			case <-done:
+				return
+			case now := <-t.C:
+				tick(now.Sub(start))
+			}
+		}
+	}()
+	return func() {
+		select {
+		case <-done:
+		default:
+			close(done)
+		}
+	}
+}
+
+func uniqueThreatPaths(threats []Threat) []Threat {
+	seen := map[string]bool{}
+	out := make([]Threat, 0, len(threats))
+	for _, th := range threats {
+		key := strings.ToLower(th.Path)
+		if seen[key] {
+			continue
+		}
+		seen[key] = true
+		out = append(out, th)
+	}
+	return out
 }
 
 func (m *Manager) ssdeepEnabled() bool {
@@ -482,8 +759,9 @@ func (m *Manager) reportThreats(threats []Threat) {
 		})
 	}
 	if len(yaraItems) > 0 {
-		if _, _, err := m.API.SendLogYara(yaraItems); err != nil {
-			_ = m.History.Append("api.error", "sendLogYara: "+err.Error(), nil)
+		if resp, _, err := m.API.SendLogYara(yaraItems); !reportOK(resp, err) {
+			_ = m.History.Append("api.error", "sendLogYara: "+errString(err, resp), nil)
+			_ = m.enqueueReport(reportq.KindYara, yaraItems)
 		} else {
 			_ = m.History.Append("api.ok", fmt.Sprintf("sendLogYara (%d threats)", len(yaraItems)), nil)
 		}
@@ -510,8 +788,9 @@ func (m *Manager) reportThreats(threats []Threat) {
 		})
 	}
 	if len(hashItems) > 0 {
-		if _, _, err := m.API.SendHash(hashItems); err != nil {
-			_ = m.History.Append("api.error", "sendHash: "+err.Error(), nil)
+		if resp, _, err := m.API.SendHash(hashItems); !reportOK(resp, err) {
+			_ = m.History.Append("api.error", "sendHash: "+errString(err, resp), nil)
+			_ = m.enqueueReport(reportq.KindHash, hashItems)
 		}
 	}
 
@@ -551,8 +830,9 @@ func (m *Manager) reportThreats(threats []Threat) {
 		ssdeepItems = append(ssdeepItems, item)
 	}
 	if len(ssdeepItems) > 0 {
-		if _, _, err := m.API.SendLogSsdeep(ssdeepItems); err != nil {
-			_ = m.History.Append("api.error", "sendLogSsdeep: "+err.Error(), nil)
+		if resp, _, err := m.API.SendLogSsdeep(ssdeepItems); !reportOK(resp, err) {
+			_ = m.History.Append("api.error", "sendLogSsdeep: "+errString(err, resp), nil)
+			_ = m.enqueueReport(reportq.KindSsdeep, ssdeepItems)
 		} else {
 			_ = m.History.Append("api.ok", fmt.Sprintf("sendLogSsdeep (%d)", len(ssdeepItems)), nil)
 		}
@@ -593,25 +873,68 @@ func (m *Manager) reportThreats(threats []Threat) {
 		candidates = append(candidates, candidate)
 	}
 	if len(candidates) > 0 {
-		if _, _, err := m.API.SendSsdeepCandidate(candidates); err != nil {
-			_ = m.History.Append("api.error", "sendSsdeepCandidate: "+err.Error(), nil)
+		if resp, _, err := m.API.SendSsdeepCandidate(candidates); !reportOK(resp, err) {
+			_ = m.History.Append("api.error", "sendSsdeepCandidate: "+errString(err, resp), nil)
+			_ = m.enqueueReport(reportq.KindSsdeepCandidate, candidates)
 		} else {
 			_ = m.History.Append("api.ok", fmt.Sprintf("sendSsdeepCandidate (%d)", len(candidates)), nil)
 		}
 	}
 }
 
-func (m *Manager) sendScanLog(mode, desc, typ string) {
+func (m *Manager) sendScanLog(mode, desc, typ, runID string) {
 	if m.API == nil {
 		return
 	}
-	_, _, _ = m.API.SendAgentScanLog([]api.ScanLogItem{{
+	items := []api.ScanLogItem{{
 		AgentID:     m.agentID(),
 		Description: desc,
 		TimeStamp:   time.Now().Format("2006-01-02 15:04:05"),
 		Mode:        mode,
 		Type:        typ,
-	}})
+		RunID:       runID,
+	}}
+	if resp, _, err := m.API.SendAgentScanLog(items); !reportOK(resp, err) {
+		_ = m.enqueueReport(reportq.KindScanLog, items)
+	}
+}
+
+func (m *Manager) enqueueReport(kind string, payload any) error {
+	if m.ReportQ == nil {
+		return nil
+	}
+	return m.ReportQ.Enqueue(kind, payload)
+}
+
+func reportOK(resp *api.Response, err error) bool {
+	if err != nil {
+		return false
+	}
+	if resp == nil {
+		return false
+	}
+	return resp.StatusCode > 0 && resp.StatusCode < 400
+}
+
+func errString(err error, resp *api.Response) string {
+	if err != nil {
+		return err.Error()
+	}
+	if resp != nil && resp.Error != "" {
+		return resp.Error
+	}
+	if resp != nil {
+		return fmt.Sprintf("status %d", resp.StatusCode)
+	}
+	return "unknown error"
+}
+
+func newScanRunID() string {
+	var b [16]byte
+	if _, err := rand.Read(b[:]); err != nil {
+		return fmt.Sprintf("%d", time.Now().UnixNano())
+	}
+	return hex.EncodeToString(b[:])
 }
 
 func (m *Manager) agentID() int64 {

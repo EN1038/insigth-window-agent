@@ -17,34 +17,35 @@ import (
 )
 
 type Server struct {
-	svc Service
-	srv *http.Server
+	svc   Service
+	token string
+	srv   *http.Server
 }
 
-func NewServer(svc Service) *Server {
-	return &Server{svc: svc}
+func NewServer(svc Service, token string) *Server {
+	return &Server{svc: svc, token: strings.TrimSpace(token)}
 }
 
 func (s *Server) Listen(ctx context.Context, addr string) error {
 	mux := http.NewServeMux()
 	mux.HandleFunc("/v1/health", s.handleHealth)
-	mux.HandleFunc("/v1/status", s.handleStatus)
-	mux.HandleFunc("/v1/config", s.handleConfig)
-	mux.HandleFunc("/v1/connection/test", s.handleConnectionTest)
-	mux.HandleFunc("/v1/login", s.handleLogin)
-	mux.HandleFunc("/v1/logout", s.handleLogout)
-	mux.HandleFunc("/v1/settings", s.handleSettings)
-	mux.HandleFunc("/v1/scan/start", s.handleScanStart)
-	mux.HandleFunc("/v1/scan/stop", s.handleScanStop)
-	mux.HandleFunc("/v1/scan/status", s.handleScanStatus)
-	mux.HandleFunc("/v1/rules/sync", s.handleRulesSync)
-	mux.HandleFunc("/v1/agent/update/check", s.handleAgentUpdateCheck)
-	mux.HandleFunc("/v1/agent/update/install", s.handleAgentUpdateInstall)
-	mux.HandleFunc("/v1/rules/info", s.handleRulesInfo)
-	mux.HandleFunc("/v1/ssdeep/info", s.handleSsdeepInfo)
-	mux.HandleFunc("/v1/quarantine", s.handleQuarantine)
-	mux.HandleFunc("/v1/history", s.handleHistory)
-	mux.HandleFunc("/v1/service/install", s.handleServiceInstall)
+	mux.HandleFunc("/v1/status", s.auth(s.handleStatus))
+	mux.HandleFunc("/v1/config", s.auth(s.handleConfig))
+	mux.HandleFunc("/v1/connection/test", s.auth(s.handleConnectionTest))
+	mux.HandleFunc("/v1/login", s.auth(s.handleLogin))
+	mux.HandleFunc("/v1/logout", s.auth(s.handleLogout))
+	mux.HandleFunc("/v1/settings", s.auth(s.handleSettings))
+	mux.HandleFunc("/v1/scan/start", s.auth(s.handleScanStart))
+	mux.HandleFunc("/v1/scan/stop", s.auth(s.handleScanStop))
+	mux.HandleFunc("/v1/scan/status", s.auth(s.handleScanStatus))
+	mux.HandleFunc("/v1/rules/sync", s.auth(s.handleRulesSync))
+	mux.HandleFunc("/v1/agent/update/check", s.auth(s.handleAgentUpdateCheck))
+	mux.HandleFunc("/v1/agent/update/install", s.auth(s.handleAgentUpdateInstall))
+	mux.HandleFunc("/v1/rules/info", s.auth(s.handleRulesInfo))
+	mux.HandleFunc("/v1/ssdeep/info", s.auth(s.handleSsdeepInfo))
+	mux.HandleFunc("/v1/quarantine", s.auth(s.handleQuarantine))
+	mux.HandleFunc("/v1/history", s.auth(s.handleHistory))
+	mux.HandleFunc("/v1/service/install", s.auth(s.handleServiceInstall))
 
 	ln, err := net.Listen("tcp", addr)
 	if err != nil {
@@ -61,6 +62,22 @@ func (s *Server) Listen(ctx context.Context, addr string) error {
 		_ = s.srv.Shutdown(shutdownCtx)
 	}()
 	return s.srv.Serve(ln)
+}
+
+// auth requires the local IPC shared token (except health, which stays open for discovery).
+func (s *Server) auth(next http.HandlerFunc) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		if s.token == "" {
+			http.Error(w, "ipc token not configured", http.StatusServiceUnavailable)
+			return
+		}
+		got := strings.TrimSpace(r.Header.Get(tokenHeader))
+		if got == "" || got != s.token {
+			http.Error(w, "unauthorized", http.StatusUnauthorized)
+			return
+		}
+		next(w, r)
+	}
 }
 
 func (s *Server) handleHealth(w http.ResponseWriter, r *http.Request) {
@@ -213,7 +230,15 @@ func (s *Server) handleScanStart(w http.ResponseWriter, r *http.Request) {
 	// Preflight rules so the UI can show an immediate actionable error instead of
 	// failing asynchronously after returning OK.
 	if err := sr.Manager.EnsureRulesReady(); err != nil {
-		writeJSON(w, OKResponse{OK: false, Message: "rules not ready: " + err.Error() + " (sync rules first)"})
+		msg := "rules not ready: " + err.Error() + " (open YARA RULES → Sync, or wait for download)"
+		if st := s.svc.GetSettings(); st != nil && !st.GetBool(settings.KeyTIBootstrapDone) {
+			tip := strings.TrimSpace(st.Get(settings.KeyTIDownloadMessage, ""))
+			if tip == "" {
+				tip = "downloading threat intelligence from Center"
+			}
+			msg = "threat intelligence not ready yet: " + tip
+		}
+		writeJSON(w, OKResponse{OK: false, Message: msg})
 		return
 	}
 	var req ScanStartRequest
@@ -222,21 +247,26 @@ func (s *Server) handleScanStart(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	mgr := sr.Manager
+	started := false
 	switch strings.ToLower(req.Type) {
 	case "quick":
-		mgr.StartQuickScan()
+		started = mgr.StartQuickScan()
 	case "full":
-		mgr.StartFullScan()
+		started = mgr.StartFullScan()
 	case "auto":
-		mgr.StartAutoScan()
+		started = mgr.StartAutoScan()
 	case "custom":
 		if strings.TrimSpace(req.Path) == "" {
 			writeJSON(w, OKResponse{OK: false, Message: "path required"})
 			return
 		}
-		mgr.StartCustomScan(req.Path)
+		started = mgr.StartCustomScan(req.Path)
 	default:
 		writeJSON(w, OKResponse{OK: false, Message: "unknown scan type"})
+		return
+	}
+	if !started {
+		writeJSON(w, OKResponse{OK: false, Message: "scan already running"})
 		return
 	}
 	writeJSON(w, OKResponse{OK: true})
@@ -261,13 +291,15 @@ func (s *Server) handleScanStatus(w http.ResponseWriter, r *http.Request) {
 	if sr := s.svc.ScanRuntime(); sr != nil && sr.Manager != nil {
 		st := sr.Manager.Status()
 		writeJSON(w, ScanStatusResponse{
-			Scanning: st.Scanning,
-			ScanType: st.ScanType,
-			Scanned:  st.Scanned,
-			Total:    st.Total,
-			Skipped:  st.Skipped,
-			Threats:  st.Threats,
-			Status:   st.Status,
+			Scanning:    st.Scanning,
+			ScanType:    st.ScanType,
+			Scanned:     st.Scanned,
+			Total:       st.Total,
+			Skipped:     st.Skipped,
+			Threats:     st.Threats,
+			Status:      st.Status,
+			Message:     st.Message,
+			CurrentFile: st.CurrentFile,
 		})
 		return
 	}

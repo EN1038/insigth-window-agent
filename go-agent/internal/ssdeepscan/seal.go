@@ -35,15 +35,19 @@ func BundledSQLiteCandidates(installDir string) []string {
 }
 
 // SealBundledSignatures imports plaintext bundled signatures.db into the encrypted
-// store when no encrypted index exists yet. Matches the YARA bundled-rules flow.
+// store when no usable encrypted index exists yet. Matches the YARA bundled-rules flow.
 func SealBundledSignatures(dataDir, installDir string) (imported int, err error) {
 	store := NewStore(dataDir)
-	if store.HasEncryptedStore() {
+	if idx, err := store.LoadIndex(); err == nil && idx != nil && idx.Total > 0 && store.HasEncryptedStore() {
 		return 0, nil
 	}
 	src := findBundledSQLite(installDir)
 	if src == "" {
 		return 0, nil
+	}
+	// Empty/corrupt index.enc would block re-import — clear before sealing.
+	if store.HasEncryptedStore() {
+		_ = store.Clear()
 	}
 	n, err := store.ImportFromSQLite(src)
 	if err != nil {
@@ -51,6 +55,10 @@ func SealBundledSignatures(dataDir, installDir string) (imported int, err error)
 	}
 	// Remove plaintext copy from installer tree only (keep repo dev bundle).
 	_ = removeInstallEngineCopy(installDir)
+	bundled := filepath.Join(installDir, "bundled", "ssdeep", BundledSQLiteName)
+	if st, err := os.Stat(bundled); err == nil && !st.IsDir() {
+		_ = securefs.WipeAndRemove(bundled)
+	}
 	return n, nil
 }
 

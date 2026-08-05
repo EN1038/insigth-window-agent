@@ -21,15 +21,17 @@ type Enumerator struct {
 	OnFile      func(FileItem)
 }
 
-func NewEnumerator(st *settings.Store, scanAll bool) *Enumerator {
+func NewEnumerator(st *settings.Store, scanAll bool, allExtensions bool) *Enumerator {
 	e := &Enumerator{
 		settings:   st,
 		exclusions: st.Exclusions(),
 		scanAll:    scanAll,
 		extensions: map[string]struct{}{},
 	}
-	for _, ext := range st.ScanExtensions() {
-		e.extensions[strings.ToLower(ext)] = struct{}{}
+	if !allExtensions {
+		for _, ext := range st.ScanExtensions() {
+			e.extensions[strings.ToLower(ext)] = struct{}{}
+		}
 	}
 	return e
 }

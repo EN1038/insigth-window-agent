@@ -9,6 +9,8 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+
+	"github.com/sosecure/insite-agent/internal/securefs"
 )
 
 // ImportZip extracts a downloaded rule ZIP and stores .yar files encrypted.
@@ -20,7 +22,7 @@ func (s *Store) ImportZip(zipPath, ruleSetName string) (version string, count in
 	if err != nil {
 		return "", 0, err
 	}
-	defer os.RemoveAll(tempDir)
+	defer securefs.WipeTree(tempDir)
 
 	if err := extractZip(zipPath, tempDir); err != nil {
 		return "", 0, err

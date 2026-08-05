@@ -3,19 +3,23 @@ package scan
 import "time"
 
 const (
-	batchSize  = 5000
-	queueCap   = 10000
+	// Smaller batches keep the UI updating during YARA/ssdeep instead of freezing
+	// on multi-thousand-file chunks with no progress.
+	batchSize   = 64
+	queueCap    = 10000
 	scanWorkers = 1
 )
 
 type StatusInfo struct {
-	Scanning bool   `json:"scanning"`
-	ScanType string `json:"scan_type"`
-	Scanned  int    `json:"scanned"`
-	Total    int    `json:"total"`
-	Skipped  int    `json:"skipped"`
-	Threats  int    `json:"threats"`
-	Status   string `json:"status"`
+	Scanning    bool   `json:"scanning"`
+	ScanType    string `json:"scan_type"`
+	Scanned     int    `json:"scanned"`
+	Total       int    `json:"total"`
+	Skipped     int    `json:"skipped"`
+	Threats     int    `json:"threats"`
+	Status      string `json:"status"` // discovering|scanning|completed|stopped|error|idle
+	Message     string `json:"message"`
+	CurrentFile string `json:"current_file"`
 }
 
 
@@ -69,15 +73,30 @@ func (r Result) Duration() time.Duration {
 
 func APIMode(scanType ScanType, scanSource string) string {
 	switch {
+	case scanSource == SourceSchedule || scanSource == SourceLogin:
+		return "AUTO_SCAN"
 	case scanType == ScanAuto:
 		return "AUTO_SCAN"
-	case scanType == ScanSilent:
+	case scanType == ScanSilent || scanSource == SourceRealtime:
 		return "REALTIME_SCAN"
-	case scanSource == "USB":
+	case scanSource == SourceUSB || scanSource == "USB":
 		return "USB_SCAN"
 	case scanType == ScanCustom:
 		return "CUSTOM_SCAN"
+	case scanType == ScanQuick:
+		return "QUICK_SCAN"
+	case scanType == ScanFull:
+		return "FULL_SCAN"
 	default:
 		return "MANUAL_SCAN"
 	}
 }
+
+// Scan trigger sources (stored on Result.ScanSource / API mode).
+const (
+	SourceManual   = "Manual"
+	SourceSchedule = "Schedule"
+	SourceLogin    = "Login"
+	SourceUSB      = "USB"
+	SourceRealtime = "Realtime"
+)

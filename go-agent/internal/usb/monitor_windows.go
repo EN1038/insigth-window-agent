@@ -60,8 +60,10 @@ func (m *Monitor) poll() {
 	defer m.mu.Unlock()
 	for drive := range current {
 		if !m.known[drive] {
-			m.known[drive] = true
-			go m.manager.StartCustomScan(drive)
+			// Only mark known after a scan is accepted; retry while busy.
+			if m.manager.StartCustomScan(drive) {
+				m.known[drive] = true
+			}
 		}
 	}
 	for drive := range m.known {

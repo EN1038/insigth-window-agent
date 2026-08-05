@@ -11,6 +11,7 @@ import (
 	"unicode/utf16"
 
 	"github.com/sosecure/insite-agent/internal/config"
+	"github.com/sosecure/insite-agent/internal/securefs"
 )
 
 type Match struct {
@@ -38,7 +39,7 @@ func (s *Scanner) ScanBatch(ruleEntries, filePaths []string) ([]Match, error) {
 	if err := writeScanListUTF16(listPath, filePaths); err != nil {
 		return nil, err
 	}
-	defer os.Remove(listPath)
+	defer securefs.WipeAndRemove(listPath)
 
 	args := buildRuleArgs(ruleEntries)
 	args = append(args, "--scan-list", listPath)

@@ -81,6 +81,9 @@ func NewHost(baseDir string) (*Host, error) {
 		_ = hist.Append("ssdeep.error", "bundled seal: "+err.Error(), nil)
 	} else if n > 0 {
 		st.Set(settings.KeySsdeepBundledTotal, fmt.Sprintf("%d", n))
+		if strings.TrimSpace(st.Get(settings.KeySsdeepDBVersion, "")) == "" {
+			st.Set(settings.KeySsdeepDBVersion, "bundled")
+		}
 		_ = st.Save()
 		_ = hist.Append("ssdeep.bundled", fmt.Sprintf("sealed bundled ssdeep signatures (%d)", n), nil)
 	}
@@ -113,7 +116,11 @@ func NewHost(baseDir string) (*Host, error) {
 		Runner:   runner,
 		API:      apiClient,
 	}
-	h.IPC = ipc.NewServer(h)
+	tok, err := ipc.EnsureLocalToken(baseDir)
+	if err != nil {
+		return nil, fmt.Errorf("ipc token: %w", err)
+	}
+	h.IPC = ipc.NewServer(h, tok)
 	return h, nil
 }
 

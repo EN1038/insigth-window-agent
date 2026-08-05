@@ -235,7 +235,7 @@ Agent ใช้เทียบกับ `ssdeep_db_version` ใน settings ว�
 | Field | บังคับ | หมายเหตุ |
 |-------|--------|----------|
 | `hash_sha256` | แนะนำ | ใช้คิว VT ฝั่ง server |
-| `scan_mode` | แนะนำ | เหมือน `sendAgentScanLog.mode`: `MANUAL_SCAN`, `AUTO_SCAN`, `USB_SCAN`, `REALTIME_SCAN`, `CUSTOM_SCAN` |
+| `scan_mode` | แนะนำ | เหมือน `sendAgentScanLog.mode`: `FULL_SCAN`, `QUICK_SCAN`, `AUTO_SCAN`, `USB_SCAN`, `REALTIME_SCAN`, `CUSTOM_SCAN`, `MANUAL_SCAN` |
 | `source` | ไม่ | เช่น `agent_detection`, `yara_hit`, `ssdeep_hit` |
 
 **Response `data`:**

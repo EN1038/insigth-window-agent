@@ -255,7 +255,7 @@ func (r *Router) showOverview(setPage func(fyne.CanvasObject)) {
 
 	stopCtrl := newStopScanControl(func() { _ = r.client.StopScan(r.ctx) })
 
-	leftCol := container.NewVBox(
+	leftItems := []fyne.CanvasObject{
 		fullScan,
 		vspace(8),
 		quickScan,
@@ -267,7 +267,14 @@ func (r *Router) showOverview(setPage func(fyne.CanvasObject)) {
 		container.NewCenter(container.New(&fixedWidth{w: 200}, typeGroup)),
 		vspace(14),
 		container.NewCenter(stopCtrl),
-	)
+	}
+	if r.embedded {
+		warn := widget.NewLabel("Standalone UI — realtime / schedule / login scan run only while this window stays open. Start the Windows service for always-on protection.")
+		warn.Wrapping = fyne.TextWrapWord
+		warn.Importance = widget.WarningImportance
+		leftItems = append([]fyne.CanvasObject{warn, vspace(8)}, leftItems...)
+	}
+	leftCol := container.NewVBox(leftItems...)
 	leftScroll := container.NewVScroll(leftCol)
 	const overviewH = float32(520)
 	leftPanel := card(container.New(&fixedHeight{h: overviewH}, leftScroll))
@@ -286,12 +293,25 @@ func (r *Router) showOverview(setPage func(fyne.CanvasObject)) {
 
 	ring := newProgressRing()
 	pct := heading("0", 56, colorText)
+	pctUnit := canvasMuted("%", colorMuted)
 	pctBox := container.NewStack(
 		container.New(&fixedSize{w: 200, h: 200}, ring.canvas),
 		container.NewCenter(container.NewVBox(
 			container.NewCenter(pct),
-			container.NewCenter(canvasMuted("%", colorMuted)),
+			container.NewCenter(pctUnit),
 		)),
+	)
+	scanPhase := canvasMuted("Ready", colorMuted)
+	scanPhase.TextSize = 11
+	scanPhase.Alignment = fyne.TextAlignCenter
+	scanFile := canvasMuted("", colorMuted)
+	scanFile.TextSize = 10
+	scanFile.Alignment = fyne.TextAlignCenter
+	ringCol := container.NewVBox(
+		container.NewCenter(pctBox),
+		vspace(4),
+		container.NewCenter(scanPhase),
+		container.NewCenter(scanFile),
 	)
 
 	logEvents := []ipc.HistoryEvent{}
@@ -328,17 +348,18 @@ func (r *Router) showOverview(setPage func(fyne.CanvasObject)) {
 
 	rightCardBody := container.NewHBox(
 		container.New(&fixedWidth{w: 140}, metrics),
-		container.New(&fixedWidth{w: 240}, container.NewCenter(pctBox)),
+		container.New(&fixedWidth{w: 260}, container.NewCenter(ringCol)),
 		layout.NewSpacer(),
 		container.New(&fixedWidth{w: 300}, logPanel),
 	)
 	rightCard := card(container.NewPadded(container.NewPadded(rightCardBody)))
 
-	tools := container.NewGridWithColumns(4,
+	tools := container.NewGridWithColumns(5,
 		toolCard(resIconLog, "VIEW LOGS", func() { r.showViewLogs() }),
 		toolCard(resIconYara, "YARA RULES", func() { r.showYaraRules() }),
 		toolCard(resIconHash, "HASH", func() { r.showHashTool() }),
-		toolCard(resIconBatch, "SSDEEP", func() { r.showSsdeepTool() }),
+		toolCardText("ssdeep", "SSDEEP", func() { r.showSsdeepTool() }),
+		toolCard(theme.WarningIcon(), "QUARANTINE", func() { r.showQuarantine() }),
 	)
 
 	rightCol := container.NewVBox(
@@ -365,18 +386,70 @@ func (r *Router) showOverview(setPage func(fyne.CanvasObject)) {
 		ev, evErr := r.client.History(r.ctx, 40)
 		fyne.Do(func() {
 			fileCount.Text = fmtCount(ss.Scanned)
+			if ss.Scanning && strings.EqualFold(ss.Status, "discovering") && ss.Scanned == 0 {
+				fileCount.Text = fmtCount(ss.Total)
+			}
 			detectCount.Text = fmtCount(ss.Threats)
 			frac := 0.0
-			if ss.Total > 0 {
-				frac = float64(ss.Scanned) / float64(ss.Total)
-			} else if !ss.Scanning {
-				frac = 0
+			pctLabel := "0"
+			phase := "Ready"
+			fileHint := ""
+			switch {
+			case ss.Scanning && strings.EqualFold(ss.Status, "discovering"):
+				// Soft activity meter while total is still growing.
+				frac = 0.08 + 0.22*math.Mod(float64(ss.Total%500)/500.0, 1.0)
+				pctLabel = "…"
+				phase = ss.Message
+				if phase == "" {
+					phase = fmt.Sprintf("Discovering… %d found", ss.Total)
+				}
+				fileHint = ss.CurrentFile
+			case ss.Scanning && strings.EqualFold(ss.Status, "finalizing"):
+				frac = 1
+				pctLabel = "100"
+				phase = ss.Message
+				if phase == "" {
+					phase = "Finalizing…"
+				}
+				fileHint = ss.CurrentFile
+			case ss.Scanning:
+				if ss.Total > 0 {
+					frac = float64(ss.Scanned) / float64(ss.Total)
+				} else {
+					frac = 0.05
+				}
+				pctLabel = fmtCount(int(frac * 100))
+				phase = ss.Message
+				if phase == "" {
+					phase = fmt.Sprintf("Scanning… %d / %d", ss.Scanned, ss.Total)
+				}
+				fileHint = ss.CurrentFile
+			default:
+				if ss.Total > 0 {
+					frac = float64(ss.Scanned) / float64(ss.Total)
+					pctLabel = fmtCount(int(frac * 100))
+				}
+				if msg := strings.TrimSpace(ss.Message); msg != "" {
+					phase = msg
+				} else {
+					phase = "Ready"
+				}
 			}
 			ring.set(frac)
-			pct.Text = fmtCount(int(frac * 100))
+			pct.Text = pctLabel
+			if pctLabel == "…" {
+				pctUnit.Text = ""
+			} else {
+				pctUnit.Text = "%"
+			}
+			scanPhase.Text = truncateText(phase, 42)
+			scanFile.Text = truncateText(fileHint, 36)
 			fileCount.Refresh()
 			detectCount.Refresh()
 			pct.Refresh()
+			pctUnit.Refresh()
+			scanPhase.Refresh()
+			scanFile.Refresh()
 			stopCtrl.setScanning(ss.Scanning)
 			if evErr == nil {
 				logEvents = filterScanEvents(ev, 40)
@@ -510,7 +583,7 @@ func (r *Router) showSettings(setPage func(fyne.CanvasObject)) {
 		divider(),
 		toggleRowImg(resIconUSB, "USB protection", "Automatically scan removable drives", usb),
 		divider(),
-		toggleRowImg(resIconConn, "Auto scan on login", "Run a quick scan when a user signs in", auto),
+		toggleRowImg(resIconConn, "Auto scan on login", "Run a quick scan when a user signs in (not on agent start)", auto),
 	))
 
 	schedule := card(container.NewVBox(
@@ -552,6 +625,16 @@ func (r *Router) showSettings(setPage func(fyne.CanvasObject)) {
 
 	rulesVer := muted(fmt.Sprintf("local=%s  server=%s  ver=%s",
 		orDash(st.LocalRulesCount), orDash(st.ServerRulesCount), orDash(st.RulesVersion)))
+	ssdeepInfo, _ := r.client.SsdeepInfo(r.ctx)
+	ssdeepHashes := "—"
+	if ssdeepInfo.Total > 0 {
+		ssdeepHashes = fmt.Sprintf("%d", ssdeepInfo.Total)
+	}
+	ssdeepVer := orDash(ssdeepInfo.Version)
+	if ssdeepVer == "—" {
+		ssdeepVer = orDash(st.SsdeepDBVersion)
+	}
+	ssdeepLine := muted(fmt.Sprintf("ssdeep hashes=%s  ver=%s", ssdeepHashes, ssdeepVer))
 	syncBtn := widget.NewButtonWithIcon("Sync now", theme.DownloadIcon(), nil)
 	syncBtn.OnTapped = func() {
 		syncBtn.Disable()
@@ -574,7 +657,7 @@ func (r *Router) showSettings(setPage func(fyne.CanvasObject)) {
 	rulesCard := card(container.NewVBox(
 		sectionHeaderImg(resIconYara, "Threat intelligence"),
 		vspace(4),
-		container.NewBorder(nil, nil, container.NewVBox(label("Threat rules"), rulesVer), syncBtn),
+		container.NewBorder(nil, nil, container.NewVBox(label("Threat rules"), rulesVer, ssdeepLine), syncBtn),
 	))
 
 	curVer := orDash(st.AgentVersionCurrent)
@@ -693,8 +776,8 @@ func (r *Router) showSettings(setPage func(fyne.CanvasObject)) {
 
 	body := container.NewVBox(
 		protection, vspace(6),
-		schedule, vspace(6),
 		ssdeepCard, vspace(6),
+		schedule, vspace(6),
 		rulesCard, vspace(6),
 		updateCard, vspace(6),
 		container.NewGridWithColumns(2, logout, save),
@@ -1208,11 +1291,12 @@ func truncateText(s string, max int) string {
 // toolCardButton is a hoverable dashboard shortcut card.
 type toolCardButton struct {
 	widget.BaseWidget
-	iconRes fyne.Resource
-	title   string
-	hover   bool
-	onTap   func()
-	bg      *canvas.Rectangle
+	iconRes  fyne.Resource
+	iconText string
+	title    string
+	hover    bool
+	onTap    func()
+	bg       *canvas.Rectangle
 }
 
 var (
@@ -1226,6 +1310,20 @@ func newToolCardButton(icon fyne.Resource, text string, onTap func()) *toolCardB
 		title:   text,
 		onTap:   onTap,
 		bg:      canvas.NewRectangle(colorCard),
+	}
+	t.bg.CornerRadius = 12
+	t.bg.StrokeWidth = 1
+	t.ExtendBaseWidget(t)
+	t.refreshLook()
+	return t
+}
+
+func newToolCardTextButton(iconText, text string, onTap func()) *toolCardButton {
+	t := &toolCardButton{
+		iconText: iconText,
+		title:    text,
+		onTap:    onTap,
+		bg:       canvas.NewRectangle(colorCard),
 	}
 	t.bg.CornerRadius = 12
 	t.bg.StrokeWidth = 1
@@ -1266,8 +1364,16 @@ func (t *toolCardButton) Tapped(*fyne.PointEvent) {
 }
 
 func (t *toolCardButton) CreateRenderer() fyne.WidgetRenderer {
+	var iconObj fyne.CanvasObject
+	if t.iconText != "" {
+		txt := heading(t.iconText, 20, colorPrimary)
+		txt.Alignment = fyne.TextAlignCenter
+		iconObj = container.NewCenter(container.New(&fixedHeight{h: 52}, txt))
+	} else {
+		iconObj = img(t.iconRes, 52, 52)
+	}
 	body := container.NewCenter(container.NewVBox(
-		container.NewCenter(img(t.iconRes, 52, 52)),
+		container.NewCenter(iconObj),
 		vspace(10),
 		container.NewCenter(heading(t.title, 13, colorText)),
 	))
@@ -1277,6 +1383,11 @@ func (t *toolCardButton) CreateRenderer() fyne.WidgetRenderer {
 // toolCard is a large tappable card (VIEW LOGS / YARA / HASH).
 func toolCard(icon fyne.Resource, text string, onTap func()) fyne.CanvasObject {
 	return newToolCardButton(icon, text, onTap)
+}
+
+// toolCardText is like toolCard but uses lettering for the icon (e.g. "ssdeep").
+func toolCardText(iconText, text string, onTap func()) fyne.CanvasObject {
+	return newToolCardTextButton(iconText, text, onTap)
 }
 
 func sectionHeaderImg(icon fyne.Resource, text string) fyne.CanvasObject {

@@ -11,3 +11,7 @@ func quickScanProfileEnvs() []map[string]string { return nil }
 func expandQuickPath(tmpl string, _ map[string]string) string {
 	return os.ExpandEnv(tmpl)
 }
+
+func (s *Store) RealtimeWatchRoots() []string {
+	return s.QuickScanPaths()
+}

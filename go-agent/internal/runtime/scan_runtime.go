@@ -7,6 +7,7 @@ import (
 	"github.com/sosecure/insite-agent/internal/history"
 	"github.com/sosecure/insite-agent/internal/login"
 	"github.com/sosecure/insite-agent/internal/quarantine"
+	"github.com/sosecure/insite-agent/internal/reportq"
 	"github.com/sosecure/insite-agent/internal/rules"
 	"github.com/sosecure/insite-agent/internal/scan"
 	"github.com/sosecure/insite-agent/internal/settings"
@@ -21,18 +22,21 @@ type ScanRuntime struct {
 	Watcher   *watcher.Watcher
 	USB       *usb.Monitor
 	Login     *login.Monitor
+	ReportQ   *reportq.Queue
 }
 
 func NewScanRuntime(baseDir string, st *settings.Store, snap *snapshot.Store, apiClient *api.Client, hist *history.Store, ruleStore *rules.Store) *ScanRuntime {
 	quar := quarantine.New(baseDir, st.Get(settings.KeyQuarantinePath, ""))
 	_ = quar.Load()
-	mgr := scan.NewManager(baseDir, st, snap, apiClient, hist, ruleStore, quar)
+	rq := reportq.New(baseDir)
+	mgr := scan.NewManager(baseDir, st, snap, apiClient, hist, ruleStore, quar, rq)
 	return &ScanRuntime{
 		Manager:   mgr,
 		Scheduler: scan.NewScheduler(mgr, st),
 		Watcher:   watcher.New(mgr, st),
 		USB:       usb.New(mgr, st),
 		Login:     login.New(mgr, st),
+		ReportQ:   rq,
 	}
 }
 

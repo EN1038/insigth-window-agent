@@ -6,6 +6,7 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
+	"sync"
 
 	"github.com/sosecure/insite-agent/internal/config"
 	"github.com/sosecure/insite-agent/internal/storage"
@@ -85,9 +86,44 @@ const DefaultScanExtensions = "" +
 	".txt,.log,.bak,.old,.dat," +
 	".img,.iso"
 
+// LegacyExclusionPaths is the pre–market-AV default that blanked most of the disk
+// from Full scan. Installs still on this list are upgraded once on load.
+const LegacyExclusionPaths = `\windows;\$recycle.bin;\system volume information;\program files;\program files (x86);\programdata`
+
+// DefaultExclusionPaths follows consumer AV practice: Full scan covers user data
+// and Program Files, while skipping only high-churn / dangerous system areas.
+const DefaultExclusionPaths = "" +
+	`\$recycle.bin;` +
+	`\system volume information;` +
+	`\windows\winsxs;` +
+	`\windows\softwaredistribution;` +
+	`\windows\servicing;` +
+	`\windows\assembly;` +
+	`\windows\installer;` +
+	`\programdata\microsoft\windows defender;` +
+	`\programdata\microsoft\windows\wer`
+
+// HardExclusions are always applied (even if the operator clears exclusion_paths).
+func HardExclusions() []string {
+	return []string{
+		`\$recycle.bin`,
+		`\system volume information`,
+		`\windows\winsxs`,
+		`\windows\softwaredistribution`,
+		`\windows\servicing`,
+	}
+}
+
+// DefaultQuickScanPaths matches typical AV "quick/fast" coverage.
+const DefaultQuickScanPaths = `%USERPROFILE%\Downloads;%USERPROFILE%\Desktop;%USERPROFILE%\Documents;%TEMP%;%APPDATA%`
+
+// LegacyQuickScanPaths is upgraded once when still at the older default.
+const LegacyQuickScanPaths = `%USERPROFILE%\Downloads;%USERPROFILE%\Desktop;%TEMP%;%APPDATA%`
+
 type Store struct {
 	baseDir string
 	paths   config.Paths
+	mu      sync.RWMutex
 
 	Values map[string]string `json:"values"`
 }
@@ -123,10 +159,10 @@ func (s *Store) setDefaults() {
 	def(KeyQuarantinePath, filepath.Join(s.baseDir, "Quarantine"))
 	def(KeyLogLevel, "info")
 	def(KeyScanExtensions, DefaultScanExtensions)
-	def(KeyExclusionPaths, `\windows;\$recycle.bin;\system volume information;\program files;\program files (x86);\programdata`)
+	def(KeyExclusionPaths, DefaultExclusionPaths)
 	def(KeyCacheExpiryHours, "168")
-	def(KeyQuickScanPaths, `%USERPROFILE%\Downloads;%USERPROFILE%\Desktop;%TEMP%;%APPDATA%`)
-	def(KeyAutoScanOnLogin, "true")
+	def(KeyQuickScanPaths, DefaultQuickScanPaths)
+	def(KeyAutoScanOnLogin, "false")
 	def(KeyUSBProtection, "true")
 	def(KeyRealtimeShield, "true")
 	def(KeyBatchJobEveryDay, strconv.Itoa(DefaultBatchIntervalMinutes))
@@ -170,8 +206,11 @@ func (s *Store) Load() error {
 	if err := enc.Load(&p); err != nil {
 		// If missing, attempt migrate legacy settings.cfg (encrypted/plain), then save.
 		if os.IsNotExist(err) {
+			s.mu.Lock()
 			_ = s.migrateLegacySettingsCfg(filepath.Join(s.paths.DataDir, "settings.cfg"))
-			_ = s.MergeDefaultScanExtensions()
+			_ = s.mergeDefaultScanExtensionsLocked()
+			_ = s.migrateMarketScanDefaultsLocked()
+			s.mu.Unlock()
 			_ = s.Save()
 			return nil
 		}
@@ -180,16 +219,28 @@ func (s *Store) Load() error {
 	if p.Values == nil {
 		p.Values = map[string]string{}
 	}
+	s.mu.Lock()
 	s.Values = p.Values
 	s.setDefaults()
-	if s.MergeDefaultScanExtensions() {
+	changed := s.mergeDefaultScanExtensionsLocked()
+	if s.migrateMarketScanDefaultsLocked() {
+		changed = true
+	}
+	s.mu.Unlock()
+	if changed {
 		_ = s.Save()
 	}
 	return nil
 }
 
 func (s *Store) Save() error {
+	s.mu.Lock()
 	s.setDefaults()
+	values := make(map[string]string, len(s.Values))
+	for k, v := range s.Values {
+		values[k] = v
+	}
+	s.mu.Unlock()
 	enc := storage.EncryptedJSON{
 		VaultPath: s.paths.VaultPath,
 		Path:      filepath.Join(s.paths.DataDir, "settings.enc"),
@@ -199,10 +250,12 @@ func (s *Store) Save() error {
 	type payload struct {
 		Values map[string]string `json:"values"`
 	}
-	return enc.Save(payload{Values: s.Values})
+	return enc.Save(payload{Values: values})
 }
 
 func (s *Store) Get(key, def string) string {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
 	if v, ok := s.Values[key]; ok {
 		return v
 	}
@@ -210,6 +263,8 @@ func (s *Store) Get(key, def string) string {
 }
 
 func (s *Store) Set(key, val string) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
 	if s.Values == nil {
 		s.Values = map[string]string{}
 	}
@@ -222,18 +277,52 @@ func (s *Store) GetBool(key string) bool {
 
 func (s *Store) Exclusions() []string {
 	raw := s.Get(KeyExclusionPaths, "")
-	if raw == "" {
-		return nil
+	seen := map[string]struct{}{}
+	out := make([]string, 0, 16)
+	add := func(p string) {
+		p = strings.TrimSpace(strings.ToLower(p))
+		if p == "" {
+			return
+		}
+		if _, ok := seen[p]; ok {
+			return
+		}
+		seen[p] = struct{}{}
+		out = append(out, p)
 	}
-	parts := strings.Split(raw, ";")
-	out := make([]string, 0, len(parts))
-	for _, p := range parts {
-		p = strings.TrimSpace(p)
-		if p != "" {
-			out = append(out, p)
+	for _, p := range HardExclusions() {
+		add(p)
+	}
+	if raw != "" {
+		for _, p := range strings.Split(raw, ";") {
+			add(p)
 		}
 	}
 	return out
+}
+
+// migrateMarketScanDefaultsLocked upgrades legacy "skip almost everything" defaults
+// to market-AV style Full/Quick coverage. Only rewrites when the value still matches
+// the known legacy default so operator custom lists are preserved.
+func (s *Store) migrateMarketScanDefaultsLocked() bool {
+	if s.Values == nil {
+		return false
+	}
+	changed := false
+	norm := func(v string) string {
+		v = strings.ToLower(strings.TrimSpace(v))
+		v = strings.ReplaceAll(v, " ", "")
+		return v
+	}
+	if cur, ok := s.Values[KeyExclusionPaths]; ok && norm(cur) == norm(LegacyExclusionPaths) {
+		s.Values[KeyExclusionPaths] = DefaultExclusionPaths
+		changed = true
+	}
+	if cur, ok := s.Values[KeyQuickScanPaths]; ok && norm(cur) == norm(LegacyQuickScanPaths) {
+		s.Values[KeyQuickScanPaths] = DefaultQuickScanPaths
+		changed = true
+	}
+	return changed
 }
 
 func (s *Store) ScanExtensions() []string {
@@ -260,10 +349,27 @@ func (s *Store) ScanExtensions() []string {
 // so upgrades pick up new risky suffixes (e.g. .txt) without wiping custom lists.
 // Returns true if the stored value changed.
 func (s *Store) MergeDefaultScanExtensions() bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.mergeDefaultScanExtensionsLocked()
+}
+
+func (s *Store) mergeDefaultScanExtensionsLocked() bool {
 	have := map[string]bool{}
 	var ordered []string
-	for _, e := range s.ScanExtensions() {
-		if e == "" || have[e] {
+	raw := ""
+	if s.Values != nil {
+		raw = s.Values[KeyScanExtensions]
+	}
+	for _, e := range strings.Split(raw, ",") {
+		e = strings.TrimSpace(strings.ToLower(e))
+		if e == "" {
+			continue
+		}
+		if !strings.HasPrefix(e, ".") {
+			e = "." + e
+		}
+		if have[e] {
 			continue
 		}
 		have[e] = true
@@ -281,6 +387,9 @@ func (s *Store) MergeDefaultScanExtensions() bool {
 	}
 	if !changed {
 		return false
+	}
+	if s.Values == nil {
+		s.Values = map[string]string{}
 	}
 	s.Values[KeyScanExtensions] = strings.Join(ordered, ",")
 	return true
@@ -346,7 +455,10 @@ func (s *Store) migrateLegacySettingsCfg(path string) error {
 		k := strings.TrimSpace(ln[:eq])
 		v := strings.TrimSpace(ln[eq+1:])
 		if k != "" {
-			s.Set(k, v)
+			if s.Values == nil {
+				s.Values = map[string]string{}
+			}
+			s.Values[k] = v
 		}
 	}
 	s.setDefaults()

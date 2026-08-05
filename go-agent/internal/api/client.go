@@ -348,6 +348,7 @@ type ScanLogItem struct {
 	TimeStamp   string `json:"time_stamp"`
 	Mode        string `json:"mode"`
 	Type        string `json:"type"` // start|end
+	RunID       string `json:"run_id,omitempty"`
 }
 
 func (c *Client) SendAgentScanLog(items []ScanLogItem) (*Response, []byte, error) {

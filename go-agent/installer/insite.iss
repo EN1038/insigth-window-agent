@@ -56,3 +56,9 @@ Name: "desktopicon"; Description: "Create a &desktop shortcut"; GroupDescription
 ; Stop and remove the Go agent service before deleting files.
 Filename: "{app}\insite-agent.exe"; Parameters: "-mode uninstall"; Flags: runhidden waituntilterminated
 
+[UninstallDelete]
+Type: filesandordirs; Name: "{app}\Logs"
+Type: filesandordirs; Name: "{commonappdata}\SOSECURE Threat inSight"
+Type: filesandordirs; Name: "{localappdata}\SOSECURE Threat inSight"
+Type: filesandordirs; Name: "{userappdata}\SOSECURE Threat inSight"
+

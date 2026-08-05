@@ -61,38 +61,57 @@ func (w *Watcher) startLocked() error {
 	if err != nil {
 		return err
 	}
+	added := 0
+	var hitCap bool
 	for _, dir := range w.watchDirs() {
 		_ = filepath.Walk(dir, func(path string, info os.FileInfo, err error) error {
-			if err != nil || !info.IsDir() {
+			if hitCap {
+				return filepath.SkipDir
+			}
+			if err != nil || info == nil || !info.IsDir() {
 				return nil
 			}
-			_ = fsw.Add(path)
+			if shouldSkipRealtimeDir(path) {
+				return filepath.SkipDir
+			}
+			if fsw.Add(path) == nil {
+				added++
+			}
+			// Cap watch fan-out so huge Document trees do not exhaust handles.
+			if added >= 12000 {
+				hitCap = true
+				return filepath.SkipDir
+			}
 			return nil
 		})
+		if hitCap {
+			break
+		}
+	}
+	if added == 0 {
+		_ = fsw.Close()
+		return nil
 	}
 	w.fs = fsw
 	w.enabled = true
-	go w.loop()
+	// Pass local fsw so stop can Close without racing loop on w.fs nil.
+	go w.loop(fsw)
 	return nil
 }
 
-func (w *Watcher) loop() {
+func (w *Watcher) loop(fsw *fsnotify.Watcher) {
 	debounce := map[string]time.Time{}
 	for {
 		select {
-		case ev, ok := <-w.fs.Events:
+		case ev, ok := <-fsw.Events:
 			if !ok {
 				return
 			}
 			if ev.Op&(fsnotify.Create|fsnotify.Write|fsnotify.Rename) == 0 {
 				continue
 			}
-			path := ev.Name
-			if ev.Op&fsnotify.Rename != 0 && ev.Name != "" {
-				path = ev.Name
-			}
-			w.handle(path, debounce)
-		case _, ok := <-w.fs.Errors:
+			w.handle(ev.Name, ev.Op, debounce)
+		case _, ok := <-fsw.Errors:
 			if !ok {
 				return
 			}
@@ -100,18 +119,33 @@ func (w *Watcher) loop() {
 	}
 }
 
-func (w *Watcher) handle(filePath string, debounce map[string]time.Time) {
+func (w *Watcher) handle(filePath string, op fsnotify.Op, debounce map[string]time.Time) {
 	if !w.settings.GetBool(settings.KeyRealtimeShield) {
 		return
 	}
+	if isHardExcludedPath(filePath) {
+		return
+	}
 	st, err := os.Stat(filePath)
-	if err != nil || st.IsDir() {
+	if err != nil {
+		return
+	}
+	if st.IsDir() {
+		// Watch newly created subdirectories (fsnotify is not recursive).
+		if op&fsnotify.Create != 0 && !shouldSkipRealtimeDir(filePath) {
+			w.mu.Lock()
+			if w.fs != nil {
+				_ = w.fs.Add(filePath)
+			}
+			w.mu.Unlock()
+		}
 		return
 	}
 	if !w.shouldScanPath(filePath) {
 		return
 	}
-	if strings.Contains(strings.ToLower(filePath), `\data\`) {
+	lower := strings.ToLower(filePath)
+	if strings.Contains(lower, `\data\`) || strings.Contains(lower, `\quarantine\`) {
 		return
 	}
 	now := time.Now()
@@ -119,7 +153,14 @@ func (w *Watcher) handle(filePath string, debounce map[string]time.Time) {
 		return
 	}
 	debounce[filePath] = now
-	w.manager.StartSilentScan(filePath)
+	if len(debounce) > 4000 {
+		for k, t := range debounce {
+			if now.Sub(t) > time.Minute {
+				delete(debounce, k)
+			}
+		}
+	}
+	_ = w.manager.StartSilentScan(filePath)
 }
 
 // shouldScanPath mirrors on-demand ScanExtensions so realtime and custom scan
@@ -142,21 +183,32 @@ func (w *Watcher) shouldScanPath(filePath string) bool {
 }
 
 func (w *Watcher) watchDirs() []string {
-	profile := os.Getenv("USERPROFILE")
-	dirs := []string{}
-	if profile != "" {
-		dirs = append(dirs, filepath.Join(profile, "Downloads"))
+	if w.settings != nil {
+		return w.settings.RealtimeWatchRoots()
 	}
-	if desktop := os.Getenv("USERPROFILE"); desktop != "" {
-		dirs = append(dirs, filepath.Join(desktop, "Desktop"))
+	return nil
+}
+
+func shouldSkipRealtimeDir(path string) bool {
+	base := strings.ToLower(filepath.Base(path))
+	switch base {
+	case "node_modules", ".git", ".svn", ".hg", "cache", "caches", "code cache",
+		"gpuCache", "gpucache", "shadercache", "iNet Cache", "inetcache",
+		"windows", "winsxs", "softwaredistribution", "system volume information",
+		"$recycle.bin", "quarantine":
+		return true
 	}
-	out := make([]string, 0, len(dirs))
-	for _, d := range dirs {
-		if st, err := os.Stat(d); err == nil && st.IsDir() {
-			out = append(out, d)
+	return isHardExcludedPath(path)
+}
+
+func isHardExcludedPath(path string) bool {
+	lower := strings.ToLower(path)
+	for _, ex := range settings.HardExclusions() {
+		if strings.Contains(lower, strings.ToLower(ex)) {
+			return true
 		}
 	}
-	return out
+	return false
 }
 
 func (w *Watcher) stop() {

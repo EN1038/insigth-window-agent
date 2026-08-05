@@ -154,7 +154,7 @@ func newDragBar(hwnd func() uintptr) *dragBar {
 	return d
 }
 
-func (d *dragBar) MinSize() fyne.Size { return fyne.NewSize(80, 40) }
+func (d *dragBar) MinSize() fyne.Size { return fyne.NewSize(80, 28) }
 
 func (d *dragBar) MouseDown(e *desktop.MouseEvent) {
 	if e.Button != desktop.MouseButtonPrimary {

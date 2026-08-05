@@ -17,6 +17,7 @@ import (
 	"github.com/sosecure/insite-agent/internal/rules"
 	"github.com/sosecure/insite-agent/internal/settings"
 	"github.com/sosecure/insite-agent/internal/snapshot"
+	"github.com/sosecure/insite-agent/internal/ssdeepscan"
 	"github.com/sosecure/insite-agent/internal/sysinfo"
 )
 
@@ -322,14 +323,27 @@ func (r *Runner) startPostApproval(ctx context.Context) {
 
 	if !standalone {
 		go func() {
-			if r.Settings == nil || !r.Settings.GetBool(settings.KeyTIBootstrapDone) {
+			needBootstrap := r.Settings == nil || !r.Settings.GetBool(settings.KeyTIBootstrapDone)
+			if !needBootstrap && rules.New(r.BaseDir).FileCount() == 0 {
+				// Prior "done" flag with empty store (e.g. wiped ProgramData) — download again.
+				needBootstrap = true
+				if r.Settings != nil {
+					r.Settings.Set(settings.KeyTIBootstrapDone, "false")
+					_ = r.Settings.Save()
+				}
+			}
+			if needBootstrap {
 				r.runThreatIntelBootstrap(ctx)
 			}
+			// Scan engine only after TI is ready so Quick/Full Scan do not hit empty stores.
+			r.startScanSubsystem(ctx)
 			go r.configSyncLoop(ctx)
 			go r.tiSyncScheduleLoop(ctx)
 			go r.agentUpdateScheduleLoop(ctx)
 		}()
-	} else if r.Settings != nil {
+		return
+	}
+	if r.Settings != nil {
 		r.Settings.Set(settings.KeyTIBootstrapDone, "true")
 		_ = r.Settings.Save()
 	}
@@ -355,8 +369,8 @@ func (r *Runner) setTIProgress(percent float64, msg string) {
 }
 
 // runThreatIntelBootstrap downloads rules + ssdeep after approval and retries until
-// every listed file succeeds (or the server lists are empty). UI stays on the loading
-// screen until KeyTIBootstrapDone is true.
+// every listed file succeeds (or a usable local store already exists). UI stays on the
+// loading screen until KeyTIBootstrapDone is true.
 func (r *Runner) runThreatIntelBootstrap(ctx context.Context) {
 	if r.Settings != nil {
 		r.Settings.Set(settings.KeyTIBootstrapDone, "false")
@@ -373,6 +387,18 @@ func (r *Runner) runThreatIntelBootstrap(ctx context.Context) {
 		}
 		attempt++
 		r.setTIProgress(2, fmt.Sprintf("Downloading threat packs (attempt %d)…", attempt))
+
+		// Seed/repair empty ssdeep from installer bundle before asking Center.
+		if n, err := ssdeepscan.SealBundledSignatures(r.BaseDir, config.InstallDir()); err != nil {
+			_ = r.History.Append("ssdeep.error", "bundled seal during bootstrap: "+err.Error(), nil)
+		} else if n > 0 {
+			r.Settings.Set(settings.KeySsdeepBundledTotal, fmt.Sprintf("%d", n))
+			if strings.TrimSpace(r.Settings.Get(settings.KeySsdeepDBVersion, "")) == "" {
+				r.Settings.Set(settings.KeySsdeepDBVersion, "bundled")
+			}
+			_ = r.Settings.Save()
+			_ = r.History.Append("ssdeep.bundled", fmt.Sprintf("sealed bundled ssdeep during bootstrap (%d)", n), nil)
+		}
 
 		_ = r.syncConfigFromServer()
 
@@ -399,7 +425,18 @@ func (r *Runner) runThreatIntelBootstrap(ctx context.Context) {
 			return
 		}
 
-		r.setTIProgress(5, "Some packs failed — retrying in 10s…")
+		why := []string{}
+		if !rulesDone {
+			why = append(why, "YARA")
+		}
+		if !ssdeepDone {
+			why = append(why, "ssdeep")
+		}
+		msg := fmt.Sprintf("%s not ready — retrying in 10s…", strings.Join(why, "+"))
+		r.setTIProgress(5, msg)
+		_ = r.History.Append("download.warn", msg, map[string]any{
+			"attempt": attempt, "rules_done": rulesDone, "ssdeep_done": ssdeepDone,
+		})
 		select {
 		case <-ctx.Done():
 			return
@@ -606,6 +643,7 @@ func (r *Runner) doHeartbeat(isLogin bool) {
 	if r.API == nil {
 		return
 	}
+	r.flushReportQueue()
 	resp, raw, err := r.API.AgentOnlineTimestamp(isLogin)
 	if err != nil {
 		r.setCenterOnline(false)
@@ -619,6 +657,21 @@ func (r *Runner) doHeartbeat(isLogin bool) {
 	}
 	r.setCenterOnline(true)
 	_ = r.History.Append("heartbeat.ok", "heartbeat ok", nil)
+}
+
+func (r *Runner) flushReportQueue() {
+	r.mu.Lock()
+	sr := r.Scan
+	apiClient := r.API
+	r.mu.Unlock()
+	if sr == nil || sr.ReportQ == nil || apiClient == nil {
+		return
+	}
+	if n, err := sr.ReportQ.Flush(apiClient); n > 0 {
+		_ = r.History.Append("api.ok", fmt.Sprintf("report queue flushed (%d)", n), nil)
+	} else if err != nil {
+		_ = r.History.Append("api.warn", "report queue flush: "+err.Error(), nil)
+	}
 }
 
 func (r *Runner) setCenterOnline(ok bool) {

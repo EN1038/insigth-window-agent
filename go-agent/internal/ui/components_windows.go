@@ -167,6 +167,9 @@ func (f fixedWidth) Layout(objs []fyne.CanvasObject, s fyne.Size) {
 
 // flexWidth lets content fill the parent width while reporting MinWidth=0 so
 // long labels cannot stretch the main window (Fyne grows the window to MinSize).
+//
+// Layout must keep the child's full MinHeight — resizing to the viewport only
+// clips Settings cards (e.g. Ssdeep) so VScroll never reveals them.
 type flexWidth struct{}
 
 func (flexWidth) MinSize(objs []fyne.CanvasObject) fyne.Size {
@@ -181,7 +184,12 @@ func (flexWidth) MinSize(objs []fyne.CanvasObject) fyne.Size {
 
 func (flexWidth) Layout(objs []fyne.CanvasObject, s fyne.Size) {
 	for _, o := range objs {
-		o.Resize(s)
+		m := o.MinSize()
+		h := m.Height
+		if h < s.Height {
+			h = s.Height
+		}
+		o.Resize(fyne.NewSize(s.Width, h))
 		o.Move(fyne.NewPos(0, 0))
 	}
 }
