@@ -16,6 +16,7 @@ import (
 )
 
 // RunConfirmExit shows login credentials before closing the tray UI process.
+// Exit is allowed only after a successful online Login (same gate as Confirm Stop).
 func RunConfirmExit(ctx context.Context, client *ipc.Client) error {
 	prepareSoftwareGL()
 	a := app.NewWithID("com.sosecure.insite-agent.confirm-exit")
@@ -42,6 +43,7 @@ func RunConfirmExit(ctx context.Context, client *ipc.Client) error {
 		pass := passEntry.Text
 		if email == "" || pass == "" {
 			status.Text = "Email and password are required"
+			status.Color = colorError
 			status.Refresh()
 			return
 		}

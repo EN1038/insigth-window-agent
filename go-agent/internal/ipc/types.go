@@ -45,15 +45,19 @@ type ScanStartRequest struct {
 }
 
 type ScanStatusResponse struct {
-	Scanning    bool   `json:"scanning"`
-	ScanType    string `json:"scan_type"`
-	Scanned     int    `json:"scanned"`
-	Total       int    `json:"total"`
-	Skipped     int    `json:"skipped"`
-	Threats     int    `json:"threats"`
-	Status      string `json:"status"`
-	Message     string `json:"message"`
-	CurrentFile string `json:"current_file"`
+	Scanning      bool   `json:"scanning"`
+	ScanType      string `json:"scan_type"`
+	Source        string `json:"source"`
+	Scanned       int    `json:"scanned"`
+	Total         int    `json:"total"`
+	Skipped       int    `json:"skipped"`
+	Threats       int    `json:"threats"`
+	Status        string `json:"status"`
+	Message       string `json:"message"`
+	CurrentFile   string `json:"current_file"`
+	CurrentPath   string `json:"current_path"`
+	CurrentEngine string `json:"current_engine"`
+	DiscoveryDone bool   `json:"discovery_done"`
 }
 
 type SettingsView struct {

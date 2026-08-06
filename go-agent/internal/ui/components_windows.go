@@ -213,6 +213,22 @@ func (f *fixedHeight) Layout(objs []fyne.CanvasObject, s fyne.Size) {
 	}
 }
 
+// fillParent lays children out to the full parent size while reporting MinSize
+// 0×0. Use it so dense pages (Overview) cannot grow a fixed splash window —
+// Fyne otherwise expands the window to content MinSize and leaves a thin top edge.
+type fillParent struct{}
+
+func (fillParent) MinSize([]fyne.CanvasObject) fyne.Size {
+	return fyne.NewSize(0, 0)
+}
+
+func (fillParent) Layout(objs []fyne.CanvasObject, s fyne.Size) {
+	for _, o := range objs {
+		o.Resize(s)
+		o.Move(fyne.NewPos(0, 0))
+	}
+}
+
 // rightCoverLayout scales a single image like CSS object-fit:cover, anchored to the right.
 // Matches legacy ConfigWindow bg-login.png (UniformToFill + HorizontalAlignment=Right).
 type rightCoverLayout struct{}

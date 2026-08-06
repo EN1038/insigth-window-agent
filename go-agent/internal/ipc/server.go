@@ -291,15 +291,19 @@ func (s *Server) handleScanStatus(w http.ResponseWriter, r *http.Request) {
 	if sr := s.svc.ScanRuntime(); sr != nil && sr.Manager != nil {
 		st := sr.Manager.Status()
 		writeJSON(w, ScanStatusResponse{
-			Scanning:    st.Scanning,
-			ScanType:    st.ScanType,
-			Scanned:     st.Scanned,
-			Total:       st.Total,
-			Skipped:     st.Skipped,
-			Threats:     st.Threats,
-			Status:      st.Status,
-			Message:     st.Message,
-			CurrentFile: st.CurrentFile,
+			Scanning:      st.Scanning,
+			ScanType:      st.ScanType,
+			Source:        st.Source,
+			Scanned:       st.Scanned,
+			Total:         st.Total,
+			Skipped:       st.Skipped,
+			Threats:       st.Threats,
+			Status:        st.Status,
+			Message:       st.Message,
+			CurrentFile:   st.CurrentFile,
+			CurrentPath:   st.CurrentPath,
+			CurrentEngine: st.CurrentEngine,
+			DiscoveryDone: st.DiscoveryDone,
 		})
 		return
 	}
@@ -332,17 +336,28 @@ func (s *Server) handleRulesSync(w http.ResponseWriter, r *http.Request) {
 		rulesN, ssdeepN, err := s.svc.SyncThreatIntel()
 		if err != nil {
 			if st := s.svc.GetSettings(); st != nil {
-				st.Set(settings.KeyTIDownloadMessage, "Sync failed: "+err.Error())
+				msg := err.Error()
+				if st.GetBool(settings.KeyTISyncPending) {
+					msg = "Threat intelligence update is waiting until the current scan finishes."
+				} else if !strings.HasPrefix(strings.ToLower(msg), "sync failed") {
+					msg = "Sync failed: " + msg
+				}
+				st.Set(settings.KeyTIDownloadMessage, msg)
 				_ = st.Save()
 			}
 			return
 		}
+		_ = rulesN
+		_ = ssdeepN
 		if sr := s.svc.ScanRuntime(); sr != nil {
 			sr.RefreshRules()
 		}
 		if st := s.svc.GetSettings(); st != nil {
 			st.Set(settings.KeyTIDownloadPercent, "100")
-			st.Set(settings.KeyTIDownloadMessage, fmt.Sprintf("Sync done (rules=%d ssdeep=%d)", rulesN, ssdeepN))
+			// SyncThreatIntel already wrote a plain-language DownloadMessage — keep it.
+			if strings.TrimSpace(st.Get(settings.KeyTIDownloadMessage, "")) == "" {
+				st.Set(settings.KeyTIDownloadMessage, "Threat intelligence sync finished.")
+			}
 			_ = st.Save()
 		}
 	}()
@@ -359,15 +374,50 @@ func (s *Server) handleAgentUpdateCheck(w http.ResponseWriter, r *http.Request) 
 		return
 	}
 	st := s.svc.GetSettings()
-	msg := "Checked for agent update"
+	msg := "Checked for agent updates."
 	if st != nil {
-		msg = fmt.Sprintf("current=%s target=%s status=%s",
-			st.Get(settings.KeyAgentVersionCurrent, ""),
-			st.Get(settings.KeyAgentVersionTarget, ""),
-			st.Get(settings.KeyAgentUpdateStatus, ""),
-		)
+		cur := strings.TrimSpace(st.Get(settings.KeyAgentVersionCurrent, ""))
+		tgt := strings.TrimSpace(st.Get(settings.KeyAgentVersionTarget, ""))
+		status := strings.TrimSpace(st.Get(settings.KeyAgentUpdateStatus, ""))
+		switch status {
+		case "up_to_date":
+			if cur != "" {
+				msg = fmt.Sprintf("Your agent is up to date (version %s).", cur)
+			} else {
+				msg = "Your agent is up to date."
+			}
+		case "available":
+			if tgt != "" && cur != "" {
+				msg = fmt.Sprintf("A newer agent version (%s) is available. You are on %s.", tgt, cur)
+			} else if tgt != "" {
+				msg = fmt.Sprintf("A newer agent version (%s) is available.", tgt)
+			} else {
+				msg = "A newer agent version is available from Center."
+			}
+		case "deferred":
+			msg = "An agent update is waiting until the current scan finishes."
+		case "downloading", "installing", "ready":
+			if tgt != "" {
+				msg = fmt.Sprintf("Agent update to %s is in progress.", tgt)
+			} else {
+				msg = "Agent update is in progress."
+			}
+		case "failed":
+			msg = "The last agent update check or download failed. Try again from Settings."
+		default:
+			if cur != "" || tgt != "" {
+				msg = fmt.Sprintf("Update check finished (current %s, target %s).", orDashIPC(cur), orDashIPC(tgt))
+			}
+		}
 	}
 	writeJSON(w, OKResponse{OK: true, Message: msg})
+}
+
+func orDashIPC(s string) string {
+	if strings.TrimSpace(s) == "" {
+		return "—"
+	}
+	return s
 }
 
 func (s *Server) handleAgentUpdateInstall(w http.ResponseWriter, r *http.Request) {
@@ -378,7 +428,7 @@ func (s *Server) handleAgentUpdateInstall(w http.ResponseWriter, r *http.Request
 	go func() {
 		_ = s.svc.InstallAssignedAgentUpdate()
 	}()
-	writeJSON(w, OKResponse{OK: true, Message: "Agent update started"})
+	writeJSON(w, OKResponse{OK: true, Message: "Downloading and installing the assigned agent version. The service will restart when ready."})
 }
 
 func (s *Server) handleRulesInfo(w http.ResponseWriter, r *http.Request) {

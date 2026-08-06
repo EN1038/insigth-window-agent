@@ -58,6 +58,10 @@ func (r *Runner) syncSsdeepFromServerResult() (complete bool, imported int, fail
 	store := ssdeepscan.NewStore(r.BaseDir)
 	idx, _ := store.LoadIndex()
 	localEmpty := idx == nil || idx.Total == 0 || !store.HasEncryptedStore()
+	localTotal := 0
+	if idx != nil {
+		localTotal = idx.Total
+	}
 	currentVersion := strings.TrimSpace(r.Settings.Get(settings.KeySsdeepDBVersion, ""))
 	if localEmpty {
 		// Local store wiped / never imported — don't claim a version to Center.
@@ -67,22 +71,54 @@ func (r *Runner) syncSsdeepFromServerResult() (complete bool, imported int, fail
 	}
 
 	metaVersion := ""
+	metaOK := false
 	if resp, raw, err := r.API.GetSsdeep(currentVersion); err != nil {
 		_ = r.History.Append("api.warn", "getSsdeep: "+err.Error(), nil)
 	} else if resp.StatusCode != 200 {
 		_ = r.History.Append("api.warn", fmt.Sprintf("getSsdeep status=%d body=%s", resp.StatusCode, compact(raw)), nil)
 	} else {
+		metaOK = true
 		metaVersion = parseSsdeepMetaVersion(resp.Data)
 		if metaVersion != "" {
 			_ = r.History.Append("ssdeep.meta", "server ssdeep version "+metaVersion, nil)
+		} else {
+			_ = r.History.Append("ssdeep.meta", "Center has no ssdeep packs assigned for this site", nil)
 		}
 	}
+	emptyAssignment := metaOK && metaVersion == ""
 
 	// Local store already filled (bundled seal / prior import) but version never
 	// tagged — adopt Center getSsdeep version so UI / skip-logic see it.
 	if !localEmpty && currentVersion == "" && metaVersion != "" {
 		r.adoptSsdeepDBVersion(metaVersion)
 		currentVersion = metaVersion
+	}
+
+	// Intentional empty assignment: wipe local so site no longer uses removed packs.
+	if emptyAssignment {
+		if !localEmpty {
+			if err := store.Clear(); err != nil {
+				_ = r.History.Append("ssdeep.error", "clear local ssdeep store: "+err.Error(), nil)
+				return false, 0, 1
+			}
+			r.Settings.Set(settings.KeySsdeepDBVersion, "")
+			r.Settings.Set(settings.KeySsdeepBundledTotal, "0")
+			_ = r.Settings.Save()
+			_ = r.History.Append("ssdeep.sync", fmt.Sprintf(
+				"cleared local ssdeep store to match empty Center assignment (was %d signatures)", localTotal), map[string]any{
+				"old_local": localTotal,
+			})
+			_ = r.History.Append("ui.notify",
+				"Center removed ssdeep signature packs for this site. Local fuzzy signatures were cleared.",
+				map[string]any{"kind": "ti_sync"})
+			if r.Scan != nil {
+				r.Scan.RefreshSsdeep()
+			}
+		} else {
+			_ = r.History.Append("ssdeep.skip", "Center has no ssdeep packs for this site; local store already empty", nil)
+		}
+		r.setTIProgress(95, "Ssdeep: no packs assigned for this site")
+		return true, 0, 0
 	}
 
 	// Each ssdeep pack is a full snapshot. If local already has signatures on the
@@ -99,22 +135,24 @@ func (r *Runner) syncSsdeepFromServerResult() (complete bool, imported int, fail
 		r.setTIProgress(95, "Ssdeep categorized store ready")
 		return true, 0, 0
 	}
-	if !localEmpty && metaVersion == "" && currentVersion != "" && idx != nil && idx.Total > 0 {
+	// getSsdeep failed/unavailable — keep local; never wipe on network error.
+	if !localEmpty && !metaOK && idx != nil && idx.Total > 0 {
 		_ = r.History.Append("ssdeep.skip", "local ssdeep present; server meta unavailable", nil)
 		r.setTIProgress(95, "Ssdeep already loaded")
 		return true, 0, 0
 	}
-	// Local signatures exist but neither side has a version string yet.
-	if !localEmpty && idx != nil && idx.Total > 0 && currentVersion == "" && metaVersion == "" {
+	// Local signatures exist but neither side has a version string yet (meta failed).
+	if !localEmpty && idx != nil && idx.Total > 0 && currentVersion == "" && !metaOK {
 		r.adoptSsdeepDBVersion("bundled")
 		_ = r.History.Append("ssdeep.skip", fmt.Sprintf("local ssdeep present (%d signatures)", idx.Total), nil)
 		r.setTIProgress(95, fmt.Sprintf("Ssdeep ready (%d signatures)", idx.Total))
 		return true, 0, 0
 	}
 
-	force := localEmpty
+	force := localEmpty || (metaVersion != "" && currentVersion != "" && metaVersion != currentVersion)
 	if force {
-		_ = r.History.Append("ssdeep.force", "local ssdeep store empty; requesting force requeue", nil)
+		_ = r.History.Append("ssdeep.force", fmt.Sprintf(
+			"requesting force requeue (localEmpty=%v local_v=%s server_v=%s)", localEmpty, currentVersion, metaVersion), nil)
 	}
 	resp, raw, err := r.API.DownloadSsdeepSiteForce(currentVersion, force)
 	if err != nil {
@@ -212,12 +250,17 @@ func (r *Runner) downloadSsdeep(items []ssdeepDownloadItem, agentID int64) (impo
 	downloadsDir := filepath.Join(r.BaseDir, "Data", "ssdeep", "downloads")
 	_ = os.MkdirAll(downloadsDir, 0o700)
 
-	// Multi-category packs must merge into one store. Wipe once, then merge each pack.
-	if len(items) > 0 {
-		_ = store.Clear()
+	totalFiles := len(items)
+	if totalFiles == 0 {
+		return 0, 0
 	}
 
-	totalFiles := len(items)
+	type stagedPack struct {
+		item      ssdeepDownloadItem
+		localPath string
+		fileName  string
+	}
+	staged := make([]stagedPack, 0, totalFiles)
 	for idx, item := range items {
 		if strings.TrimSpace(item.Path) == "" {
 			continue
@@ -241,6 +284,33 @@ func (r *Runner) downloadSsdeep(items []ssdeepDownloadItem, agentID int64) (impo
 			failed++
 			continue
 		}
+		staged = append(staged, stagedPack{item: item, localPath: localPath, fileName: fileName})
+	}
+
+	if len(staged) == 0 {
+		return 0, failed
+	}
+
+	// Replace local store only after at least one pack downloaded successfully.
+	oldIdx, _ := store.LoadIndex()
+	oldTotal := 0
+	if oldIdx != nil {
+		oldTotal = oldIdx.Total
+	}
+	if err := store.Clear(); err != nil {
+		_ = r.History.Append("ssdeep.error", "clear local ssdeep before replace: "+err.Error(), nil)
+		return 0, failed + 1
+	}
+	_ = r.History.Append("ssdeep.sync", fmt.Sprintf(
+		"replacing local ssdeep store to match Center assignment (old=%d packs=%d)", oldTotal, len(staged)), map[string]any{
+		"old_local": oldTotal,
+		"packs":     len(staged),
+	})
+
+	for _, sp := range staged {
+		item := sp.item
+		localPath := sp.localPath
+		fileName := sp.fileName
 
 		importPath, cleanup, err := prepareSsdeepImportFile(localPath)
 		if err != nil {

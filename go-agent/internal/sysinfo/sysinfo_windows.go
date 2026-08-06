@@ -24,11 +24,22 @@ func Hostname() string {
 	return h
 }
 
-// LocalIPv4 returns ip_private using the same approach as the legacy .NET agent:
-// Dns.GetHostEntry(hostname).AddressList -> first IPv4. Falls back to interface scan.
+// LocalIPv4 returns ip_private. Prefer an up RFC1918 interface address (stable on
+// multi-NIC Server hosts); fall back to hostname DNS then any non-loopback IPv4.
 func LocalIPv4() string {
+	if ip := localIPv4FromInterfaces(); ip != "" && ip != "127.0.0.1" {
+		return ip
+	}
 	if h, err := os.Hostname(); err == nil && h != "" {
 		if ips, err := net.LookupIP(h); err == nil {
+			for _, ip := range ips {
+				if v4 := ip.To4(); v4 != nil {
+					s := v4.String()
+					if isPrivateIPv4(s) {
+						return s
+					}
+				}
+			}
 			for _, ip := range ips {
 				if v4 := ip.To4(); v4 != nil {
 					return v4.String()

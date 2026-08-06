@@ -276,8 +276,10 @@ func (r *Router) showOverview(setPage func(fyne.CanvasObject)) {
 	}
 	leftCol := container.NewVBox(leftItems...)
 	leftScroll := container.NewVScroll(leftCol)
-	const overviewH = float32(520)
-	leftPanel := card(container.New(&fixedHeight{h: overviewH}, leftScroll))
+	// fillParent: do not report a fixed MinHeight — overviewH=520 used to exceed
+	// the remaining window (650 − chrome − stats − footer) and Fyne grew the
+	// splash window, leaving a thin top edge above the black title bar.
+	leftPanel := card(container.New(&fillParent{}, leftScroll))
 
 	// RIGHT COLUMN — metrics + ring + live log inside one card
 	fileCount := heading("0", 24, colorSuccess)
@@ -304,13 +306,17 @@ func (r *Router) showOverview(setPage func(fyne.CanvasObject)) {
 	scanPhase := canvasMuted("Ready", colorMuted)
 	scanPhase.TextSize = 11
 	scanPhase.Alignment = fyne.TextAlignCenter
+	scanEngine := canvasMuted("", colorAccentCyan)
+	scanEngine.TextSize = 10
+	scanEngine.Alignment = fyne.TextAlignCenter
 	scanFile := canvasMuted("", colorMuted)
 	scanFile.TextSize = 10
 	scanFile.Alignment = fyne.TextAlignCenter
 	ringCol := container.NewVBox(
-		container.NewCenter(pctBox),
+		pctBox,
 		vspace(4),
 		container.NewCenter(scanPhase),
+		container.NewCenter(scanEngine),
 		container.NewCenter(scanFile),
 	)
 
@@ -338,7 +344,7 @@ func (r *Router) showOverview(setPage func(fyne.CanvasObject)) {
 				t = t[11:19]
 			}
 			ts.Text = t
-			msg.Text = truncateText(e.Message, 72)
+			msg.Text = truncateMiddle(e.Message, 90)
 			msg.Color = kindColor(e.Kind)
 			ts.Refresh()
 			msg.Refresh()
@@ -346,13 +352,18 @@ func (r *Router) showOverview(setPage func(fyne.CanvasObject)) {
 	)
 	logPanel := liveLogPanel(logList)
 
-	rightCardBody := container.NewHBox(
-		container.New(&fixedWidth{w: 140}, metrics),
-		container.New(&fixedWidth{w: 260}, container.NewCenter(ringCol)),
-		layout.NewSpacer(),
-		container.New(&fixedWidth{w: 300}, logPanel),
+	// Pack metrics + ring on the left (tight gap so the ring sits beside the counts).
+	metricsAndRing := container.NewHBox(
+		container.New(&fixedWidth{w: 120}, metrics),
+		hspace(4),
+		container.New(&fixedWidth{w: 200}, ringCol),
 	)
-	rightCard := card(container.NewPadded(container.NewPadded(rightCardBody)))
+	rightCardBody := container.NewBorder(
+		nil, nil, nil,
+		container.New(&fixedWidth{w: 300}, logPanel),
+		container.NewHBox(metricsAndRing, layout.NewSpacer()),
+	)
+	rightCard := card(container.NewPadded(rightCardBody))
 
 	tools := container.NewGridWithColumns(5,
 		toolCard(resIconLog, "VIEW LOGS", func() { r.showViewLogs() }),
@@ -362,18 +373,17 @@ func (r *Router) showOverview(setPage func(fyne.CanvasObject)) {
 		toolCard(theme.WarningIcon(), "QUARANTINE", func() { r.showQuarantine() }),
 	)
 
-	rightCol := container.NewVBox(
-		rightCard,
-		vspace(12),
-		container.New(&fixedHeight{h: 132}, tools),
-	)
+	rightInner := container.NewBorder(nil,
+		container.NewVBox(vspace(12), container.New(&fixedHeight{h: 132}, tools)),
+		nil, nil, rightCard)
 
 	page := container.NewBorder(nil, nil,
-		container.New(&fixedWidth{w: 248}, container.New(&fixedHeight{h: overviewH}, leftPanel)),
+		container.New(&fixedWidth{w: 248}, leftPanel),
 		nil,
-		container.New(&fixedHeight{h: overviewH}, container.NewPadded(rightCol)),
+		container.NewPadded(rightInner),
 	)
-	setPage(container.NewPadded(page))
+	// Cap MinSize so Overview cannot stretch the fixed 1100×650 splash window.
+	setPage(container.NewPadded(container.New(&flexWidth{}, container.New(&fillParent{}, page))))
 
 	// Refresh loop
 	stop := make(chan struct{})
@@ -385,56 +395,81 @@ func (r *Router) showOverview(setPage func(fyne.CanvasObject)) {
 		}
 		ev, evErr := r.client.History(r.ctx, 40)
 		fyne.Do(func() {
+			busy := ss.Scanning
+			fullScan.setEnabled(!busy)
+			quickScan.setEnabled(!busy)
+			customScan.setEnabled(!busy)
+			typeGroup.Disable()
+			if !busy {
+				typeGroup.Enable()
+			}
+			stLower := strings.ToLower(strings.TrimSpace(ss.ScanType))
+			fullScan.setActive(busy && stLower == "full")
+			quickScan.setActive(busy && (stLower == "quick" || stLower == "auto"))
+			customScan.setActive(busy && (stLower == "custom" || stLower == "silent"))
+
 			fileCount.Text = fmtCount(ss.Scanned)
-			if ss.Scanning && strings.EqualFold(ss.Status, "discovering") && ss.Scanned == 0 {
+			if busy && !ss.DiscoveryDone {
 				fileCount.Text = fmtCount(ss.Total)
 			}
 			detectCount.Text = fmtCount(ss.Threats)
+
 			frac := 0.0
 			pctLabel := "0"
 			phase := "Ready"
+			engineHint := ""
 			fileHint := ""
+			modeLabel := overviewScanModeLabel(ss.ScanType, ss.Source)
+
 			switch {
-			case ss.Scanning && strings.EqualFold(ss.Status, "discovering"):
-				// Soft activity meter while total is still growing.
-				frac = 0.08 + 0.22*math.Mod(float64(ss.Total%500)/500.0, 1.0)
-				pctLabel = "…"
-				phase = ss.Message
-				if phase == "" {
-					phase = fmt.Sprintf("Discovering… %d found", ss.Total)
-				}
-				fileHint = ss.CurrentFile
-			case ss.Scanning && strings.EqualFold(ss.Status, "finalizing"):
+			case busy && (strings.EqualFold(ss.Status, "finalizing") || strings.Contains(strings.ToLower(ss.Message), "quarantin") || strings.Contains(strings.ToLower(ss.Message), "reporting")):
 				frac = 1
 				pctLabel = "100"
-				phase = ss.Message
-				if phase == "" {
-					phase = "Finalizing…"
+				phase = modeLabel
+				if msg := strings.TrimSpace(ss.Message); msg != "" {
+					phase = modeLabel + " · " + msg
 				}
-				fileHint = ss.CurrentFile
-			case ss.Scanning:
+				fileHint = firstNonEmpty(ss.CurrentPath, ss.CurrentFile)
+			case busy && !ss.DiscoveryDone:
+				// Soft meter — do not claim overall % while Total is still growing.
+				frac = 0.08 + 0.22*math.Mod(float64(ss.Total%500)/500.0, 1.0)
+				pctLabel = "…"
+				phase = modeLabel + " · Discovering"
+				if ss.Message != "" {
+					phase = modeLabel + " · " + ss.Message
+				} else {
+					phase = fmt.Sprintf("%s · Discovering… found %d · scanned %d", modeLabel, ss.Total, ss.Scanned)
+				}
+				engineHint = "DISCOVER"
+				fileHint = firstNonEmpty(ss.CurrentPath, ss.CurrentFile)
+			case busy:
 				if ss.Total > 0 {
 					frac = float64(ss.Scanned) / float64(ss.Total)
+					if frac > 1 {
+						frac = 1
+					}
 				} else {
 					frac = 0.05
 				}
 				pctLabel = fmtCount(int(frac * 100))
-				phase = ss.Message
-				if phase == "" {
-					phase = fmt.Sprintf("Scanning… %d / %d", ss.Scanned, ss.Total)
+				phase = modeLabel
+				if ss.Message != "" {
+					phase = modeLabel + " · " + ss.Message
+				} else {
+					phase = fmt.Sprintf("%s · Scanning… %d / %d", modeLabel, ss.Scanned, ss.Total)
 				}
-				fileHint = ss.CurrentFile
+				engineHint = overviewEngineLabel(ss.CurrentEngine)
+				fileHint = firstNonEmpty(ss.CurrentPath, ss.CurrentFile)
 			default:
-				if ss.Total > 0 {
+				if ss.Total > 0 && strings.TrimSpace(ss.Message) != "" {
 					frac = float64(ss.Scanned) / float64(ss.Total)
 					pctLabel = fmtCount(int(frac * 100))
-				}
-				if msg := strings.TrimSpace(ss.Message); msg != "" {
-					phase = msg
+					phase = ss.Message
 				} else {
 					phase = "Ready"
 				}
 			}
+
 			ring.set(frac)
 			pct.Text = pctLabel
 			if pctLabel == "…" {
@@ -442,17 +477,25 @@ func (r *Router) showOverview(setPage func(fyne.CanvasObject)) {
 			} else {
 				pctUnit.Text = "%"
 			}
-			scanPhase.Text = truncateText(phase, 42)
-			scanFile.Text = truncateText(fileHint, 36)
+			scanPhase.Text = truncateText(phase, 48)
+			scanEngine.Text = engineHint
+			scanFile.Text = truncateMiddle(fileHint, 48)
 			fileCount.Refresh()
 			detectCount.Refresh()
 			pct.Refresh()
 			pctUnit.Refresh()
 			scanPhase.Refresh()
+			scanEngine.Refresh()
 			scanFile.Refresh()
-			stopCtrl.setScanning(ss.Scanning)
+			stopCtrl.setScanning(busy)
 			if evErr == nil {
 				logEvents = filterScanEvents(ev, 40)
+				if live := liveScanLogEvent(ss); live != nil {
+					logEvents = append([]ipc.HistoryEvent{*live}, logEvents...)
+					if len(logEvents) > 40 {
+						logEvents = logEvents[:40]
+					}
+				}
 				logList.Refresh()
 			}
 		})
@@ -649,9 +692,9 @@ func (r *Router) showSettings(setPage func(fyne.CanvasObject)) {
 			// Reload settings page so Center values appear without leaving the page.
 			r.showSettings(setPage)
 			if strings.TrimSpace(msg) == "" {
-				msg = "Synced rules, ssdeep, and settings from server."
+				msg = "Threat intelligence sync finished."
 			}
-			dialog.ShowInformation("Threat intelligence", msg, r.window)
+			dialog.ShowInformation("Threat intelligence", humanizeNotifyMessage(msg), r.window)
 		})
 	}
 	rulesCard := card(container.NewVBox(
@@ -1027,17 +1070,20 @@ func (n *navButton) CreateRenderer() fyne.WidgetRenderer {
 // scanActionButton is a scan control with border, hover, and press feedback.
 type scanActionButton struct {
 	widget.BaseWidget
-	iconRes fyne.Resource
-	title   string
-	primary bool
-	height  float32
-	hover   bool
-	press   bool
-	onTap   func()
+	iconRes  fyne.Resource
+	title    string
+	primary  bool
+	height   float32
+	hover    bool
+	press    bool
+	disabled bool
+	active   bool
+	onTap    func()
 
 	fill   *canvas.Rectangle
 	border *canvas.Rectangle
 	shade  *canvas.Rectangle
+	titleT *canvas.Text
 }
 
 var (
@@ -1057,12 +1103,45 @@ func newScanActionButton(icon fyne.Resource, title string, primary bool, height 
 		border:  canvas.NewRectangle(color.Transparent),
 		shade:   canvas.NewRectangle(color.Transparent),
 	}
+	textSz := float32(16)
+	fg := colorOnAccent
+	if !primary {
+		textSz = 13
+		fg = colorText
+	}
+	b.titleT = heading(title, textSz, fg)
 	b.ExtendBaseWidget(b)
 	b.refreshLook()
 	return b
 }
 
-func (b *scanActionButton) Cursor() desktop.Cursor { return desktop.PointerCursor }
+func (b *scanActionButton) Cursor() desktop.Cursor {
+	if b.disabled {
+		return desktop.DefaultCursor
+	}
+	return desktop.PointerCursor
+}
+
+func (b *scanActionButton) setEnabled(on bool) {
+	dis := !on
+	if b.disabled == dis {
+		return
+	}
+	b.disabled = dis
+	if dis {
+		b.hover = false
+		b.press = false
+	}
+	b.refreshLook()
+}
+
+func (b *scanActionButton) setActive(on bool) {
+	if b.active == on {
+		return
+	}
+	b.active = on
+	b.refreshLook()
+}
 
 func (b *scanActionButton) refreshLook() {
 	radius := float32(12)
@@ -1074,6 +1153,10 @@ func (b *scanActionButton) refreshLook() {
 	b.shade.CornerRadius = radius
 
 	switch {
+	case b.disabled:
+		b.shade.FillColor = color.NRGBA{R: 0x00, G: 0x00, B: 0x00, A: 0x55}
+		b.press = false
+		b.hover = false
 	case b.press:
 		b.shade.FillColor = color.NRGBA{R: 0x00, G: 0x00, B: 0x00, A: 0x35}
 	case b.hover:
@@ -1084,37 +1167,79 @@ func (b *scanActionButton) refreshLook() {
 
 	if b.primary {
 		switch {
+		case b.disabled:
+			b.fill.FillColor = color.NRGBA{R: 0x1e, G: 0x3a, B: 0x5f, A: 0xff}
+			b.border.StrokeColor = colorCardBorder
+			b.border.StrokeWidth = 1
+			if b.titleT != nil {
+				b.titleT.Color = colorMuted
+			}
 		case b.press:
 			b.fill.FillColor = color.NRGBA{R: 0x1d, G: 0x4e, B: 0xbd, A: 0xff}
-		case b.hover:
-			b.fill.FillColor = colorScanGradB
-		default:
-			b.fill.FillColor = colorScanGradA
-		}
-		if b.hover || b.press {
 			b.border.StrokeColor = colorAccentCyan
 			b.border.StrokeWidth = 1.5
-		} else {
+			if b.titleT != nil {
+				b.titleT.Color = colorOnAccent
+			}
+		case b.hover || b.active:
+			b.fill.FillColor = colorScanGradB
+			b.border.StrokeColor = colorAccentCyan
+			b.border.StrokeWidth = 1.5
+			if b.titleT != nil {
+				b.titleT.Color = colorOnAccent
+			}
+		default:
+			b.fill.FillColor = colorScanGradA
 			b.border.StrokeColor = color.NRGBA{R: 0x60, G: 0xa5, B: 0xfa, A: 0x70}
 			b.border.StrokeWidth = 1
+			if b.titleT != nil {
+				b.titleT.Color = colorOnAccent
+			}
 		}
 	} else {
-		if b.hover || b.press {
+		switch {
+		case b.disabled:
+			b.fill.FillColor = color.NRGBA{R: 0x15, G: 0x1c, B: 0x29, A: 0xff}
+			b.border.StrokeColor = colorCardBorder
+			b.border.StrokeWidth = 1
+			if b.titleT != nil {
+				b.titleT.Color = colorMuted
+			}
+		case b.active:
+			b.fill.FillColor = color.NRGBA{R: 0x1e, G: 0x3a, B: 0x5f, A: 0xff}
+			b.border.StrokeColor = colorAccentCyan
+			b.border.StrokeWidth = 1.5
+			if b.titleT != nil {
+				b.titleT.Color = colorAccentCyan
+			}
+		case b.hover || b.press:
 			b.fill.FillColor = color.NRGBA{R: 0x20, G: 0x2b, B: 0x3d, A: 0xff}
 			b.border.StrokeColor = colorPrimary
 			b.border.StrokeWidth = 1.5
-		} else {
+			if b.titleT != nil {
+				b.titleT.Color = colorText
+			}
+		default:
 			b.fill.FillColor = colorCard
 			b.border.StrokeColor = colorCardBorder
 			b.border.StrokeWidth = 1
+			if b.titleT != nil {
+				b.titleT.Color = colorText
+			}
 		}
 	}
 	b.shade.Refresh()
 	b.fill.Refresh()
 	b.border.Refresh()
+	if b.titleT != nil {
+		b.titleT.Refresh()
+	}
 }
 
 func (b *scanActionButton) MouseIn(*desktop.MouseEvent) {
+	if b.disabled {
+		return
+	}
 	b.hover = true
 	b.refreshLook()
 }
@@ -1128,6 +1253,9 @@ func (b *scanActionButton) MouseOut() {
 }
 
 func (b *scanActionButton) MouseDown(*desktop.MouseEvent) {
+	if b.disabled {
+		return
+	}
 	b.press = true
 	b.refreshLook()
 }
@@ -1138,30 +1266,22 @@ func (b *scanActionButton) MouseUp(*desktop.MouseEvent) {
 }
 
 func (b *scanActionButton) Tapped(*fyne.PointEvent) {
-	if b.onTap != nil {
-		b.onTap()
+	if b.disabled || b.onTap == nil {
+		return
 	}
+	b.onTap()
 }
 
 func (b *scanActionButton) CreateRenderer() fyne.WidgetRenderer {
 	iconSz := float32(26)
-	textSz := float32(16)
 	if !b.primary {
 		iconSz = 18
-		textSz = 13
 	}
 	row := container.NewCenter(container.NewHBox(
 		img(b.iconRes, iconSz, iconSz),
 		hspace(8),
-		heading(b.title, textSz, colorOnAccent),
+		b.titleT,
 	))
-	if !b.primary {
-		row = container.NewCenter(container.NewHBox(
-			img(b.iconRes, iconSz, iconSz),
-			hspace(8),
-			heading(b.title, textSz, colorText),
-		))
-	}
 	objects := []fyne.CanvasObject{b.fill, b.shade, b.border, row}
 	stack := container.NewStack(objects...)
 	return widget.NewSimpleRenderer(container.New(&fixedHeight{h: b.height}, stack))
@@ -1277,7 +1397,7 @@ func liveLogPanel(list fyne.CanvasObject) fyne.CanvasObject {
 	return container.NewBorder(
 		container.NewVBox(head, vspace(8)),
 		nil, nil, nil,
-		container.New(&fixedHeight{h: 248}, body),
+		body,
 	)
 }
 
@@ -1286,6 +1406,94 @@ func truncateText(s string, max int) string {
 		return s
 	}
 	return s[:max-1] + "…"
+}
+
+func truncateMiddle(s string, max int) string {
+	s = strings.TrimSpace(s)
+	if max <= 4 || len(s) <= max {
+		return s
+	}
+	keep := max - 1
+	left := keep / 2
+	right := keep - left
+	if left < 1 {
+		left = 1
+	}
+	if right < 1 {
+		right = 1
+	}
+	return s[:left] + "…" + s[len(s)-right:]
+}
+
+func firstNonEmpty(vals ...string) string {
+	for _, v := range vals {
+		if strings.TrimSpace(v) != "" {
+			return v
+		}
+	}
+	return ""
+}
+
+func overviewScanModeLabel(scanType, source string) string {
+	src := strings.TrimSpace(source)
+	st := strings.ToLower(strings.TrimSpace(scanType))
+	switch {
+	case strings.EqualFold(src, "Realtime") || st == "silent":
+		return "REALTIME"
+	case strings.EqualFold(src, "Schedule") || strings.EqualFold(src, "Login") || st == "auto":
+		return "AUTO SCAN"
+	case strings.EqualFold(src, "USB"):
+		return "USB SCAN"
+	case st == "full":
+		return "FULL SCAN"
+	case st == "quick":
+		return "QUICK SCAN"
+	case st == "custom":
+		return "CUSTOM SCAN"
+	default:
+		if src != "" {
+			return strings.ToUpper(src)
+		}
+		return "SCAN"
+	}
+}
+
+func overviewEngineLabel(engine string) string {
+	switch strings.ToLower(strings.TrimSpace(engine)) {
+	case "yara":
+		return "YARA"
+	case "ssdeep":
+		return "ssdeep"
+	case "discover":
+		return "DISCOVER"
+	default:
+		return ""
+	}
+}
+
+func liveScanLogEvent(ss ipc.ScanStatusResponse) *ipc.HistoryEvent {
+	if !ss.Scanning {
+		return nil
+	}
+	path := firstNonEmpty(ss.CurrentPath, ss.CurrentFile)
+	eng := overviewEngineLabel(ss.CurrentEngine)
+	if eng == "" && !ss.DiscoveryDone {
+		eng = "DISCOVER"
+	}
+	msg := overviewScanModeLabel(ss.ScanType, ss.Source)
+	if eng != "" {
+		msg = eng + "  " + msg
+	}
+	if path != "" {
+		msg += "  " + path
+	} else if ss.Message != "" {
+		msg += "  " + ss.Message
+	}
+	return &ipc.HistoryEvent{
+		Time:    time.Now().Format(time.RFC3339),
+		Kind:    "scan.live",
+		Message: msg,
+	}
 }
 
 // toolCardButton is a hoverable dashboard shortcut card.
@@ -1485,7 +1693,7 @@ func (r *Router) runThreatIntelSyncUI(onDone func(err error, msg string)) {
 				fyne.Do(func() {
 					bar.SetValue(pct)
 					if lastMsg != "" {
-						msg.Text = lastMsg
+						msg.Text = humanizeNotifyMessage(lastMsg)
 						msg.Refresh()
 					}
 				})
@@ -1494,19 +1702,25 @@ func (r *Router) runThreatIntelSyncUI(onDone func(err error, msg string)) {
 				}
 				done := (seenBusy && !busy) ||
 					(!busy && strings.Contains(strings.ToLower(lastMsg), "sync done")) ||
-					(!busy && strings.Contains(strings.ToLower(lastMsg), "sync failed"))
+					(!busy && strings.Contains(strings.ToLower(lastMsg), "sync failed")) ||
+					(!busy && strings.Contains(strings.ToLower(lastMsg), "sync queued")) ||
+					(!busy && strings.Contains(strings.ToLower(lastMsg), "waiting until the current scan finishes")) ||
+					(!busy && strings.Contains(strings.ToLower(lastMsg), "threat intelligence is up to date")) ||
+					(!busy && strings.Contains(strings.ToLower(lastMsg), "threat intelligence updated")) ||
+					(!busy && strings.Contains(strings.ToLower(lastMsg), "threat intelligence sync finished"))
 				if done {
 					failed := strings.Contains(strings.ToLower(lastMsg), "sync failed")
+					display := humanizeNotifyMessage(lastMsg)
 					fyne.Do(func() {
 						if !failed {
 							bar.SetValue(100)
 						}
 						d.Hide()
 						if failed {
-							onDone(fmt.Errorf("%s", lastMsg), lastMsg)
+							onDone(fmt.Errorf("%s", display), display)
 							return
 						}
-						onDone(nil, lastMsg)
+						onDone(nil, display)
 					})
 					return
 				}

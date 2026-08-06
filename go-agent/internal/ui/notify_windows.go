@@ -3,6 +3,9 @@
 package ui
 
 import (
+	"fmt"
+	"regexp"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -18,33 +21,36 @@ import (
 )
 
 type notifyItem struct {
+	Key     string
 	Time    string
 	Message string
 }
 
 type notifyBell struct {
 	widget.BaseWidget
-	router   *Router
-	icon     *canvas.Image
-	badge    *canvas.Text
-	badgeBg  *canvas.Rectangle
-	offsetY  float32
-	unread   int
-	bounce   int
-	popup    *widget.PopUp
-	mu       sync.Mutex
-	seenKeys map[string]bool
-	items    []notifyItem
+	router     *Router
+	icon       *canvas.Image
+	badge      *canvas.Text
+	badgeBg    *canvas.Rectangle
+	offsetY    float32
+	unread     int
+	bounce     int
+	popup      *widget.PopUp
+	mu         sync.Mutex
+	seenKeys   map[string]bool
+	dismissed  map[string]bool
+	items      []notifyItem
 }
 
 func newNotifyBell(r *Router) *notifyBell {
 	n := &notifyBell{
-		router:   r,
-		icon:     canvas.NewImageFromResource(theme.MailComposeIcon()),
-		badge:    canvas.NewText("", colorOnAccent),
-		badgeBg:  canvas.NewRectangle(colorError),
-		seenKeys: map[string]bool{},
-		items:    nil,
+		router:    r,
+		icon:      canvas.NewImageFromResource(theme.MailComposeIcon()),
+		badge:     canvas.NewText("", colorOnAccent),
+		badgeBg:   canvas.NewRectangle(colorError),
+		seenKeys:  map[string]bool{},
+		dismissed: map[string]bool{},
+		items:     nil,
 	}
 	n.icon.FillMode = canvas.ImageFillContain
 	n.icon.SetMinSize(fyne.NewSize(18, 18))
@@ -94,31 +100,13 @@ func (n *notifyBell) refreshBadge() {
 		n.badgeBg.Hide()
 		return
 	}
-	txt := strconvItoa(u)
+	txt := strconv.Itoa(u)
 	if u > 9 {
 		txt = "9+"
 	}
 	n.badge.Text = txt
 	n.badge.Show()
 	n.badgeBg.Show()
-}
-
-func strconvItoa(n int) string {
-	if n <= 0 {
-		return "0"
-	}
-	const digits = "0123456789"
-	if n < 10 {
-		return digits[n : n+1]
-	}
-	var b [12]byte
-	i := len(b)
-	for n > 0 {
-		i--
-		b[i] = digits[n%10]
-		n /= 10
-	}
-	return string(b[i:])
 }
 
 func (n *notifyBell) Tapped(*fyne.PointEvent) {
@@ -129,6 +117,30 @@ func (n *notifyBell) Cursor() desktop.Cursor {
 	return desktop.PointerCursor
 }
 
+func (n *notifyBell) removeItem(key string) {
+	n.mu.Lock()
+	defer n.mu.Unlock()
+	n.dismissed[key] = true
+	out := n.items[:0]
+	for _, it := range n.items {
+		if it.Key == key {
+			continue
+		}
+		out = append(out, it)
+	}
+	n.items = out
+}
+
+func (n *notifyBell) clearAll() {
+	n.mu.Lock()
+	defer n.mu.Unlock()
+	for _, it := range n.items {
+		n.dismissed[it.Key] = true
+	}
+	n.items = nil
+	n.unread = 0
+}
+
 func (n *notifyBell) showDropdown() {
 	n.mu.Lock()
 	items := append([]notifyItem(nil), n.items...)
@@ -137,31 +149,55 @@ func (n *notifyBell) showDropdown() {
 	n.refreshBadge()
 	n.Refresh()
 
-	rows := make([]fyne.CanvasObject, 0, len(items)+1)
-	title := canvas.NewText("Notifications", colorText)
+	title := canvas.NewText("Mailbox", colorText)
 	title.TextStyle = fyne.TextStyle{Bold: true}
-	rows = append(rows, title)
+	title.TextSize = 14
+
+	clearBtn := widget.NewButtonWithIcon("Clear all", theme.DeleteIcon(), func() {
+		n.clearAll()
+		n.refreshBadge()
+		n.Refresh()
+		n.showDropdown()
+	})
+	clearBtn.Importance = widget.LowImportance
 	if len(items) == 0 {
-		rows = append(rows, canvasMuted("No recent updates", colorMuted))
+		clearBtn.Disable()
+	}
+
+	header := container.NewBorder(nil, nil, title, clearBtn)
+	rows := []fyne.CanvasObject{header, divider()}
+
+	if len(items) == 0 {
+		empty := widget.NewLabel("No messages yet.\nUpdates from sync, scans, and agent upgrades will appear here.")
+		empty.Wrapping = fyne.TextWrapWord
+		empty.Importance = widget.LowImportance
+		rows = append(rows, empty)
 	} else {
 		for _, it := range items {
-			t := it.Time
-			if len(t) > 19 {
-				t = t[:19]
-			}
-			t = strings.ReplaceAll(t, "T", " ")
-			msg := canvas.NewText(clipNotify(it.Message, 56), colorText)
-			msg.TextSize = 12
-			rows = append(rows, container.NewVBox(
-				canvasMuted(t, colorMuted),
-				msg,
-				divider(),
-			))
+			item := it
+			t := formatNotifyTime(item.Time)
+			timeLbl := canvasMuted(t, colorMuted)
+
+			msg := widget.NewLabel(item.Message)
+			msg.Wrapping = fyne.TextWrapWord
+			msg.TextStyle = fyne.TextStyle{}
+
+			del := widget.NewButtonWithIcon("", theme.DeleteIcon(), func() {
+				n.removeItem(item.Key)
+				n.refreshBadge()
+				n.Refresh()
+				n.showDropdown()
+			})
+			del.Importance = widget.LowImportance
+
+			body := container.NewBorder(nil, nil, nil, del, container.NewVBox(timeLbl, msg))
+			rows = append(rows, body, divider())
 		}
 	}
+
 	box := container.NewVBox(rows...)
 	scroll := container.NewVScroll(box)
-	const popupW, popupH float32 = 300, 240
+	const popupW, popupH float32 = 380, 320
 	scroll.SetMinSize(fyne.NewSize(popupW-16, popupH-16))
 	padded := container.NewPadded(scroll)
 
@@ -171,8 +207,6 @@ func (n *notifyBell) showDropdown() {
 	n.popup = widget.NewPopUp(padded, n.router.window.Canvas())
 	n.popup.Resize(fyne.NewSize(popupW, popupH))
 
-	// Position() is parent-relative; use absolute canvas coords so the menu
-	// appears under the bell (top-right) instead of drifting to the left edge.
 	abs := fyne.CurrentApp().Driver().AbsolutePositionForObject(n)
 	can := n.router.window.Canvas().Size()
 	x := abs.X + n.Size().Width - popupW
@@ -195,12 +229,118 @@ func (n *notifyBell) showDropdown() {
 	n.popup.ShowAtPosition(fyne.NewPos(x, y))
 }
 
-func clipNotify(s string, max int) string {
-	s = strings.TrimSpace(s)
-	if max > 0 && len(s) > max {
-		return s[:max] + "…"
+func formatNotifyTime(t string) string {
+	t = strings.TrimSpace(t)
+	if len(t) > 19 {
+		t = t[:19]
 	}
-	return s
+	return strings.ReplaceAll(t, "T", " ")
+}
+
+var (
+	reSyncedRules = regexp.MustCompile(`(?i)^synced rules=(\d+)\s*ssdeep=(\d+)$`)
+	reSyncDone    = regexp.MustCompile(`(?i)^sync done \(rules=(\d+)\s*ssdeep=(\d+)\)$`)
+	reScanNotify  = regexp.MustCompile(`(?i)^scan (\w+)\s*[—\-]+\s*scanned (\d+),\s*skipped (\d+),\s*threats (\d+)$`)
+	reScanShort   = regexp.MustCompile(`(?i)^scan (\w+)\s*[—\-]+\s*(\d+) scanned,\s*(\d+) threats$`)
+	reUpdateAvail = regexp.MustCompile(`(?i)^update available\s+(.+)$`)
+	reYaraDone    = regexp.MustCompile(`(?i)^yara rules done \((\d+) ok,\s*(\d+) failed\)$`)
+	reSsdeepProg  = regexp.MustCompile(`(?i)^ssdeep\s+(\d+)/(\d+):\s*(.+)$`)
+	reYaraProg    = regexp.MustCompile(`(?i)^yara rules\s+(\d+)/(\d+):\s*(.+)$`)
+)
+
+// humanizeNotifyMessage rewrites legacy cryptic notify text for the mailbox.
+func humanizeNotifyMessage(msg string) string {
+	msg = strings.TrimSpace(msg)
+	if msg == "" {
+		return msg
+	}
+	if m := reSyncedRules.FindStringSubmatch(msg); len(m) == 3 {
+		return humanizeTICounts(atoiSafe(m[1]), atoiSafe(m[2]))
+	}
+	if m := reSyncDone.FindStringSubmatch(msg); len(m) == 3 {
+		return humanizeTICounts(atoiSafe(m[1]), atoiSafe(m[2]))
+	}
+	if m := reScanNotify.FindStringSubmatch(msg); len(m) == 5 {
+		status, scanned, skipped, threats := m[1], atoiSafe(m[2]), atoiSafe(m[3]), atoiSafe(m[4])
+		switch strings.ToLower(status) {
+		case "completed":
+			if threats > 0 {
+				return fmt.Sprintf("Scan finished. Checked %d file(s), skipped %d, found %d threat(s).", scanned, skipped, threats)
+			}
+			return fmt.Sprintf("Scan finished. Checked %d file(s), skipped %d. No threats found.", scanned, skipped)
+		case "stopped":
+			return fmt.Sprintf("Scan stopped early. Checked %d file(s), skipped %d, found %d threat(s).", scanned, skipped, threats)
+		}
+	}
+	if m := reScanShort.FindStringSubmatch(msg); len(m) == 4 {
+		status, scanned, threats := m[1], atoiSafe(m[2]), atoiSafe(m[3])
+		if strings.EqualFold(status, "completed") {
+			if threats > 0 {
+				return fmt.Sprintf("Scan finished. Checked %d file(s), found %d threat(s).", scanned, threats)
+			}
+			return fmt.Sprintf("Scan finished. Checked %d file(s). No threats found.", scanned)
+		}
+		return fmt.Sprintf("Scan %s. Checked %d file(s), found %d threat(s).", status, scanned, threats)
+	}
+	if m := reUpdateAvail.FindStringSubmatch(msg); len(m) == 2 {
+		return fmt.Sprintf("A new agent version (%s) is available from Center.", strings.TrimSpace(m[1]))
+	}
+	if m := reYaraDone.FindStringSubmatch(msg); len(m) == 3 {
+		okN, failN := atoiSafe(m[1]), atoiSafe(m[2])
+		if failN > 0 && okN == 0 {
+			return fmt.Sprintf("Could not download YARA rule packs (%d failed). Local rules were kept when possible.", failN)
+		}
+		if failN > 0 {
+			return fmt.Sprintf("Downloaded %d YARA rule pack(s); %d pack(s) could not be downloaded.", okN, failN)
+		}
+		return fmt.Sprintf("Downloaded %d YARA rule pack(s).", okN)
+	}
+	if m := reYaraProg.FindStringSubmatch(msg); len(m) == 4 {
+		return fmt.Sprintf("Downloading YARA rules (%s of %s): %s", m[1], m[2], m[3])
+	}
+	if m := reSsdeepProg.FindStringSubmatch(msg); len(m) == 4 {
+		return fmt.Sprintf("Downloading ssdeep signatures (%s of %s): %s", m[1], m[2], m[3])
+	}
+	low := strings.ToLower(msg)
+	switch {
+	case strings.EqualFold(msg, "Settings updated from Center"):
+		return "Protection settings were updated from Center."
+	case strings.Contains(low, "sync queued") || strings.Contains(low, "waiting for scan to finish"):
+		return "Threat intelligence update is waiting until the current scan finishes."
+	case strings.HasPrefix(low, "yara rules ready"):
+		return "YARA detection rules are ready."
+	case strings.HasPrefix(low, "ssdeep already") || strings.HasPrefix(low, "ssdeep ready") || strings.HasPrefix(low, "ssdeep categorized"):
+		return "Fuzzy (ssdeep) signatures are ready."
+	case strings.HasPrefix(low, "no ssdeep packs"):
+		return "No new ssdeep signature packs to download."
+	case strings.HasPrefix(low, "waiting for ssdeep"):
+		return "Waiting for ssdeep signature packs from Center…"
+	case strings.HasPrefix(low, "waiting for yara"):
+		return "Waiting for YARA rule packs from Center…"
+	case low == "starting sync…" || low == "starting sync...":
+		return "Starting threat intelligence sync…"
+	case strings.Contains(low, "syncing threat intelligence"):
+		return "Syncing threat intelligence from Center…"
+	}
+	return msg
+}
+
+func humanizeTICounts(rulesN, ssdeepN int) string {
+	switch {
+	case rulesN <= 0 && ssdeepN <= 0:
+		return "Threat intelligence is up to date. No new detection rules or fuzzy signatures were needed."
+	case rulesN > 0 && ssdeepN > 0:
+		return fmt.Sprintf("Threat intelligence updated. Downloaded %d YARA rule file(s) and %d ssdeep signature pack(s).", rulesN, ssdeepN)
+	case rulesN > 0:
+		return fmt.Sprintf("Threat intelligence updated. Downloaded %d YARA rule file(s). Fuzzy signatures were already current.", rulesN)
+	default:
+		return fmt.Sprintf("Threat intelligence updated. Downloaded %d ssdeep signature pack(s). YARA rules were already current.", ssdeepN)
+	}
+}
+
+func atoiSafe(s string) int {
+	n, _ := strconv.Atoi(strings.TrimSpace(s))
+	return n
 }
 
 func (n *notifyBell) ingest(events []ipc.HistoryEvent) {
@@ -212,23 +352,29 @@ func (n *notifyBell) ingest(events []ipc.HistoryEvent) {
 			continue
 		}
 		key := e.Time + "|" + e.Message
+		if n.dismissed[key] {
+			n.seenKeys[key] = true
+			continue
+		}
 		if n.seenKeys[key] {
 			continue
 		}
 		n.seenKeys[key] = true
-		n.items = append([]notifyItem{{Time: e.Time, Message: e.Message}}, n.items...)
-		if len(n.items) > 20 {
-			n.items = n.items[:20]
+		n.items = append([]notifyItem{{
+			Key:     key,
+			Time:    e.Time,
+			Message: humanizeNotifyMessage(e.Message),
+		}}, n.items...)
+		if len(n.items) > 30 {
+			n.items = n.items[:30]
 		}
 		n.unread++
 		added++
 	}
-	unread := n.unread
 	n.mu.Unlock()
 	if added > 0 {
 		n.startBounce()
 	}
-	_ = unread
 	fyne.Do(func() {
 		n.refreshBadge()
 		n.Refresh()

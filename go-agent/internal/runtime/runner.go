@@ -157,6 +157,7 @@ func (r *Runner) startOnlineRuntime(ctx context.Context) {
 	}
 	r.restartApprovalLoop(ctx)
 	r.restartHeartbeatLoop(ctx)
+	r.wireScanAPI()
 	if r.Settings.GetBool(keyApproved) {
 		r.startPostApproval(ctx)
 	}
@@ -454,23 +455,53 @@ func (r *Runner) standaloneMode() bool {
 
 func (r *Runner) startScanSubsystem(ctx context.Context) {
 	r.mu.Lock()
-	if r.scanStarted || r.Snapshot == nil || r.Rules == nil {
+	if r.Snapshot == nil || r.Rules == nil {
+		r.mu.Unlock()
+		return
+	}
+	if r.scanStarted {
+		r.wireScanAPILocked()
 		r.mu.Unlock()
 		return
 	}
 	r.scanStarted = true
+	apiClient := r.API
 	r.mu.Unlock()
 
-	r.Scan = NewScanRuntime(r.BaseDir, r.Settings, r.Snapshot, r.API, r.History, r.Rules)
+	r.Scan = NewScanRuntime(r.BaseDir, r.Settings, r.Snapshot, apiClient, r.History, r.Rules)
 	if r.Scan != nil && r.Scan.Manager != nil {
 		r.Scan.Manager.OnScanIdle = func() {
-			// Drain deferred auto TI sync / agent update as soon as scan ends.
+			// Retry any failed detection/scan-log posts before other post-scan work.
+			r.flushReportQueue()
+			// Manual Sync Now (and other deferred TI pulls) run first, then interval ticks.
+			r.flushPendingTISync()
 			r.tickTISyncSchedule()
 			r.tickAgentUpdateSchedule()
 		}
 	}
 	go r.Scan.Run(ctx)
 	_ = r.History.Append("scan.runtime", "scan subsystem started (scheduler, watcher, usb)", nil)
+	r.wireScanAPI()
+}
+
+// wireScanAPI attaches the live Center client to an already-running scan engine.
+// Scan can start before Save & Connect finishes; without this, heartbeat works but
+// detections are dropped because Manager.API stays nil.
+func (r *Runner) wireScanAPI() {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.wireScanAPILocked()
+}
+
+func (r *Runner) wireScanAPILocked() {
+	if r.API == nil || r.Scan == nil || r.Scan.Manager == nil {
+		return
+	}
+	if r.Scan.Manager.API == r.API {
+		return
+	}
+	r.Scan.Manager.API = r.API
+	_ = r.History.Append("scan.runtime", "scan engine linked to Center API", nil)
 }
 
 func (r *Runner) scanningNow() bool {
@@ -554,6 +585,8 @@ func (r *Runner) tickTISyncSchedule() {
 	}
 	// Do not pull rules/ssdeep while a scan is running; keep interval due until idle.
 	if r.scanningNow() {
+		r.Settings.Set(settings.KeyTISyncPending, "true")
+		_ = r.Settings.Save()
 		_ = r.History.Append("ti.defer", "TI sync deferred until scan finishes", map[string]any{
 			"phase": "sync",
 		})
@@ -564,14 +597,38 @@ func (r *Runner) tickTISyncSchedule() {
 	_, _, _ = r.SyncThreatIntel()
 }
 
+func (r *Runner) flushPendingTISync() {
+	if r.Settings == nil || !r.Settings.GetBool(settings.KeyTISyncPending) {
+		return
+	}
+	if r.scanningNow() {
+		return
+	}
+	r.Settings.Set(settings.KeyTISyncPending, "false")
+	_ = r.Settings.Save()
+	_ = r.History.Append("ti.sync", "running TI sync queued while scan was active", nil)
+	_, _, _ = r.SyncThreatIntel()
+}
+
 // SyncThreatIntel pulls config + rules + ssdeep from Center immediately (UI Sync now).
 func (r *Runner) SyncThreatIntel() (rulesN, ssdeepN int, err error) {
 	if r.API == nil {
 		return 0, 0, fmt.Errorf("not connected")
 	}
 	if r.scanningNow() {
-		_ = r.History.Append("ti.defer", "TI sync blocked: scan in progress", nil)
-		return 0, 0, fmt.Errorf("scan in progress — sync will run after the scan finishes")
+		if r.Settings != nil {
+			r.Settings.Set(settings.KeyTISyncPending, "true")
+			r.Settings.Set(settings.KeyTIDownloadMessage, "Threat intelligence update is waiting until the current scan finishes.")
+			_ = r.Settings.Save()
+		}
+		_ = r.History.Append("ti.defer", "TI sync queued: scan in progress", nil)
+		_ = r.History.Append("ui.notify",
+			"Threat intelligence update is waiting until the current scan finishes.",
+			map[string]any{"kind": "ti_sync_queued"})
+		return 0, 0, fmt.Errorf("scan in progress — sync queued until the scan finishes")
+	}
+	if r.Settings != nil {
+		r.Settings.Set(settings.KeyTISyncPending, "false")
 	}
 	_ = r.History.Append("download.progress", "Syncing threat intelligence…", map[string]any{"phase": "sync", "percent": 0})
 	_ = r.syncConfigFromServer()
@@ -591,15 +648,16 @@ func (r *Runner) SyncThreatIntel() (rulesN, ssdeepN int, err error) {
 	}
 	r.Settings.Set(settings.KeyLastTISyncRun, settings.FormatIntervalRunStamp(time.Now()))
 	_ = r.Settings.Save()
+	userMsg := formatTISyncUserMessage(rulesN, ssdeepN)
 	r.Settings.Set(settings.KeyTIBootstrapDone, "true")
 	r.Settings.Set(settings.KeyTIDownloadPercent, "100")
-	r.Settings.Set(settings.KeyTIDownloadMessage, fmt.Sprintf("Sync done (rules=%d ssdeep=%d)", rulesN, ssdeepN))
+	r.Settings.Set(settings.KeyTIDownloadMessage, userMsg)
 	_ = r.Settings.Save()
-	_ = r.History.Append("download.progress", fmt.Sprintf("Sync done (rules=%d ssdeep=%d)", rulesN, ssdeepN), map[string]any{
+	_ = r.History.Append("download.progress", userMsg, map[string]any{
 		"phase": "sync", "percent": 100, "rules": rulesN, "ssdeep": ssdeepN,
 	})
-	_ = r.History.Append("ui.notify", fmt.Sprintf("Synced rules=%d ssdeep=%d", rulesN, ssdeepN), map[string]any{
-		"kind": "ti_sync",
+	_ = r.History.Append("ui.notify", userMsg, map[string]any{
+		"kind": "ti_sync", "rules": rulesN, "ssdeep": ssdeepN,
 	})
 	return rulesN, ssdeepN, nil
 }
@@ -613,6 +671,11 @@ func (r *Runner) configSyncLoop(ctx context.Context) {
 			return
 		case <-t.C:
 			if !r.Settings.GetBool(keyApproved) {
+				continue
+			}
+			// Avoid applying Center config (paths/schedules/engines) mid-scan.
+			if r.scanningNow() {
+				_ = r.History.Append("config.defer", "getConfig deferred until scan finishes", nil)
 				continue
 			}
 			if err := r.syncConfigFromServer(); err == nil {
@@ -643,6 +706,7 @@ func (r *Runner) doHeartbeat(isLogin bool) {
 	if r.API == nil {
 		return
 	}
+	r.wireScanAPI()
 	r.flushReportQueue()
 	resp, raw, err := r.API.AgentOnlineTimestamp(isLogin)
 	if err != nil {
@@ -743,6 +807,7 @@ func (r *Runner) ReloadConfig(cfg *config.AgentConfig) {
 		keystore.SetActiveSiteKey("")
 		r.API = nil
 	}
+	r.wireScanAPILocked()
 	runCtx := r.runCtx
 	r.mu.Unlock()
 

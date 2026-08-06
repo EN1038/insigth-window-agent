@@ -573,7 +573,7 @@ func (r *Router) showTIDownload() {
 		fyne.Do(func() {
 			bar.SetValue(st.DownloadPercent)
 			if msg := strings.TrimSpace(st.DownloadMessage); msg != "" {
-				sub.Text = msg
+				sub.Text = humanizeNotifyMessage(msg)
 				sub.Refresh()
 			}
 			low := strings.ToLower(st.DownloadMessage)

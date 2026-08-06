@@ -10,6 +10,7 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -42,9 +43,41 @@ type Progress struct {
 
 type Response struct {
 	Error      string          `json:"error"`
-	StatusCode int             `json:"status_code"`
+	StatusCode flexStatus      `json:"status_code"`
 	Data       json.RawMessage `json:"data"`
 }
+
+// flexStatus accepts JSON number or numeric string (PHP sometimes sends "200").
+type flexStatus int
+
+func (s *flexStatus) UnmarshalJSON(b []byte) error {
+	b = bytes.TrimSpace(b)
+	if len(b) == 0 || string(b) == "null" {
+		*s = 0
+		return nil
+	}
+	if b[0] == '"' {
+		var str string
+		if err := json.Unmarshal(b, &str); err != nil {
+			return err
+		}
+		n, err := strconv.Atoi(strings.TrimSpace(str))
+		if err != nil {
+			*s = 0
+			return nil
+		}
+		*s = flexStatus(n)
+		return nil
+	}
+	var n int
+	if err := json.Unmarshal(b, &n); err != nil {
+		return err
+	}
+	*s = flexStatus(n)
+	return nil
+}
+
+func (s flexStatus) Int() int { return int(s) }
 
 func New(cfg *config.AgentConfig) *Client {
 	tr := &http.Transport{
@@ -189,19 +222,10 @@ func (c *Client) postJSON(endpoint string, body any) (*Response, []byte, error) 
 
 	var r Response
 	if err := json.Unmarshal(raw, &r); err != nil {
-		snip := strings.TrimSpace(string(raw))
-		if len(snip) > 80 {
-			snip = snip[:80] + "..."
-		}
-		snip = strings.ReplaceAll(snip, "\n", " ")
-		snip = strings.ReplaceAll(snip, "\r", " ")
-		if snip == "" {
-			snip = "empty body"
-		}
-		return nil, raw, fmt.Errorf("decode response (HTTP %d: %s): %w", resp.StatusCode, snip, err)
+		return nil, raw, fmt.Errorf("%s", DecodeHTTPError(resp.StatusCode, raw, err))
 	}
 	if r.Error == "" && r.StatusCode >= 400 {
-		r.Error = http.StatusText(r.StatusCode)
+		r.Error = http.StatusText(int(r.StatusCode))
 	}
 	if r.StatusCode == 0 && resp.StatusCode == http.StatusOK {
 		r.StatusCode = 200
@@ -337,7 +361,8 @@ type YaraLogItem struct {
 
 func (c *Client) SendLogYara(items []YaraLogItem) (*Response, []byte, error) {
 	payload := map[string]any{
-		"yara": items,
+		"yara":       items,
+		"ip_private": sysinfo.LocalIPv4(),
 	}
 	return c.postJSON("sendLogYara", payload)
 }
@@ -354,15 +379,22 @@ type ScanLogItem struct {
 func (c *Client) SendAgentScanLog(items []ScanLogItem) (*Response, []byte, error) {
 	payload := map[string]any{
 		"agent_scan": items,
+		"ip_private": sysinfo.LocalIPv4(),
 	}
 	return c.postJSON("sendAgentScanLog", payload)
 }
 
+// HashItem matches Center sendHash, which looks each entry up in the OTX
+// indicator collection by (type, hash) — so type must be an OTX indicator type
+// such as FileHash-MD5.
 type HashItem struct {
-	FileName string `json:"file_name"`
-	HashMD5  string `json:"hash_md5"`
+	Hash     string `json:"hash"`
+	Type     string `json:"type"`
 	Path     string `json:"path"`
+	FileName string `json:"file_name,omitempty"`
 }
+
+const HashTypeMD5 = "FileHash-MD5"
 
 func (c *Client) SendHash(items []HashItem) (*Response, []byte, error) {
 	payload := map[string]any{

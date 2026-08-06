@@ -50,7 +50,7 @@ func (r *Runner) syncConfigFromServer() error {
 	afterTI := r.Settings.Get(settings.KeyTISyncEveryDay, "")
 	afterUpd := r.Settings.Get(settings.KeyAgentUpdateSchedule, "")
 	if beforeBatch != afterBatch || beforeTI != afterTI || beforeUpd != afterUpd {
-		_ = r.History.Append("ui.notify", "Settings updated from Center", map[string]any{"kind": "config"})
+		_ = r.History.Append("ui.notify", "Protection settings were updated from Center.", map[string]any{"kind": "config"})
 	}
 	return nil
 }
@@ -107,17 +107,21 @@ func (r *Runner) syncRulesFromServerResult(fallbackRaw json.RawMessage) (complet
 	prevLocal := atoiDefault(r.Settings.Get(settings.KeyLocalRulesCount, "0"), localCount)
 	r.recordRulesCountDelta(serverRuleNames, serverFileCount, localCount, prevServer, prevLocal)
 
-	// Force when clearly behind catalog, or when Center has packs but local store is still tiny/bundled-only.
+	catalogOK := errGetRule == nil && respGetRule != nil && respGetRule.StatusCode == 200
+	emptyAssignment := catalogOK && serverPacks == 0 && serverFileCount == 0 && serverRuleNames == 0
+
+	// Force when behind, when local ahead of Center (shrunk assignment), or tiny/bundled local with packs present.
 	force := (serverFileCount > 0 && localCount < serverFileCount) ||
 		(serverPacks > 0 && localCount < 20) ||
-		(serverRuleNames > 0 && localCount < serverRuleNames && localCount < 20)
+		(serverRuleNames > 0 && localCount < serverRuleNames && localCount < 20) ||
+		(catalogOK && serverFileCount > 0 && localCount > serverFileCount) ||
+		(catalogOK && serverPacks > 0 && localCount > serverFileCount && serverFileCount >= 0)
 	if force {
 		if respReset, _, errReset := r.API.ResetRuleDownload(); errReset != nil {
 			_ = r.History.Append("api.warn", "resetRuleDownload: "+errReset.Error(), nil)
 		} else if respReset == nil {
 			_ = r.History.Append("api.warn", "resetRuleDownload: empty response", nil)
 		} else if respReset.StatusCode != 200 && respReset.StatusCode != 0 {
-			// status_code=0 often means encrypted envelope without inner code; treat only non-zero fails as real.
 			_ = r.History.Append("api.warn", fmt.Sprintf("resetRuleDownload status=%d error=%s", respReset.StatusCode, respReset.Error), nil)
 		} else {
 			if respReset.StatusCode == 0 {
@@ -133,10 +137,40 @@ func (r *Runner) syncRulesFromServerResult(fallbackRaw json.RawMessage) (complet
 	var items []ruleDownloadItem
 	listOK := false
 
-	if err == nil && resp.StatusCode == 200 {
+	if err == nil && resp != nil && resp.StatusCode == 200 {
 		items = parseRuleDownloadItems(resp.Data)
 		useOfficial = len(items) > 0
 		listOK = true
+	}
+	// Center returns 404 when site has no assigned packs — treat as successful empty list when catalog agrees.
+	if err == nil && resp != nil && resp.StatusCode == 404 && emptyAssignment {
+		items = nil
+		listOK = true
+	}
+
+	// Intentional empty assignment: wipe local so site no longer scans with removed packs.
+	if listOK && len(items) == 0 && emptyAssignment {
+		if localCount > 0 {
+			if err := rStore.Clear(); err != nil {
+				_ = r.History.Append("rules.error", "clear local YARA store: "+err.Error(), nil)
+				return false, 0, 1
+			}
+			_ = r.History.Append("rules.sync", fmt.Sprintf(
+				"cleared local YARA store to match empty Center assignment (was %d files)", localCount), map[string]any{
+				"old_local": localCount,
+			})
+			_ = r.History.Append("ui.notify",
+				"Center removed YARA rule packs for this site. Local detection rules were cleared.",
+				map[string]any{"kind": "ti_sync"})
+			if r.Scan != nil {
+				r.Scan.RefreshRules()
+			}
+		} else {
+			_ = r.History.Append("rules.skip", "Center has no YARA packs for this site; local store already empty", nil)
+		}
+		r.persistRulesCounts(0, 0, 0)
+		r.setTIProgress(45, "YARA: no packs assigned for this site")
+		return true, 0, 0
 	}
 
 	// When pack queue is empty after force, report clear status. Content only
@@ -162,8 +196,10 @@ func (r *Runner) syncRulesFromServerResult(fallbackRaw json.RawMessage) (complet
 			r.setTIProgress(45, fmt.Sprintf("YARA rules ready (%d files / %d names)", localCount, serverRuleNames))
 			return true, 0, 0
 		}
-		_ = r.History.Append("rules.skip", fmt.Sprintf(
-			"local YARA files (%d) > server files (%d) — keeping local store", localCount, serverFileCount), nil)
+		// Local ahead but force did not requeue — cannot safely partial-delete; warn and keep until packs return.
+		_ = r.History.Append("rules.warn", fmt.Sprintf(
+			"local YARA files (%d) > server files (%d) but no packs requeued — keeping local until Center requeues",
+			localCount, serverFileCount), nil)
 		r.setTIProgress(45, fmt.Sprintf("YARA rules ready (local=%d server_files=%d)", localCount, serverFileCount))
 		return true, 0, 0
 	}
@@ -172,21 +208,31 @@ func (r *Runner) syncRulesFromServerResult(fallbackRaw json.RawMessage) (complet
 		items = parseRuleDownloadItems(fallbackRaw)
 		useOfficial = false
 		if len(items) == 0 {
+			if !listOK {
+				// Network / Center error — never wipe.
+				if localCount > 0 {
+					_ = r.History.Append("rules.skip", fmt.Sprintf(
+						"YARA sync unreachable; keeping local store (%d files)", localCount), nil)
+					r.setTIProgress(45, fmt.Sprintf("YARA rules ready (%d files)", localCount))
+					return true, 0, 0
+				}
+				_ = r.History.Append("rules.warn", "no YARA packs available and local store empty — will retry", nil)
+				r.setTIProgress(45, "Waiting for YARA packs from Center…")
+				if err != nil {
+					_ = r.History.Append("api.warn", "downloadRuleSite: "+err.Error(), nil)
+				} else if resp != nil {
+					_ = r.History.Append("api.warn", fmt.Sprintf("downloadRuleSite status=%d body=%s", resp.StatusCode, compact(raw)), nil)
+				}
+				return false, 0, 1
+			}
 			if localCount > 0 {
 				_ = r.History.Append("rules.skip", fmt.Sprintf(
 					"no new YARA packs from Center; continuing with local store (%d files)", localCount), nil)
 				r.setTIProgress(45, fmt.Sprintf("YARA rules ready (%d files)", localCount))
 				return true, 0, 0
 			}
-			// Empty local store must NOT count as complete — otherwise bootstrap
-			// finishes and scans fail with "no rules in store".
 			_ = r.History.Append("rules.warn", "no YARA packs available and local store empty — will retry", nil)
 			r.setTIProgress(45, "Waiting for YARA packs from Center…")
-			if err != nil {
-				_ = r.History.Append("api.warn", "downloadRuleSite: "+err.Error(), nil)
-			} else if resp != nil && !listOK {
-				_ = r.History.Append("api.warn", fmt.Sprintf("downloadRuleSite status=%d body=%s", resp.StatusCode, compact(raw)), nil)
-			}
 			return false, 0, 1
 		}
 		_ = r.History.Append("rules.fallback", "using approval/fallback rules JSON", nil)
@@ -200,8 +246,6 @@ func (r *Runner) syncRulesFromServerResult(fallbackRaw json.RawMessage) (complet
 	hasRules := localCount > 0
 	complete = (failed == 0) || (imported > 0) || hasRules
 	if serverFileCount > 0 && localCount < serverFileCount && failed > 0 {
-		// Missing files on Center (404) will never succeed — don't trap the UI on the
-		// bootstrap screen forever when a usable local rule store already exists.
 		if notFound >= failed && hasRules {
 			_ = r.History.Append("rules.warn", fmt.Sprintf(
 				"Center pack(s) missing on disk (%d) — continuing with local=%d (server_files=%d)",
@@ -256,12 +300,13 @@ func (r *Runner) persistRulesCounts(serverNames, serverFiles, localCount int) {
 		return
 	}
 	// Keep KeyServerRulesCount as file count for BehindServer / UI (legacy key name).
+	r.Settings.Set(settings.KeyServerRuleFilesCount, strconv.Itoa(serverFiles))
 	if serverFiles > 0 {
 		r.Settings.Set(settings.KeyServerRulesCount, strconv.Itoa(serverFiles))
-		r.Settings.Set(settings.KeyServerRuleFilesCount, strconv.Itoa(serverFiles))
 	} else if serverNames > 0 {
-		// Fallback only when unique_files unavailable.
 		r.Settings.Set(settings.KeyServerRulesCount, strconv.Itoa(serverNames))
+	} else {
+		r.Settings.Set(settings.KeyServerRulesCount, "0")
 	}
 	r.Settings.Set(settings.KeyLocalRulesCount, strconv.Itoa(localCount))
 	_ = r.Settings.Save()
@@ -273,6 +318,17 @@ func (r *Runner) downloadRules(items []ruleDownloadItem, agentID int64, useOffic
 	_ = os.MkdirAll(paths, 0o700)
 
 	total := len(items)
+	if total == 0 {
+		return 0, 0, 0
+	}
+
+	type stagedPack struct {
+		item      ruleDownloadItem
+		localPath string
+		ruleName  string
+		fileName  string
+	}
+	staged := make([]stagedPack, 0, total)
 	for idx, item := range items {
 		if item.Path == "" {
 			continue
@@ -303,6 +359,32 @@ func (r *Runner) downloadRules(items []ruleDownloadItem, agentID int64, useOffic
 			}
 			continue
 		}
+		staged = append(staged, stagedPack{item: item, localPath: localPath, ruleName: ruleName, fileName: fileName})
+	}
+
+	if len(staged) == 0 {
+		if total > 0 {
+			r.setTIProgress(50, fmt.Sprintf("YARA rules done (0 ok, %d failed)", failed))
+		}
+		return 0, failed, notFound
+	}
+
+	oldCount := store.FileCount()
+	if err := store.Clear(); err != nil {
+		_ = r.History.Append("rules.error", "clear local YARA before replace: "+err.Error(), nil)
+		return 0, failed + 1, notFound
+	}
+	_ = r.History.Append("rules.sync", fmt.Sprintf(
+		"replacing local YARA store to match Center assignment (old=%d packs=%d)", oldCount, len(staged)), map[string]any{
+		"old_local": oldCount,
+		"packs":     len(staged),
+	})
+
+	for _, sp := range staged {
+		item := sp.item
+		localPath := sp.localPath
+		ruleName := sp.ruleName
+		fileName := sp.fileName
 
 		ext := strings.ToLower(filepath.Ext(localPath))
 		var version string
@@ -327,7 +409,6 @@ func (r *Runner) downloadRules(items []ruleDownloadItem, agentID int64, useOffic
 				version = r.Settings.Get(settings.KeyRulesVersion, "catalog")
 			}
 		default:
-			// Try zip first; if that fails treat as plaintext yar.
 			version, ruleCount, err = store.ImportZip(localPath, ruleName)
 			if err != nil {
 				data, readErr := os.ReadFile(localPath)
@@ -378,7 +459,7 @@ func (r *Runner) downloadRules(items []ruleDownloadItem, agentID int64, useOffic
 		}
 
 		_ = securefs.WipeAndRemove(localPath)
-		imported++
+		imported += ruleCount
 		_ = r.History.Append("rules.ok", fmt.Sprintf("imported %s (%d files, v=%s)", fileName, ruleCount, version), map[string]any{
 			"rule_id": item.ID,
 			"count":   ruleCount,

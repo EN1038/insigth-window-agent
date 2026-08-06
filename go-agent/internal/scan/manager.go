@@ -83,7 +83,7 @@ func NewManager(baseDir string, st *settings.Store, snap *snapshot.Store, apiCli
 		Rules:      ruleStore,
 		Quarantine: quar,
 		ReportQ:    rq,
-		scanner:    NewScanner(yaraPath),
+		scanner:    NewScannerFromSettings(yaraPath, st),
 		ssdeep:     ssdeepscan.NewMatcher(baseDir, threshold),
 	}
 }
@@ -217,17 +217,26 @@ func (m *Manager) scanWork(scanType ScanType, customPath string, scanAll bool, s
 	}
 	verbose := scanType != ScanSilent
 	phaseMsg := fmt.Sprintf("Starting %s scan…", scanType)
+	discoveryDoneAtStart := scanType == ScanSilent
 	m.setStatus(func(s *StatusInfo) {
 		*s = StatusInfo{
-			Scanning: true,
-			ScanType: string(scanType),
-			Status:   "discovering",
-			Message:  phaseMsg,
+			Scanning:      true,
+			ScanType:      string(scanType),
+			Source:        source,
+			Status:        "discovering",
+			Message:       phaseMsg,
+			CurrentEngine: "discover",
+			DiscoveryDone: discoveryDoneAtStart,
+		}
+		if discoveryDoneAtStart {
+			s.Status = "scanning"
+			s.CurrentEngine = ""
 		}
 	})
 	if scanType == ScanCustom && source != SourceUSB && len(strings.TrimSpace(customPath)) <= 3 {
 		result.ScanSource = SourceUSB
 		source = SourceUSB
+		m.setStatus(func(s *StatusInfo) { s.Source = source })
 	}
 
 	_ = m.History.Append("scan.start", fmt.Sprintf("scan started: %s", scanType), map[string]any{
@@ -288,18 +297,21 @@ func (m *Manager) scanWork(scanType ScanType, customPath string, scanAll bool, s
 		base := filepath.Base(pathOrDir)
 		m.setStatus(func(s *StatusInfo) {
 			s.Total = int(n)
+			s.Scanned = int(sc)
 			s.Skipped = skipN
-			// Discovery and scan workers run concurrently — don't clobber active scan UX.
-			if sc > 0 || s.Status == "scanning" {
-				s.Status = "scanning"
-				s.Scanned = int(sc)
-				s.Message = fmt.Sprintf("Scanning… %d / %d", sc, n)
-				return
-			}
+			s.DiscoveryDone = false
+			// Keep status as discovering until enumerator finishes so UI does not
+			// treat Scanned/Total as overall percent while Total is still growing.
 			s.Status = "discovering"
-			s.Message = fmt.Sprintf("Discovering files… %d found", n)
+			s.CurrentEngine = "discover"
+			s.CurrentPath = pathOrDir
 			if base != "" && base != "." {
 				s.CurrentFile = base
+			}
+			if sc > 0 {
+				s.Message = fmt.Sprintf("Discovering… found %d · scanned %d", n, sc)
+			} else {
+				s.Message = fmt.Sprintf("Discovering files… %d found", n)
 			}
 		})
 	}
@@ -333,9 +345,10 @@ func (m *Manager) scanWork(scanType ScanType, customPath string, scanAll bool, s
 			nowNano := time.Now().UnixNano()
 			prev := lastProgressLog.Load()
 			if verbose && (n == 1 || nowNano-prev > progressTick) && lastProgressLog.CompareAndSwap(prev, nowNano) {
-				_ = m.History.Append("scan.progress", fmt.Sprintf("Discovering files… %d found", n), map[string]any{
-					"total": n,
-					"path":  item.Path,
+				_ = m.History.Append("scan.progress", fmt.Sprintf("Discovering… %d found — %s", n, item.Path), map[string]any{
+					"total":  n,
+					"path":   item.Path,
+					"engine": "discover",
 				})
 			}
 			if !scanAll && scanType != ScanSilent {
@@ -373,14 +386,24 @@ func (m *Manager) scanWork(scanType ScanType, customPath string, scanAll bool, s
 			n := totalFound.Load()
 			sc := scanned.Load()
 			m.setStatus(func(s *StatusInfo) {
+				s.DiscoveryDone = true
 				s.Status = "scanning"
 				s.Total = int(n)
 				s.Scanned = int(sc)
 				s.Skipped = int(skipped.Load())
 				s.Message = fmt.Sprintf("Scanning… %d / %d", sc, n)
+				if s.CurrentEngine == "discover" {
+					s.CurrentEngine = ""
+				}
 			})
 			_ = m.History.Append("scan.progress", fmt.Sprintf("Discovery done — scanning %d files", n), map[string]any{
 				"total": n,
+			})
+		} else {
+			m.setStatus(func(s *StatusInfo) {
+				s.DiscoveryDone = true
+				s.Status = "scanning"
+				s.Total = int(totalFound.Load())
 			})
 		}
 	}()
@@ -402,6 +425,9 @@ func (m *Manager) scanWork(scanType ScanType, customPath string, scanAll bool, s
 		go func() {
 			defer active.Add(-1)
 			m.processBatch(b, rulePaths, &result, scanType, &scanned, &totalFound, &threats, stopped)
+			if yaraFileDelay > 0 && !stopped() {
+				time.Sleep(yaraFileDelay)
+			}
 		}()
 	}
 	for active.Load() > 0 {
@@ -420,6 +446,7 @@ func (m *Manager) scanWork(scanType ScanType, customPath string, scanAll bool, s
 	}
 	m.setStatus(func(s *StatusInfo) {
 		s.Scanning = true
+		s.DiscoveryDone = true
 		s.Scanned = int(scanned.Load())
 		s.Skipped = int(skipped.Load())
 		s.Total = int(totalFound.Load())
@@ -427,6 +454,8 @@ func (m *Manager) scanWork(scanType ScanType, customPath string, scanAll bool, s
 		s.Status = "finalizing"
 		s.Message = "Saving results…"
 		s.CurrentFile = ""
+		s.CurrentPath = ""
+		s.CurrentEngine = ""
 	})
 
 	_ = m.Snapshot.Save()
@@ -441,9 +470,7 @@ func (m *Manager) scanWork(scanType ScanType, customPath string, scanAll bool, s
 		"ssdeep":  countThreatsByEngine(result.Threats, "ssdeep"),
 		"source":  source,
 	})
-	_ = m.History.Append("ui.notify", fmt.Sprintf(
-		"Scan %s — scanned %d, skipped %d, threats %d",
-		result.Status, result.FilesScanned, result.FilesSkipped, result.ThreatsFound), map[string]any{
+	_ = m.History.Append("ui.notify", formatScanUserMessage(result.Status, result.FilesScanned, result.FilesSkipped, result.ThreatsFound), map[string]any{
 		"kind":    "scan",
 		"scanned": result.FilesScanned,
 		"skipped": result.FilesSkipped,
@@ -462,13 +489,16 @@ func (m *Manager) scanWork(scanType ScanType, customPath string, scanAll bool, s
 
 	m.setStatus(func(s *StatusInfo) {
 		s.Scanning = false
+		s.DiscoveryDone = true
 		s.Scanned = result.FilesScanned
 		s.Skipped = result.FilesSkipped
 		s.Total = result.TotalFound
 		s.Threats = result.ThreatsFound
 		s.Status = result.Status
-		s.Message = fmt.Sprintf("Scan %s — %d scanned, %d threats", result.Status, result.FilesScanned, result.ThreatsFound)
+		s.Message = formatScanUserMessage(result.Status, result.FilesScanned, result.FilesSkipped, result.ThreatsFound)
 		s.CurrentFile = ""
+		s.CurrentPath = ""
+		s.CurrentEngine = ""
 	})
 }
 
@@ -504,16 +534,27 @@ func (m *Manager) processBatch(batch []FileItem, rulePaths []string, result *Res
 	already := int(scanned.Load())
 	totalHint := int(totalFound.Load())
 	m.setStatus(func(s *StatusInfo) {
-		s.Status = "scanning"
+		if s.DiscoveryDone {
+			s.Status = "scanning"
+		} else {
+			s.Status = "discovering"
+		}
 		s.Scanned = already
 		s.Total = totalHint
 		s.Threats = int(threats.Load())
-		s.Message = fmt.Sprintf("Analyzing with YARA… %d files", len(paths))
+		s.CurrentEngine = "yara"
+		s.CurrentPath = paths[0]
 		s.CurrentFile = filepath.Base(paths[0])
+		s.Message = fmt.Sprintf("Analyzing with YARA… %d files", len(paths))
 	})
 	stopPulse := m.pulseStatus(func(elapsed time.Duration) {
 		m.setStatus(func(s *StatusInfo) {
-			s.Status = "scanning"
+			if s.DiscoveryDone {
+				s.Status = "scanning"
+			} else {
+				s.Status = "discovering"
+			}
+			s.CurrentEngine = "yara"
 			s.Message = fmt.Sprintf("Analyzing with YARA… %d files (%ds)", len(paths), int(elapsed.Seconds()))
 		})
 	}, 500*time.Millisecond)
@@ -541,15 +582,27 @@ func (m *Manager) processBatch(batch []FileItem, rulePaths []string, result *Res
 	ssdeepHits := map[string]ssdeepscan.Match{}
 	if m.ssdeepEnabled() && len(cleanPaths) > 0 && m.ssdeep != nil {
 		m.setStatus(func(s *StatusInfo) {
-			s.Status = "scanning"
-			s.Message = fmt.Sprintf("Fuzzy hashing… 0 / %d", len(cleanPaths))
+			if s.DiscoveryDone {
+				s.Status = "scanning"
+			} else {
+				s.Status = "discovering"
+			}
+			s.CurrentEngine = "ssdeep"
+			s.CurrentPath = cleanPaths[0]
 			s.CurrentFile = filepath.Base(cleanPaths[0])
+			s.Message = fmt.Sprintf("Fuzzy hashing… 0 / %d", len(cleanPaths))
 		})
 		hits, serr := m.ssdeep.ScanCleanFiles(cleanPaths, sizes, stopped, func(done int, path string) {
 			m.setStatus(func(s *StatusInfo) {
-				s.Status = "scanning"
-				s.Message = fmt.Sprintf("Fuzzy hashing… %d / %d", done, len(cleanPaths))
+				if s.DiscoveryDone {
+					s.Status = "scanning"
+				} else {
+					s.Status = "discovering"
+				}
+				s.CurrentEngine = "ssdeep"
+				s.CurrentPath = path
 				s.CurrentFile = filepath.Base(path)
+				s.Message = fmt.Sprintf("Fuzzy hashing… %d / %d", done, len(cleanPaths))
 			})
 		})
 		if serr != nil {
@@ -605,18 +658,35 @@ func (m *Manager) processBatch(batch []FileItem, rulePaths []string, result *Res
 		scannedCount := scanned.Add(1)
 		totalN := int(totalFound.Load())
 		threatN := int(threats.Load())
+		engineLabel := "yara"
+		if infected {
+			engineLabel = "yara"
+		} else if _, ok := ssdeepHits[key]; ok {
+			engineLabel = "ssdeep"
+		}
 		m.setStatus(func(s *StatusInfo) {
-			s.Status = "scanning"
+			if s.DiscoveryDone {
+				s.Status = "scanning"
+			} else {
+				s.Status = "discovering"
+			}
 			s.Scanned = int(scannedCount)
 			s.Total = totalN
 			s.Threats = threatN
-			s.Message = fmt.Sprintf("Scanning… %d / %d", scannedCount, totalN)
+			s.CurrentPath = item.Path
 			s.CurrentFile = filepath.Base(item.Path)
+			s.CurrentEngine = engineLabel
+			if s.DiscoveryDone {
+				s.Message = fmt.Sprintf("Scanning… %d / %d", scannedCount, totalN)
+			} else {
+				s.Message = fmt.Sprintf("Discovering… found %d · scanned %d", totalN, scannedCount)
+			}
 		})
 		// Prefer status updates for live UX; history is sparse (encrypted I/O).
 		if status == "infected" || scannedCount == 1 || scannedCount%40 == 0 {
-			_ = m.History.Append("scan.item", "Scanning: "+filepath.Base(item.Path), map[string]any{
+			_ = m.History.Append("scan.item", fmt.Sprintf("%s  %s", strings.ToUpper(engineLabel), item.Path), map[string]any{
 				"path":    item.Path,
+				"engine":  engineLabel,
 				"scanned": scannedCount,
 				"total":   totalN,
 			})
@@ -648,7 +718,9 @@ func (m *Manager) processBatch(batch []FileItem, rulePaths []string, result *Res
 				m.setStatus(func(s *StatusInfo) {
 					s.Status = "finalizing"
 					s.Message = fmt.Sprintf("Quarantining… %d / %d", i+1, len(uniq))
+					s.CurrentPath = th.Path
 					s.CurrentFile = filepath.Base(th.Path)
+					s.CurrentEngine = ""
 				})
 				_ = m.Quarantine.Isolate(th.Path, th.Rule)
 			}
@@ -727,10 +799,12 @@ func scanStartDescription(m *Manager) string {
 }
 
 func (m *Manager) reportThreats(threats []Threat) {
-	if m.API == nil {
-		return
-	}
 	agentID := m.agentID()
+	if agentID <= 0 {
+		// Center matches detections by agent_id; 0 means rows land orphaned and
+		// never show under Alert / Scan History.
+		_ = m.History.Append("api.warn", "agent_id=0 — detections may not appear on Center; re-approve or Sync now", nil)
+	}
 	device := sysinfo.Hostname()
 	ts := time.Now().Format("2006-01-02 15:04:05")
 
@@ -759,11 +833,16 @@ func (m *Manager) reportThreats(threats []Threat) {
 		})
 	}
 	if len(yaraItems) > 0 {
-		if resp, _, err := m.API.SendLogYara(yaraItems); !reportOK(resp, err) {
+		if m.API == nil {
+			_ = m.enqueueReport(reportq.KindYara, yaraItems)
+			_ = m.History.Append("api.warn", fmt.Sprintf("sendLogYara queued (%d threats); Center API not linked yet", len(yaraItems)), nil)
+		} else if resp, _, err := m.API.SendLogYara(yaraItems); !reportOK(resp, err) {
 			_ = m.History.Append("api.error", "sendLogYara: "+errString(err, resp), nil)
 			_ = m.enqueueReport(reportq.KindYara, yaraItems)
 		} else {
-			_ = m.History.Append("api.ok", fmt.Sprintf("sendLogYara (%d threats)", len(yaraItems)), nil)
+			_ = m.History.Append("api.ok", fmt.Sprintf("sendLogYara (%d threats, agent_id=%d)", len(yaraItems), agentID), map[string]any{
+				"agent_id": agentID, "count": len(yaraItems),
+			})
 		}
 	}
 
@@ -782,13 +861,16 @@ func (m *Manager) reportThreats(threats []Threat) {
 			continue
 		}
 		hashItems = append(hashItems, api.HashItem{
-			FileName: filepath.Base(th.Path),
-			HashMD5:  md5,
+			Hash:     md5,
+			Type:     api.HashTypeMD5,
 			Path:     th.Path,
+			FileName: filepath.Base(th.Path),
 		})
 	}
 	if len(hashItems) > 0 {
-		if resp, _, err := m.API.SendHash(hashItems); !reportOK(resp, err) {
+		if m.API == nil {
+			_ = m.enqueueReport(reportq.KindHash, hashItems)
+		} else if resp, _, err := m.API.SendHash(hashItems); !reportOK(resp, err) {
 			_ = m.History.Append("api.error", "sendHash: "+errString(err, resp), nil)
 			_ = m.enqueueReport(reportq.KindHash, hashItems)
 		}
@@ -830,7 +912,9 @@ func (m *Manager) reportThreats(threats []Threat) {
 		ssdeepItems = append(ssdeepItems, item)
 	}
 	if len(ssdeepItems) > 0 {
-		if resp, _, err := m.API.SendLogSsdeep(ssdeepItems); !reportOK(resp, err) {
+		if m.API == nil {
+			_ = m.enqueueReport(reportq.KindSsdeep, ssdeepItems)
+		} else if resp, _, err := m.API.SendLogSsdeep(ssdeepItems); !reportOK(resp, err) {
 			_ = m.History.Append("api.error", "sendLogSsdeep: "+errString(err, resp), nil)
 			_ = m.enqueueReport(reportq.KindSsdeep, ssdeepItems)
 		} else {
@@ -873,7 +957,9 @@ func (m *Manager) reportThreats(threats []Threat) {
 		candidates = append(candidates, candidate)
 	}
 	if len(candidates) > 0 {
-		if resp, _, err := m.API.SendSsdeepCandidate(candidates); !reportOK(resp, err) {
+		if m.API == nil {
+			_ = m.enqueueReport(reportq.KindSsdeepCandidate, candidates)
+		} else if resp, _, err := m.API.SendSsdeepCandidate(candidates); !reportOK(resp, err) {
 			_ = m.History.Append("api.error", "sendSsdeepCandidate: "+errString(err, resp), nil)
 			_ = m.enqueueReport(reportq.KindSsdeepCandidate, candidates)
 		} else {
@@ -883,9 +969,6 @@ func (m *Manager) reportThreats(threats []Threat) {
 }
 
 func (m *Manager) sendScanLog(mode, desc, typ, runID string) {
-	if m.API == nil {
-		return
-	}
 	items := []api.ScanLogItem{{
 		AgentID:     m.agentID(),
 		Description: desc,
@@ -894,9 +977,19 @@ func (m *Manager) sendScanLog(mode, desc, typ, runID string) {
 		Type:        typ,
 		RunID:       runID,
 	}}
-	if resp, _, err := m.API.SendAgentScanLog(items); !reportOK(resp, err) {
+	if m.API == nil {
 		_ = m.enqueueReport(reportq.KindScanLog, items)
+		_ = m.History.Append("api.warn", fmt.Sprintf("sendAgentScanLog queued (%s %s); Center API not linked yet", mode, typ), nil)
+		return
 	}
+	if resp, _, err := m.API.SendAgentScanLog(items); !reportOK(resp, err) {
+		_ = m.History.Append("api.error", "sendAgentScanLog: "+errString(err, resp), nil)
+		_ = m.enqueueReport(reportq.KindScanLog, items)
+		return
+	}
+	_ = m.History.Append("api.ok", fmt.Sprintf("sendAgentScanLog %s %s", mode, typ), map[string]any{
+		"mode": mode, "type": typ, "run_id": runID, "agent_id": m.agentID(),
+	})
 }
 
 func (m *Manager) enqueueReport(kind string, payload any) error {

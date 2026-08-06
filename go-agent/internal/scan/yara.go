@@ -6,12 +6,14 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"time"
 	"unicode/utf16"
 
 	"github.com/sosecure/insite-agent/internal/config"
 	"github.com/sosecure/insite-agent/internal/securefs"
+	"github.com/sosecure/insite-agent/internal/settings"
 )
 
 type Match struct {
@@ -19,12 +21,43 @@ type Match struct {
 	FilePath string
 }
 
+// ScannerOptions tunes yara64 resource use. Zero-value is safe but slow.
+type ScannerOptions struct {
+	FastScan   bool // -f
+	NoWarnings bool // -w
+	TimeoutSec int  // -a seconds; 0 = off
+}
+
 type Scanner struct {
 	YaraExe string
+	Opts    ScannerOptions
 }
 
 func NewScanner(yaraExe string) *Scanner {
-	return &Scanner{YaraExe: yaraExe}
+	return &Scanner{
+		YaraExe: yaraExe,
+		Opts: ScannerOptions{
+			FastScan:   true,
+			NoWarnings: true,
+		},
+	}
+}
+
+func NewScannerFromSettings(yaraExe string, st *settings.Store) *Scanner {
+	s := NewScanner(yaraExe)
+	if st == nil {
+		return s
+	}
+	s.Opts.FastScan = st.GetBool(settings.KeyYaraFastScan)
+	s.Opts.NoWarnings = true
+	sec := 0
+	fmt.Sscanf(strings.TrimSpace(st.Get(settings.KeyYaraTimeoutSec, "0")), "%d", &sec)
+	if sec > 0 {
+		s.Opts.TimeoutSec = sec
+	} else {
+		s.Opts.TimeoutSec = 0
+	}
+	return s
 }
 
 func (s *Scanner) ScanBatch(ruleEntries, filePaths []string) ([]Match, error) {
@@ -41,9 +74,7 @@ func (s *Scanner) ScanBatch(ruleEntries, filePaths []string) ([]Match, error) {
 	}
 	defer securefs.WipeAndRemove(listPath)
 
-	args := buildRuleArgs(ruleEntries)
-	args = append(args, "--scan-list", listPath)
-
+	args := s.buildArgs(ruleEntries, listPath)
 	cmd := exec.Command(s.YaraExe, args...)
 	cmd.Env = os.Environ()
 	out, err := cmd.CombinedOutput()
@@ -59,13 +90,32 @@ func (s *Scanner) ScanBatch(ruleEntries, filePaths []string) ([]Match, error) {
 	return parseYaraOutput(string(out)), nil
 }
 
+func (s *Scanner) buildArgs(ruleEntries []string, listPath string) []string {
+	var args []string
+	if s.Opts.FastScan {
+		args = append(args, "-f")
+	}
+	if s.Opts.NoWarnings {
+		args = append(args, "-w")
+	}
+	if s.Opts.TimeoutSec > 0 {
+		args = append(args, "-a", strconv.Itoa(s.Opts.TimeoutSec))
+	}
+	args = append(args, buildRuleArgs(ruleEntries)...)
+	args = append(args, "--scan-list", listPath)
+	return args
+}
+
 func writeScanListUTF16(path string, files []string) error {
+	// yara64 --scan-list on Windows expects UTF-16LE paths.
+	// Do NOT write a BOM: this build treats FF FE as the first path character
+	// ("?C:\..."), so the first file (or every file when batchSize=1) fails to open.
 	var u16 []uint16
 	for _, f := range files {
 		u16 = append(u16, utf16.Encode([]rune(f))...)
 		u16 = append(u16, '\r', '\n')
 	}
-	b := []byte{0xFF, 0xFE}
+	b := make([]byte, 0, len(u16)*2)
 	for _, c := range u16 {
 		b = append(b, byte(c), byte(c>>8))
 	}

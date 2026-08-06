@@ -12,6 +12,7 @@ import (
 	"github.com/sosecure/insite-agent/internal/config"
 	"github.com/sosecure/insite-agent/internal/crypto"
 	"github.com/sosecure/insite-agent/internal/keystore"
+	"github.com/sosecure/insite-agent/internal/securefs"
 	"github.com/sosecure/insite-agent/internal/storage"
 )
 
@@ -83,6 +84,16 @@ func (s *Store) FileCount() int {
 		return 0
 	}
 	return len(idx.Files)
+}
+
+// Clear wipes the encrypted YARA rule store (index + blobs) so the next sync
+// can rebuild exactly what Center assigned to this site.
+func (s *Store) Clear() error {
+	idxPath := filepath.Join(s.paths.DataDir, "rules", "index.enc")
+	_ = os.Remove(idxPath)
+	blobsDir := filepath.Join(s.paths.DataDir, "rules", "blobs")
+	_ = securefs.WipeTree(blobsDir)
+	return os.MkdirAll(blobsDir, 0o700)
 }
 
 // PutIndexed stores one rule file and writes it into the index under ruleSet:relPath.

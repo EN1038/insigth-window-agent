@@ -85,6 +85,8 @@ func kindColor(kind string) color.Color {
 		return colorError
 	case strings.Contains(kind, "ok"), strings.Contains(kind, "approve"):
 		return colorSuccess
+	case strings.Contains(kind, "live"):
+		return colorAccentCyan
 	default:
 		return colorPrimary
 	}
@@ -114,9 +116,9 @@ func (r *Router) showYaraRules() {
 			}
 			r.showYaraRules()
 			if strings.TrimSpace(msg) == "" {
-				msg = "Rule sync finished."
+				msg = "Threat intelligence sync finished."
 			}
-			dialog.ShowInformation("YARA rules", msg, r.window)
+			dialog.ShowInformation("YARA rules", humanizeNotifyMessage(msg), r.window)
 		})
 	}
 	sync.Importance = widget.HighImportance
@@ -253,9 +255,9 @@ func (r *Router) showSsdeepTool() {
 			}
 			r.showSsdeepTool()
 			if strings.TrimSpace(msg) == "" {
-				msg = "Ssdeep sync finished."
+				msg = "Threat intelligence sync finished."
 			}
-			dialog.ShowInformation("Ssdeep", msg, r.window)
+			dialog.ShowInformation("Ssdeep", humanizeNotifyMessage(msg), r.window)
 		})
 	}
 	sync.Importance = widget.HighImportance
@@ -532,8 +534,8 @@ func (r *Router) showReports(setPage func(fyne.CanvasObject)) {
 			}
 			newAlerts = append(newAlerts, dashRow{
 				Time:   shortTime(e.Time),
-				Title:  "Alert",
-				Detail: clip(e.Message, 64),
+				Title:  "Mailbox",
+				Detail: clip(humanizeNotifyMessage(e.Message), 72),
 				Accent: colorPrimary,
 			})
 		}

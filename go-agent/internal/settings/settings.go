@@ -16,6 +16,11 @@ import (
 const (
 	KeyYaraRulesPath    = "yara_rules_path"
 	KeyYaraEnginePath   = "yara_engine_path"
+	// KeyYaraFastScan enables yara64 -f (fast matching). Large win on CPU/time;
+	// may skip a few slow/exhaustive string matches (rare on webshell corpora).
+	KeyYaraFastScan = "yara_fast_scan"
+	// KeyYaraTimeoutSec aborts a yara64 invocation after N seconds (-a). 0 = disabled.
+	KeyYaraTimeoutSec = "yara_timeout_sec"
 	KeyRulesVersion     = "rules_version"
 	// YARA catalog counts from Center getRule vs local encrypted store.
 	KeyServerRulesCount = "server_rules_count"
@@ -59,6 +64,9 @@ const (
 	KeyTIDownloadPercent = "ti_download_percent"
 	KeyTIDownloadMessage = "ti_download_message"
 	KeyTISyncBusy = "ti_sync_busy"
+	// KeyTISyncPending is set when Sync Now / due TI sync is deferred because a
+	// scan is running; flushed from OnScanIdle after the scan finishes.
+	KeyTISyncPending = "ti_sync_pending"
 	// OTA agent binary update (Center-assigned target version).
 	KeyAgentUpdateSchedule   = "agent_update_schedule"
 	KeyAgentVersionCurrent   = "agent_version_current"
@@ -150,6 +158,8 @@ func (s *Store) setDefaults() {
 	}
 	def(KeyYaraRulesPath, "") // rules served from encrypted store (Data/rules/*.blobenc)
 	def(KeyYaraEnginePath, filepath.Join(config.InstallDir(), "Engine", "Yara", "yara64.exe"))
+	def(KeyYaraFastScan, "true")
+	def(KeyYaraTimeoutSec, "0")
 	def(KeyRulesVersion, "1.1")
 	def(KeyServerRulesCount, "0")
 	def(KeyLocalRulesCount, "0")
@@ -181,6 +191,7 @@ func (s *Store) setDefaults() {
 	def(KeyTIDownloadPercent, "0")
 	def(KeyTIDownloadMessage, "")
 	def(KeyTISyncBusy, "false")
+	def(KeyTISyncPending, "false")
 	def(KeyAgentUpdateSchedule, strconv.Itoa(DefaultAgentUpdateIntervalMinutes))
 	def(KeyAgentVersionCurrent, "")
 	def(KeyAgentVersionTarget, "")

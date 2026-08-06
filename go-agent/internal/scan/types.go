@@ -3,23 +3,28 @@ package scan
 import "time"
 
 const (
-	// Smaller batches keep the UI updating during YARA/ssdeep instead of freezing
-	// on multi-thousand-file chunks with no progress.
-	batchSize   = 64
-	queueCap    = 10000
+	// One file per yara64.exe invocation to keep peak CPU lower (slower overall).
+	batchSize = 1
+	queueCap  = 10000
 	scanWorkers = 1
+	// Pause between yara invocations so the host can breathe between files.
+	yaraFileDelay = 80 * time.Millisecond
 )
 
 type StatusInfo struct {
-	Scanning    bool   `json:"scanning"`
-	ScanType    string `json:"scan_type"`
-	Scanned     int    `json:"scanned"`
-	Total       int    `json:"total"`
-	Skipped     int    `json:"skipped"`
-	Threats     int    `json:"threats"`
-	Status      string `json:"status"` // discovering|scanning|completed|stopped|error|idle
-	Message     string `json:"message"`
-	CurrentFile string `json:"current_file"`
+	Scanning      bool   `json:"scanning"`
+	ScanType      string `json:"scan_type"`
+	Source        string `json:"source"` // Manual|Schedule|Login|USB|Realtime
+	Scanned       int    `json:"scanned"`
+	Total         int    `json:"total"`
+	Skipped       int    `json:"skipped"`
+	Threats       int    `json:"threats"`
+	Status        string `json:"status"` // discovering|scanning|completed|stopped|error|idle|finalizing
+	Message       string `json:"message"`
+	CurrentFile   string `json:"current_file"`   // basename for compact UI
+	CurrentPath   string `json:"current_path"`   // full path
+	CurrentEngine string `json:"current_engine"` // yara|ssdeep|discover|""
+	DiscoveryDone bool   `json:"discovery_done"` // false while enumerator still running
 }
 
 

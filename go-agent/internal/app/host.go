@@ -190,21 +190,42 @@ func (h *Host) Login(email, password string) (bool, string, string) {
 	if apiClient == nil {
 		return false, "missing server config", ""
 	}
-	resp, _, err := apiClient.LoginAgent(email, password)
-	if err != nil {
-		return false, err.Error(), ""
-	}
-	if resp.StatusCode != 200 {
+	var lastMsg string
+	for attempt := 1; attempt <= 2; attempt++ {
+		resp, _, err := apiClient.LoginAgent(email, password)
+		if err != nil {
+			lastMsg = err.Error()
+			if attempt < 2 && api.IsUnreachable(err) {
+				time.Sleep(800 * time.Millisecond)
+				continue
+			}
+			return false, lastMsg, ""
+		}
+		code := resp.StatusCode
+		if code == 200 {
+			h.SetLoggedIn(true)
+			_, _, _ = apiClient.AgentOnlineTimestamp(true)
+			agentID := h.Settings.Get("agent_id", "")
+			return true, "", agentID
+		}
 		msg := resp.Error
 		if msg == "" {
-			msg = fmt.Sprintf("login failed (status %d)", resp.StatusCode)
+			msg = fmt.Sprintf("login failed (status %d)", code)
+		}
+		if strings.Contains(msg, "<") || api.IsUnreachable(fmt.Errorf("%s", msg)) {
+			msg = "Center unreachable. Check Site Client / network."
+			lastMsg = msg
+			if attempt < 2 {
+				time.Sleep(800 * time.Millisecond)
+				continue
+			}
 		}
 		return false, msg, ""
 	}
-	h.SetLoggedIn(true)
-	_, _, _ = apiClient.AgentOnlineTimestamp(true)
-	agentID := h.Settings.Get("agent_id", "")
-	return true, "", agentID
+	if lastMsg == "" {
+		lastMsg = "login failed"
+	}
+	return false, lastMsg, ""
 }
 
 func (h *Host) Logout() {

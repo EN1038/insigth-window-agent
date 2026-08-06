@@ -154,9 +154,9 @@ func (r *Runner) ReportAndCheckAgentUpdate(autoInstall bool) error {
 
 	r.setAgentUpdateStatus("available", "Update available: "+check.TargetVersion)
 	if r.History != nil {
-		_ = r.History.Append("ui.notify", "Update available "+check.TargetVersion, map[string]any{
-			"kind": "agent_update",
-		})
+		_ = r.History.Append("ui.notify",
+			fmt.Sprintf("A new agent version (%s) is available from Center.", check.TargetVersion),
+			map[string]any{"kind": "agent_update"})
 	}
 	if !autoInstall {
 		return nil
@@ -172,6 +172,9 @@ func (r *Runner) DownloadAndStageAgentUpdate(targetVersion string, packageID int
 	if r.scanningNow() {
 		r.setAgentUpdateStatus("deferred", "Update deferred until scan finishes")
 		_ = r.History.Append("update.defer", "Agent update download deferred until scan finishes", nil)
+		_ = r.History.Append("ui.notify",
+			"Agent update will start after the current scan finishes.",
+			map[string]any{"kind": "agent_update_deferred"})
 		return fmt.Errorf("scan in progress — agent update deferred")
 	}
 	current := version.AgentVersion
@@ -214,6 +217,9 @@ func (r *Runner) DownloadAndStageAgentUpdate(targetVersion string, packageID int
 	if err != nil {
 		r.setAgentUpdateStatus("failed", err.Error())
 		_, _, _ = r.API.ReportAgentUpdateStatus("failed", err.Error(), current, targetVersion)
+		_ = r.History.Append("ui.notify",
+			"Agent update download failed. Please try again from Settings.",
+			map[string]any{"kind": "agent_update_failed"})
 		return err
 	}
 	fileSHA, err := fileSHA256(staged)
@@ -257,6 +263,11 @@ func (r *Runner) DownloadAndStageAgentUpdate(targetVersion string, packageID int
 	_, _, _ = r.API.ReportAgentUpdateStatus("ready", "Package staged for watchdog install", current, targetVersion)
 	_, _, _ = r.API.ReportAgentUpdateStatus("installing", "Handed off to watchdog", current, targetVersion)
 	r.setAgentUpdateStatus("installing", "Watchdog applying update…")
+	if r.History != nil {
+		_ = r.History.Append("ui.notify",
+			fmt.Sprintf("Agent update %s is ready and will be installed shortly.", targetVersion),
+			map[string]any{"kind": "agent_update_install"})
+	}
 	return nil
 }
 
