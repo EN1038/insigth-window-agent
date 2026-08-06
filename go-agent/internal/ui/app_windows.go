@@ -80,6 +80,15 @@ type Router struct {
 	stopRefresh   chan struct{}
 	hwnd          atomic.Uintptr
 	notifyRefresh func()
+	windowHidden  atomic.Bool
+}
+
+func (r *Router) isWindowHidden() bool {
+	return r.windowHidden.Load()
+}
+
+func (r *Router) markWindowHidden(hidden bool) {
+	r.windowHidden.Store(hidden)
 }
 
 func (r *Router) setupTrayAndCloseBehavior() {
@@ -104,6 +113,7 @@ func (r *Router) setupTrayAndCloseBehavior() {
 
 	// Close / ✕ hide to tray (do not destroy the window).
 	r.window.SetCloseIntercept(func() {
+		r.markWindowHidden(true)
 		r.window.Hide()
 	})
 
@@ -116,6 +126,7 @@ func (r *Router) showWindowFromTray() {
 	if r.window == nil {
 		return
 	}
+	r.markWindowHidden(false)
 	r.window.Show()
 	r.window.RequestFocus()
 	if c := r.window.Content(); c != nil {
@@ -245,7 +256,10 @@ func (r *Router) authTopBar() fyne.CanvasObject {
 	left := container.NewHBox(hspace(4), menuBtn)
 
 	// Hide (not Close): Close destroys the window and leaves a dead tray icon that Open cannot restore.
-	closeBtn := chromeCloseButton(func() { r.window.Hide() })
+	closeBtn := chromeCloseButton(func() {
+		r.markWindowHidden(true)
+		r.window.Hide()
+	})
 	drag := container.NewMax(newDragBar(func() uintptr { return r.windowHWND() }))
 
 	return draggableTopBar(bg, 40, left, closeBtn, drag)

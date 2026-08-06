@@ -49,6 +49,15 @@ type Manager struct {
 
 	statusMu sync.RWMutex
 	status   StatusInfo
+
+	// Realtime (silent) session totals — accumulate across file events until a
+	// FULL / QUICK / CUSTOM / AUTO on-demand scan starts (then reset to 0).
+	rtSessionMu      sync.Mutex
+	rtSessionScanned int
+	rtSessionThreats int
+	rtBaseScanned    atomic.Int64 // committed session offset while a silent scan runs
+	rtBaseThreats    atomic.Int64
+	rtAccumulating   atomic.Bool  // status Total includes pending silent queue
 }
 
 // EnsureRulesReady materializes YARA rules and returns an error if no rules are available.
@@ -69,6 +78,52 @@ func (m *Manager) setStatus(fn func(*StatusInfo)) {
 	m.statusMu.Lock()
 	defer m.statusMu.Unlock()
 	fn(&m.status)
+}
+
+func (m *Manager) resetRealtimeSession() {
+	m.rtSessionMu.Lock()
+	m.rtSessionScanned = 0
+	m.rtSessionThreats = 0
+	m.rtSessionMu.Unlock()
+	m.rtBaseScanned.Store(0)
+	m.rtBaseThreats.Store(0)
+	m.rtAccumulating.Store(false)
+}
+
+func (m *Manager) realtimeSession() (scanned, threats int) {
+	m.rtSessionMu.Lock()
+	defer m.rtSessionMu.Unlock()
+	return m.rtSessionScanned, m.rtSessionThreats
+}
+
+func (m *Manager) commitRealtimeSession(scanned, threats int) {
+	if scanned <= 0 && threats <= 0 {
+		return
+	}
+	m.rtSessionMu.Lock()
+	m.rtSessionScanned += scanned
+	m.rtSessionThreats += threats
+	m.rtSessionMu.Unlock()
+}
+
+func (m *Manager) pendingSilentCount() int {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	return len(m.pendingSilent)
+}
+
+// paintCounts writes overview counters. During realtime, values are session
+// totals (prior silent files + this file) and Total includes the silent queue.
+func (m *Manager) paintCounts(s *StatusInfo, scanned, total, threats int) {
+	baseS := int(m.rtBaseScanned.Load())
+	baseT := int(m.rtBaseThreats.Load())
+	s.Scanned = baseS + scanned
+	s.Threats = baseT + threats
+	extra := 0
+	if m.rtAccumulating.Load() {
+		extra = m.pendingSilentCount()
+	}
+	s.Total = baseS + total + extra
 }
 
 func NewManager(baseDir string, st *settings.Store, snap *snapshot.Store, apiClient *api.Client, hist *history.Store, ruleStore *rules.Store, quar *quarantine.Store, rq *reportq.Queue) *Manager {
@@ -157,6 +212,11 @@ func (m *Manager) start(scanType ScanType, customPath string, scanAll bool, sour
 		m.mu.Unlock()
 		return false
 	}
+	// On-demand scans start a fresh overview session; drop queued realtime files.
+	if scanType != ScanSilent {
+		m.pendingSilent = nil
+		m.resetRealtimeSession()
+	}
 	m.running.Store(true)
 	m.scanAll = scanAll
 	m.stopCh = make(chan struct{})
@@ -218,6 +278,16 @@ func (m *Manager) scanWork(scanType ScanType, customPath string, scanAll bool, s
 	verbose := scanType != ScanSilent
 	phaseMsg := fmt.Sprintf("Starting %s scan…", scanType)
 	discoveryDoneAtStart := scanType == ScanSilent
+	if scanType == ScanSilent {
+		sc, th := m.realtimeSession()
+		m.rtBaseScanned.Store(int64(sc))
+		m.rtBaseThreats.Store(int64(th))
+		m.rtAccumulating.Store(true)
+	} else {
+		m.rtBaseScanned.Store(0)
+		m.rtBaseThreats.Store(0)
+		m.rtAccumulating.Store(false)
+	}
 	m.setStatus(func(s *StatusInfo) {
 		*s = StatusInfo{
 			Scanning:      true,
@@ -232,6 +302,7 @@ func (m *Manager) scanWork(scanType ScanType, customPath string, scanAll bool, s
 			s.Status = "scanning"
 			s.CurrentEngine = ""
 		}
+		m.paintCounts(s, 0, 0, 0)
 	})
 	if scanType == ScanCustom && source != SourceUSB && len(strings.TrimSpace(customPath)) <= 3 {
 		result.ScanSource = SourceUSB
@@ -296,8 +367,7 @@ func (m *Manager) scanWork(scanType ScanType, customPath string, scanAll bool, s
 		skipN := int(skipped.Load())
 		base := filepath.Base(pathOrDir)
 		m.setStatus(func(s *StatusInfo) {
-			s.Total = int(n)
-			s.Scanned = int(sc)
+			m.paintCounts(s, int(sc), int(n), int(threats.Load()))
 			s.Skipped = skipN
 			s.DiscoveryDone = false
 			// Keep status as discovering until enumerator finishes so UI does not
@@ -309,9 +379,9 @@ func (m *Manager) scanWork(scanType ScanType, customPath string, scanAll bool, s
 				s.CurrentFile = base
 			}
 			if sc > 0 {
-				s.Message = fmt.Sprintf("Discovering… found %d · scanned %d", n, sc)
+				s.Message = fmt.Sprintf("Discovering… found %d · scanned %d", s.Total, s.Scanned)
 			} else {
-				s.Message = fmt.Sprintf("Discovering files… %d found", n)
+				s.Message = fmt.Sprintf("Discovering files… %d found", s.Total)
 			}
 		})
 	}
@@ -388,10 +458,9 @@ func (m *Manager) scanWork(scanType ScanType, customPath string, scanAll bool, s
 			m.setStatus(func(s *StatusInfo) {
 				s.DiscoveryDone = true
 				s.Status = "scanning"
-				s.Total = int(n)
-				s.Scanned = int(sc)
+				m.paintCounts(s, int(sc), int(n), int(threats.Load()))
 				s.Skipped = int(skipped.Load())
-				s.Message = fmt.Sprintf("Scanning… %d / %d", sc, n)
+				s.Message = fmt.Sprintf("Scanning… %d / %d", s.Scanned, s.Total)
 				if s.CurrentEngine == "discover" {
 					s.CurrentEngine = ""
 				}
@@ -403,7 +472,7 @@ func (m *Manager) scanWork(scanType ScanType, customPath string, scanAll bool, s
 			m.setStatus(func(s *StatusInfo) {
 				s.DiscoveryDone = true
 				s.Status = "scanning"
-				s.Total = int(totalFound.Load())
+				m.paintCounts(s, int(scanned.Load()), int(totalFound.Load()), int(threats.Load()))
 			})
 		}
 	}()
@@ -444,13 +513,22 @@ func (m *Manager) scanWork(scanType ScanType, customPath string, scanAll bool, s
 	} else {
 		result.Status = "completed"
 	}
+	if scanType == ScanSilent {
+		m.commitRealtimeSession(result.FilesScanned, result.ThreatsFound)
+		// Bases catch up to committed session so idle/final status stays cumulative.
+		sc, th := m.realtimeSession()
+		m.rtBaseScanned.Store(int64(sc))
+		m.rtBaseThreats.Store(int64(th))
+	}
 	m.setStatus(func(s *StatusInfo) {
 		s.Scanning = true
 		s.DiscoveryDone = true
-		s.Scanned = int(scanned.Load())
+		if scanType == ScanSilent {
+			m.paintCounts(s, 0, 0, 0)
+		} else {
+			m.paintCounts(s, int(scanned.Load()), int(totalFound.Load()), int(threats.Load()))
+		}
 		s.Skipped = int(skipped.Load())
-		s.Total = int(totalFound.Load())
-		s.Threats = int(threats.Load())
 		s.Status = "finalizing"
 		s.Message = "Saving results…"
 		s.CurrentFile = ""
@@ -470,12 +548,16 @@ func (m *Manager) scanWork(scanType ScanType, customPath string, scanAll bool, s
 		"ssdeep":  countThreatsByEngine(result.Threats, "ssdeep"),
 		"source":  source,
 	})
-	_ = m.History.Append("ui.notify", formatScanUserMessage(result.Status, result.FilesScanned, result.FilesSkipped, result.ThreatsFound), map[string]any{
-		"kind":    "scan",
-		"scanned": result.FilesScanned,
-		"skipped": result.FilesSkipped,
-		"threats": result.ThreatsFound,
-	})
+	// Realtime clean hits would spam mailbox/toasts; only notify when threats
+	// found or the scan was an on-demand / scheduled pass.
+	if scanType != ScanSilent || result.ThreatsFound > 0 {
+		_ = m.History.Append("ui.notify", formatScanUserMessage(result.Status, result.FilesScanned, result.FilesSkipped, result.ThreatsFound), map[string]any{
+			"kind":    "scan",
+			"scanned": result.FilesScanned,
+			"skipped": result.FilesSkipped,
+			"threats": result.ThreatsFound,
+		})
+	}
 
 	yaraN := countThreatsByEngine(result.Threats, "yara")
 	ssdeepN := countThreatsByEngine(result.Threats, "ssdeep")
@@ -490,10 +572,12 @@ func (m *Manager) scanWork(scanType ScanType, customPath string, scanAll bool, s
 	m.setStatus(func(s *StatusInfo) {
 		s.Scanning = false
 		s.DiscoveryDone = true
-		s.Scanned = result.FilesScanned
+		if scanType == ScanSilent {
+			m.paintCounts(s, 0, 0, 0)
+		} else {
+			m.paintCounts(s, result.FilesScanned, result.TotalFound, result.ThreatsFound)
+		}
 		s.Skipped = result.FilesSkipped
-		s.Total = result.TotalFound
-		s.Threats = result.ThreatsFound
 		s.Status = result.Status
 		s.Message = formatScanUserMessage(result.Status, result.FilesScanned, result.FilesSkipped, result.ThreatsFound)
 		s.CurrentFile = ""
@@ -539,9 +623,7 @@ func (m *Manager) processBatch(batch []FileItem, rulePaths []string, result *Res
 		} else {
 			s.Status = "discovering"
 		}
-		s.Scanned = already
-		s.Total = totalHint
-		s.Threats = int(threats.Load())
+		m.paintCounts(s, already, totalHint, int(threats.Load()))
 		s.CurrentEngine = "yara"
 		s.CurrentPath = paths[0]
 		s.CurrentFile = filepath.Base(paths[0])
@@ -670,16 +752,14 @@ func (m *Manager) processBatch(batch []FileItem, rulePaths []string, result *Res
 			} else {
 				s.Status = "discovering"
 			}
-			s.Scanned = int(scannedCount)
-			s.Total = totalN
-			s.Threats = threatN
+			m.paintCounts(s, int(scannedCount), totalN, threatN)
 			s.CurrentPath = item.Path
 			s.CurrentFile = filepath.Base(item.Path)
 			s.CurrentEngine = engineLabel
 			if s.DiscoveryDone {
-				s.Message = fmt.Sprintf("Scanning… %d / %d", scannedCount, totalN)
+				s.Message = fmt.Sprintf("Scanning… %d / %d", s.Scanned, s.Total)
 			} else {
-				s.Message = fmt.Sprintf("Discovering… found %d · scanned %d", totalN, scannedCount)
+				s.Message = fmt.Sprintf("Discovering… found %d · scanned %d", s.Total, s.Scanned)
 			}
 		})
 		// Prefer status updates for live UX; history is sparse (encrypted I/O).

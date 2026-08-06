@@ -18,6 +18,7 @@ import (
 	"fyne.io/fyne/v2/widget"
 
 	"github.com/sosecure/insite-agent/internal/ipc"
+	"github.com/sosecure/insite-agent/internal/wintoast"
 )
 
 type notifyItem struct {
@@ -40,6 +41,7 @@ type notifyBell struct {
 	seenKeys   map[string]bool
 	dismissed  map[string]bool
 	items      []notifyItem
+	warmed     bool // first history poll only seeds mailbox; no tray toasts
 }
 
 func newNotifyBell(r *Router) *notifyBell {
@@ -345,7 +347,9 @@ func atoiSafe(s string) int {
 
 func (n *notifyBell) ingest(events []ipc.HistoryEvent) {
 	added := 0
+	var toastMsgs []string
 	n.mu.Lock()
+	warmed := n.warmed
 	for i := len(events) - 1; i >= 0; i-- {
 		e := events[i]
 		if e.Kind != "ui.notify" {
@@ -360,17 +364,22 @@ func (n *notifyBell) ingest(events []ipc.HistoryEvent) {
 			continue
 		}
 		n.seenKeys[key] = true
+		msg := humanizeNotifyMessage(e.Message)
 		n.items = append([]notifyItem{{
 			Key:     key,
 			Time:    e.Time,
-			Message: humanizeNotifyMessage(e.Message),
+			Message: msg,
 		}}, n.items...)
 		if len(n.items) > 30 {
 			n.items = n.items[:30]
 		}
 		n.unread++
 		added++
+		if warmed && shouldTrayToast(msg) {
+			toastMsgs = append(toastMsgs, msg)
+		}
 	}
+	n.warmed = true
 	n.mu.Unlock()
 	if added > 0 {
 		n.startBounce()
@@ -379,6 +388,59 @@ func (n *notifyBell) ingest(events []ipc.HistoryEvent) {
 		n.refreshBadge()
 		n.Refresh()
 	})
+	if len(toastMsgs) == 0 {
+		return
+	}
+	// Toast only while the main window is hidden in the tray.
+	if n.router == nil || !n.router.isWindowHidden() {
+		return
+	}
+	go func(msgs []string) {
+		for _, msg := range msgs {
+			title := trayToastTitle(msg)
+			_ = wintoast.Notify(title, msg)
+		}
+	}(toastMsgs)
+}
+
+// shouldTrayToast skips noisy in-progress sync lines; mailbox still keeps them.
+func shouldTrayToast(msg string) bool {
+	low := strings.ToLower(strings.TrimSpace(msg))
+	if low == "" {
+		return false
+	}
+	switch {
+	case strings.HasPrefix(low, "downloading yara"),
+		strings.HasPrefix(low, "downloading ssdeep"),
+		strings.HasPrefix(low, "starting threat intelligence"),
+		strings.HasPrefix(low, "syncing threat intelligence"),
+		strings.HasPrefix(low, "waiting for"):
+		return false
+	}
+	return true
+}
+
+func trayToastTitle(msg string) string {
+	low := strings.ToLower(msg)
+	switch {
+	case strings.Contains(low, "scan finished"), strings.Contains(low, "scan stopped"):
+		if strings.Contains(low, "threat") && !strings.Contains(low, "no threats") {
+			return "Threat detected"
+		}
+		return "Scan complete"
+	case strings.Contains(low, "threat intelligence"),
+		strings.Contains(low, "protection settings"),
+		strings.Contains(low, "yara"),
+		strings.Contains(low, "ssdeep"),
+		strings.Contains(low, "fuzzy"):
+		return "Threat intelligence"
+	case strings.Contains(low, "agent version"), strings.Contains(low, "update"):
+		return "Agent update"
+	case strings.Contains(low, "threat"):
+		return "Threat detected"
+	default:
+		return "SOSECURE Threat inSight"
+	}
 }
 
 func (n *notifyBell) startBounce() {

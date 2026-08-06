@@ -124,7 +124,10 @@ func (r *Router) buildSidebar(setPage func(fyne.CanvasObject)) fyne.CanvasObject
 func (r *Router) buildTopChrome() fyne.CanvasObject {
 	bg := canvas.NewRectangle(color.NRGBA{R: 0x00, G: 0x00, B: 0x00, A: 0xcc})
 	// Hide (not Close): Close destroys the window; tray Open can no longer restore it.
-	closeBtn := chromeCloseButton(func() { r.window.Hide() })
+	closeBtn := chromeCloseButton(func() {
+		r.markWindowHidden(true)
+		r.window.Hide()
+	})
 	bell, refreshBell := r.buildNotifyBell()
 	r.notifyRefresh = refreshBell
 	right := container.NewHBox(bell, hspace(6), closeBtn)
