@@ -1,10 +1,13 @@
 SOSECURE YARA ENGINE SETUP
 ==========================
 
-To enable threat scanning, please place the following files in this directory:
+yara64.exe is NOT shipped in this repository (license / binary size).
 
-1. yara64.exe  - The official YARA 64-bit command line tool.
-2. rules.yar   - Your YARA rules file.
+To enable threat scanning, place the following files in this directory:
 
-The agent will automatically execute these rules against all system files after a successful administrator login.
-Scanning runs in the background at low priority.
+1. yara64.exe  - The official YARA 64-bit command line tool
+               (from https://github.com/VirusTotal/yara/releases)
+2. rules.yar   - Optional local rules; production rules sync from Center
+
+The agent runs YARA against scanned files after a successful administrator
+login. Scanning runs in the background at low priority.

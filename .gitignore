@@ -3,6 +3,8 @@
 /bin/
 /Output/
 /go-agent/dist/
+/go-agent/bin/
+/package_*/
 
 # Large bundled ssdeep DB (keep locally or in installer)
 /go-agent/bundled/ssdeep/signatures.db
@@ -12,7 +14,12 @@
 /Engine/Mesa/_cache/
 /Engine/Mesa/*.dll
 !Engine/Mesa/README.txt
+/go-agent/*.dll
 
+# YARA binary — download separately (see Engine/Yara/README.txt)
+Engine/Yara/yara64.exe
+**/yara64.exe
+**/yarac64.exe
 
 # Legacy / bundled binaries (not part of Go agent)
 /Engine/sosecure-engine.exe
@@ -21,14 +28,27 @@
 # Secrets and runtime data
 /Config/Key/config.json
 /Config/Key/config.enc
+/Config/Key/*.p12
+/Config/Key/*.pem
+/Config/Key/*.key
+.env
+.env.*
+*.env
 /Data/
 /Logs/
 /Quarantine/
 *.qfile
 
+# Local scratch / packages / archives
+/_crypto-demo/
+*.zip
+
+# Script run logs (keep .ps1 scripts)
+go-agent/scripts/*-log.txt
+go-agent/scripts/*-out.txt
+
 # Go
 *.exe
-!Engine/Yara/yara64.exe
 *.test
 *.out
 /vendor/
