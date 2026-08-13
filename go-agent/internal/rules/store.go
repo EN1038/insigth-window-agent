@@ -19,11 +19,38 @@ import (
 // Store persists encrypted YARA rule files with a small encrypted index.
 // This replaces SQLCipher for the agent rewrite.
 type Store struct {
-	paths config.Paths
+	paths     config.Paths
+	denyFiles map[string]bool // lowercased basenames / file names from Center ignore
+	denyNames map[string]bool // lowercased YARA rule identifiers
 }
 
 func New(baseDir string) *Store {
 	return &Store{paths: config.ResolvePaths(baseDir)}
+}
+
+// SetDisabledRules configures per-agent ignore lists applied during Materialize.
+func (s *Store) SetDisabledRules(fileNames, ruleNames []string) {
+	if s == nil {
+		return
+	}
+	s.denyFiles = toLowerSet(fileNames)
+	s.denyNames = toLowerSet(ruleNames)
+}
+
+func toLowerSet(items []string) map[string]bool {
+	out := map[string]bool{}
+	for _, it := range items {
+		k := strings.ToLower(strings.TrimSpace(it))
+		if k == "" {
+			continue
+		}
+		out[k] = true
+		// Also index basename if a path-like value was stored.
+		if base := strings.ToLower(filepath.Base(k)); base != "" && base != k {
+			out[base] = true
+		}
+	}
+	return out
 }
 
 type Index struct {
@@ -235,7 +262,7 @@ func (s *Store) MaterializeWithStats(destRoot string) (MaterializeStats, []strin
 	}
 	stats.StoredFiles = len(written)
 
-	selected := buildScanIncludeList(destRoot, written)
+	selected := buildScanIncludeList(destRoot, written, s.denyFiles, s.denyNames)
 	beforePrune := len(selected)
 	if yaraExe := resolveBundledYara(s.paths.BaseDir); yaraExe != "" {
 		selected = pruneFailingIncludes(destRoot, yaraExe, selected)

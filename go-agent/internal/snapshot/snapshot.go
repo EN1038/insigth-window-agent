@@ -27,7 +27,10 @@ type FileRecord struct {
 	LastScanUnix    int64  `json:"last_scan_unix"`
 }
 
-// NeedsRescan mirrors legacy SnapshotStore incremental logic.
+// NeedsRescan decides whether a file should be scanned again.
+// Incremental skip uses size + mtime + rulesVersion only (not content hash).
+// Rare false-skips: content changes that preserve size and mtime.
+// Optional later: ContentHash (SHA-256/xxhash) when size+mtime match.
 func (r FileRecord) NeedsRescan(size int64, lastWriteUnix int64, rulesVersion string) bool {
 	if r.LastScanResult == "" {
 		return true

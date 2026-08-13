@@ -56,7 +56,7 @@ func (r *Runner) tickAgentUpdateSchedule() {
 		return
 	}
 	r.ensureAutoScheduleDefaults()
-	mins := settings.NormalizeIntervalMinutes(
+	mins := settings.NormalizeAgentUpdateMinutes(
 		r.Settings.Get(settings.KeyAgentUpdateSchedule, ""),
 		settings.DefaultAgentUpdateIntervalMinutes,
 	)
@@ -82,7 +82,7 @@ func (r *Runner) ReportAndCheckAgentUpdate(autoInstall bool) error {
 	}
 	current := version.AgentVersion
 	r.Settings.Set(settings.KeyAgentVersionCurrent, current)
-	schedule := strconv.Itoa(settings.NormalizeIntervalMinutes(
+	schedule := strconv.Itoa(settings.NormalizeAgentUpdateMinutes(
 		r.Settings.Get(settings.KeyAgentUpdateSchedule, ""),
 		settings.DefaultAgentUpdateIntervalMinutes,
 	))
@@ -91,6 +91,7 @@ func (r *Runner) ReportAndCheckAgentUpdate(autoInstall bool) error {
 	// Always allow version reporting; only block download/install while scanning.
 	if autoInstall && r.scanningNow() {
 		r.setAgentUpdateStatus("deferred", "Update deferred until scan finishes")
+		_, _, _ = r.API.ReportAgentUpdateStatus("deferred", "Update deferred until scan finishes", current, "")
 		_ = r.History.Append("update.defer", "Agent update download deferred until scan finishes", nil)
 		return nil
 	}
@@ -149,10 +150,12 @@ func (r *Runner) ReportAndCheckAgentUpdate(autoInstall bool) error {
 
 	if !check.UpdateAvailable || check.Package == nil || strings.TrimSpace(check.Package.Path) == "" {
 		r.setAgentUpdateStatus("up_to_date", "Already on assigned version")
+		_, _, _ = r.API.ReportAgentUpdateStatus("up_to_date", "Already on assigned version", current, check.TargetVersion)
 		return nil
 	}
 
 	r.setAgentUpdateStatus("available", "Update available: "+check.TargetVersion)
+	_, _, _ = r.API.ReportAgentUpdateStatus("available", "Update available: "+check.TargetVersion, current, check.TargetVersion)
 	if r.History != nil {
 		_ = r.History.Append("ui.notify",
 			fmt.Sprintf("A new agent version (%s) is available from Center.", check.TargetVersion),
@@ -169,15 +172,16 @@ func (r *Runner) DownloadAndStageAgentUpdate(targetVersion string, packageID int
 	if r.API == nil || r.Settings == nil {
 		return fmt.Errorf("not connected")
 	}
+	current := version.AgentVersion
 	if r.scanningNow() {
 		r.setAgentUpdateStatus("deferred", "Update deferred until scan finishes")
+		_, _, _ = r.API.ReportAgentUpdateStatus("deferred", "Update deferred until scan finishes", current, targetVersion)
 		_ = r.History.Append("update.defer", "Agent update download deferred until scan finishes", nil)
 		_ = r.History.Append("ui.notify",
 			"Agent update will start after the current scan finishes.",
 			map[string]any{"kind": "agent_update_deferred"})
 		return fmt.Errorf("scan in progress — agent update deferred")
 	}
-	current := version.AgentVersion
 	if kind == "" {
 		kind = "agent_binary"
 	}

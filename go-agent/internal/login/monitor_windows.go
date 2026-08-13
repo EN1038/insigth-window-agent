@@ -12,7 +12,7 @@ import (
 	"github.com/sosecure/insite-agent/internal/winuser"
 )
 
-// Monitor starts a quick scan when an interactive Windows session becomes active
+// Monitor starts a login scan when an interactive Windows session becomes active
 // (user sign-in / unlock to Active) while auto_scan_on_login is enabled.
 //
 // Sessions that are already active when the agent starts are recorded but not
@@ -98,7 +98,7 @@ func (m *Monitor) poll() {
 			// Retry next tick; do not mark scanned yet.
 			return
 		}
-		if !m.manager.StartLoginQuickScan() {
+		if !m.manager.StartLoginScan() {
 			return
 		}
 		m.scanned[id] = true

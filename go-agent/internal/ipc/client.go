@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"net/url"
 	"strings"
 	"time"
 
@@ -154,6 +155,15 @@ func (c *Client) Quarantine(ctx context.Context) ([]QuarantineItem, error) {
 func (c *Client) History(ctx context.Context, limit int) ([]HistoryEvent, error) {
 	var out []HistoryEvent
 	err := c.get(ctx, fmt.Sprintf("/v1/history?limit=%d", limit), &out)
+	return out, err
+}
+
+func (c *Client) ScanRunFiles(ctx context.Context, runID string, offset, limit int) (ScanRunFilesResponse, error) {
+	var out ScanRunFilesResponse
+	if limit <= 0 {
+		limit = 200
+	}
+	err := c.get(ctx, fmt.Sprintf("/v1/scan/files?run_id=%s&offset=%d&limit=%d", url.QueryEscape(runID), offset, limit), &out)
 	return out, err
 }
 

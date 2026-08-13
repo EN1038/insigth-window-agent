@@ -22,8 +22,8 @@ Test machines may block newly built `insite-agent.exe` (WDAC / AppLocker / third
 | Job | Setting | Default |
 |-----|---------|---------|
 | Rules + ssdeep TI sync | `ti_sync_everydate` | every **60** minutes |
-| Agent version check/update | `agent_update_schedule` | every **360** minutes |
-| Batch/auto scan | `batchjob_everydate` | every **1440** minutes |
+| Agent version check/update | `agent_update_schedule` | every **1 day** (day presets) |
+| Batch/auto scan | `batchjob_everydate` | daily at **02:00** (HH:mm) |
 
 While a scan is running, scheduled TI sync and agent update **download/install** are deferred. When the scan stops or completes, deferred work runs on the next idle tick (and immediately via `OnScanIdle`).
 

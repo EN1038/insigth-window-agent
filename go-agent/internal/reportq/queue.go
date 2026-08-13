@@ -19,9 +19,10 @@ const (
 	KindSsdeep          = "sendLogSsdeep"
 	KindSsdeepCandidate = "sendSsdeepCandidate"
 	KindScanLog         = "sendAgentScanLog"
+	KindScanFile        = "sendScanFileLog"
 
-	maxItems     = 200
-	maxAttempts  = 12
+	maxItems    = 200
+	maxAttempts = 12
 )
 
 // Item is one durable outbound API payload awaiting retry.
@@ -169,6 +170,13 @@ func dispatch(client *api.Client, it Item) (bool, error) {
 			return false, err
 		}
 		resp, _, err := client.SendAgentScanLog(items)
+		return apiOK(resp, err), err
+	case KindScanFile:
+		var items []api.ScanFileItem
+		if err := json.Unmarshal(it.Payload, &items); err != nil {
+			return false, err
+		}
+		resp, _, err := client.SendScanFileLog(items)
 		return apiOK(resp, err), err
 	default:
 		return false, fmt.Errorf("unknown kind %s", it.Kind)

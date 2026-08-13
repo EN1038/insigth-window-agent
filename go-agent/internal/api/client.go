@@ -357,6 +357,7 @@ type YaraLogItem struct {
 	FileText    string `json:"file_text"`
 	FirstScan   string `json:"first_scan"`
 	LastScan    string `json:"last_scan"`
+	RunID       string `json:"run_id,omitempty"`
 }
 
 func (c *Client) SendLogYara(items []YaraLogItem) (*Response, []byte, error) {
@@ -382,6 +383,26 @@ func (c *Client) SendAgentScanLog(items []ScanLogItem) (*Response, []byte, error
 		"ip_private": sysinfo.LocalIPv4(),
 	}
 	return c.postJSON("sendAgentScanLog", payload)
+}
+
+// ScanFileItem is one engine-scanned path for Center Scan History expand.
+type ScanFileItem struct {
+	AgentID   int64   `json:"agent_id"`
+	RunID     string  `json:"run_id,omitempty"`
+	Path      string  `json:"path"`
+	Result    string  `json:"result"` // clean|infected
+	Rule      string  `json:"rule,omitempty"`
+	Engine    string  `json:"engine,omitempty"`
+	Score     float64 `json:"score,omitempty"`
+	ScannedAt string  `json:"scanned_at,omitempty"`
+}
+
+func (c *Client) SendScanFileLog(items []ScanFileItem) (*Response, []byte, error) {
+	payload := map[string]any{
+		"scan_files": items,
+		"ip_private": sysinfo.LocalIPv4(),
+	}
+	return c.postJSON("sendScanFileLog", payload)
 }
 
 // HashItem matches Center sendHash, which looks each entry up in the OTX
@@ -464,6 +485,7 @@ type SsdeepLogItem struct {
 	Description string `json:"description"`
 	DeviceName  string `json:"device_name"`
 	DetectedAt  string `json:"detected_at"`
+	RunID       string `json:"run_id,omitempty"`
 }
 
 func (c *Client) SendLogSsdeep(items []SsdeepLogItem) (*Response, []byte, error) {
@@ -486,6 +508,7 @@ type SsdeepCandidateItem struct {
 	ScanMode   string `json:"scan_mode,omitempty"`
 	DetectedAt string `json:"detected_at"`
 	Source     string `json:"source,omitempty"`
+	RunID      string `json:"run_id,omitempty"`
 }
 
 func (c *Client) SendSsdeepCandidate(items []SsdeepCandidateItem) (*Response, []byte, error) {

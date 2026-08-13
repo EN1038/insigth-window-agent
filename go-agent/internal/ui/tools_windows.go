@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"image/color"
 	"io"
+	"path/filepath"
 	"strings"
 	"time"
 
@@ -18,6 +19,8 @@ import (
 	"fyne.io/fyne/v2/layout"
 	"fyne.io/fyne/v2/theme"
 	"fyne.io/fyne/v2/widget"
+
+	"github.com/sosecure/insite-agent/internal/ipc"
 )
 
 // ---------------------------------------------------------------------------
@@ -54,6 +57,27 @@ func (r *Router) showViewLogs() {
 			kind.Text = e.Kind
 			kind.Color = kindColor(e.Kind)
 			msg.Text = e.Message
+			if e.Kind == "scan.threat" && e.Meta != nil {
+				path, _ := e.Meta["path"].(string)
+				rule, _ := e.Meta["rule"].(string)
+				engine, _ := e.Meta["engine"].(string)
+				if path == "" {
+					path = e.Message
+				}
+				parts := []string{}
+				if rule != "" {
+					parts = append(parts, rule)
+				}
+				if engine != "" {
+					parts = append(parts, engine)
+				}
+				if path != "" {
+					parts = append(parts, path)
+				}
+				if len(parts) > 0 {
+					msg.Text = strings.Join(parts, "  ·  ")
+				}
+			}
 			ts.Refresh()
 			kind.Refresh()
 			msg.Refresh()
@@ -299,11 +323,12 @@ func (r *Router) showSsdeepTool() {
 func (r *Router) showReports(setPage func(fyne.CanvasObject)) {
 	r.stopTicker()
 
-	kpiQuarantine := heading("—", 26, colorError)
-	kpiThreats := heading("—", 26, colorWarning)
-	kpiRules := heading("—", 26, colorPrimary)
-	kpiSsdeep := heading("—", 16, colorAccentCyan)
-	kpiSync := heading("—", 14, colorText)
+	kpiLastFiles := heading("—", 26, colorPrimary)
+	kpiLastNew := heading("—", 26, colorAccentCyan)
+	kpiLastMalware := heading("—", 26, colorError)
+	kpiQuarantine := heading("—", 22, colorWarning)
+	kpiRules := heading("—", 16, colorText)
+	kpiSsdeep := heading("—", 14, colorAccentCyan)
 
 	kpiCard := func(title string, val fyne.CanvasObject) fyne.CanvasObject {
 		return card(container.NewPadded(container.NewVBox(
@@ -312,17 +337,20 @@ func (r *Router) showReports(setPage func(fyne.CanvasObject)) {
 			val,
 		)))
 	}
-	// Two rows keep MinSize under the fixed window width (5-wide grids expand it).
+	lastScanHint := muted("Last completed scan summary")
 	kpis := container.NewVBox(
+		lastScanHint,
+		vspace(6),
 		container.NewGridWithColumns(3,
-			kpiCard("QUARANTINED", kpiQuarantine),
-			kpiCard("THREATS", kpiThreats),
-			kpiCard("YARA RULES", kpiRules),
+			kpiCard("FILES (TOTAL)", kpiLastFiles),
+			kpiCard("NEWLY SCANNED", kpiLastNew),
+			kpiCard("MALWARE", kpiLastMalware),
 		),
 		vspace(8),
-		container.NewGridWithColumns(2,
+		container.NewGridWithColumns(3,
+			kpiCard("QUARANTINED", kpiQuarantine),
+			kpiCard("YARA RULES", kpiRules),
 			kpiCard("SSDEEP DB", kpiSsdeep),
-			kpiCard("LAST TI SYNC", kpiSync),
 		),
 	)
 
@@ -348,7 +376,6 @@ func (r *Router) showReports(setPage func(fyne.CanvasObject)) {
 		Accent              color.Color
 	}
 	detRows := []dashRow{}
-	alertRows := []dashRow{}
 
 	mkList := func(getRows func() []dashRow) *widget.List {
 		return widget.NewList(
@@ -374,7 +401,7 @@ func (r *Router) showReports(setPage func(fyne.CanvasObject)) {
 				rows := getRows()
 				if len(rows) == 0 {
 					ts.Text = ""
-					title.Text = "No items yet"
+					title.Text = "No malware yet"
 					title.Color = colorMuted
 					detail.Text = ""
 					ts.Refresh()
@@ -398,19 +425,18 @@ func (r *Router) showReports(setPage func(fyne.CanvasObject)) {
 	}
 
 	detList := mkList(func() []dashRow { return detRows })
-	alertList := mkList(func() []dashRow { return alertRows })
-
 	detCard := card(container.NewBorder(
-		container.NewPadded(sectionHeaderImg(resIconScan, "Recent detections")),
+		container.NewPadded(sectionHeaderImg(resIconScan, "Recent malware")),
 		nil, nil, nil,
-		container.NewPadded(container.New(&fixedHeight{h: 200}, detList)),
+		container.NewPadded(container.New(&fixedHeight{h: 160}, detList)),
 	))
-	alertCard := card(container.NewBorder(
-		container.NewPadded(sectionHeaderImg(resIconLog, "Recent alerts")),
+
+	scanHistBox := container.NewVBox(muted("No completed scans yet."))
+	scanHistCard := card(container.NewBorder(
+		container.NewPadded(sectionHeaderImg(resIconStat, "Scan history — expand a run for paths")),
 		nil, nil, nil,
-		container.NewPadded(container.New(&fixedHeight{h: 200}, alertList)),
+		container.NewPadded(container.New(&fixedHeight{h: 340}, container.NewVScroll(scanHistBox))),
 	))
-	lists := container.NewGridWithColumns(2, detCard, alertCard)
 
 	quarantineBtn := widget.NewButtonWithIcon("Quarantine", theme.WarningIcon(), func() { r.showQuarantine() })
 	logsBtn := widget.NewButtonWithIcon("Full log", theme.ListIcon(), func() { r.showViewLogs() })
@@ -430,10 +456,11 @@ func (r *Router) showReports(setPage func(fyne.CanvasObject)) {
 		vspace(6),
 		protection,
 		vspace(12),
-		lists,
+		scanHistCard,
+		vspace(12),
+		detCard,
 		vspace(8),
 	)
-	// Cap content width so long paths/labels cannot stretch the fixed window.
 	setPage(container.NewPadded(container.NewVScroll(container.New(&flexWidth{}, body))))
 
 	formatOnOff := func(on bool, label *canvas.Text) {
@@ -469,10 +496,191 @@ func (r *Router) showReports(setPage func(fyne.CanvasObject)) {
 		}
 		return s
 	}
-	isDetectKind := func(kind string) bool {
-		k := strings.ToLower(kind)
-		return strings.Contains(k, "threat") || strings.Contains(k, "detect") ||
-			strings.HasPrefix(k, "scan.item") || k == "scan.end"
+
+	metaStr := func(m map[string]any, key string) string {
+		if m == nil {
+			return ""
+		}
+		v, ok := m[key]
+		if !ok || v == nil {
+			return ""
+		}
+		switch t := v.(type) {
+		case string:
+			return t
+		default:
+			return fmt.Sprint(t)
+		}
+	}
+	metaInt := func(m map[string]any, key string) int {
+		s := strings.TrimSpace(metaStr(m, key))
+		if s == "" {
+			return 0
+		}
+		var n int
+		fmt.Sscanf(s, "%d", &n)
+		return n
+	}
+
+	buildScanHistory := func(hist []ipc.HistoryEvent) (fyne.CanvasObject, int, int, int) {
+		type sessFile struct {
+			path, result, rule, engine, score string
+		}
+		type sess struct {
+			time, mode, status, runID string
+			scanned, skipped, threats int
+			items                     []sessFile
+			fileTotal                 int
+		}
+
+		sessions := make([]sess, 0, 20)
+		for _, e := range hist {
+			if e.Kind != "scan.end" {
+				continue
+			}
+			if len(sessions) >= 20 {
+				break
+			}
+			rid := metaStr(e.Meta, "run_id")
+			mode := metaStr(e.Meta, "mode")
+			if mode == "" {
+				mode = metaStr(e.Meta, "source")
+			}
+			st := metaStr(e.Meta, "status")
+			if st == "" {
+				st = "completed"
+			}
+			items := []sessFile{}
+			fileTotal := 0
+			if rid != "" {
+				if resp, err := r.client.ScanRunFiles(r.ctx, rid, 0, 300); err == nil {
+					fileTotal = resp.Total
+					for _, row := range resp.Rows {
+						score := ""
+						if row.Score != 0 {
+							score = fmt.Sprintf("%.0f", row.Score)
+						}
+						items = append(items, sessFile{
+							path:   row.Path,
+							result: row.Result,
+							rule:   row.Rule,
+							engine: row.Engine,
+							score:  score,
+						})
+					}
+				}
+			}
+			if len(items) == 0 {
+				for _, te := range hist {
+					if te.Kind != "scan.threat" {
+						continue
+					}
+					if rid != "" && metaStr(te.Meta, "run_id") != rid {
+						continue
+					}
+					path := metaStr(te.Meta, "path")
+					if path == "" {
+						path = te.Message
+					}
+					items = append(items, sessFile{
+						path:   path,
+						result: "infected",
+						rule:   metaStr(te.Meta, "rule"),
+						engine: metaStr(te.Meta, "engine"),
+						score:  metaStr(te.Meta, "score"),
+					})
+				}
+				fileTotal = len(items)
+			}
+			sessions = append(sessions, sess{
+				time:      shortTime(e.Time),
+				mode:      mode,
+				status:    st,
+				runID:     rid,
+				scanned:   metaInt(e.Meta, "scanned"),
+				skipped:   metaInt(e.Meta, "skipped"),
+				threats:   metaInt(e.Meta, "threats"),
+				items:     items,
+				fileTotal: fileTotal,
+			})
+		}
+		if len(sessions) == 0 {
+			return muted("No completed scans yet. Run a scan to see file totals and path history."), 0, 0, 0
+		}
+
+		last := sessions[0]
+		lastTotal := last.scanned + last.skipped
+		if lastTotal == 0 {
+			lastTotal = last.fileTotal
+		}
+		lastNew := last.scanned
+		if lastNew == 0 && last.fileTotal > 0 {
+			lastNew = last.fileTotal
+		}
+		lastMalware := last.threats
+
+		acc := widget.NewAccordion()
+		for _, s := range sessions {
+			totalFiles := s.scanned + s.skipped
+			title := fmt.Sprintf("%s  ·  %s  ·  total %d  (new %d · skipped %d)  ·  malware %d",
+				s.time, orDash(s.mode), totalFiles, s.scanned, s.skipped, s.threats)
+			if s.status != "" && s.status != "finished" && s.status != "completed" {
+				title = fmt.Sprintf("%s  [%s]", title, s.status)
+			}
+			var detail fyne.CanvasObject
+			if len(s.items) == 0 {
+				detail = container.NewVBox(
+					muted("No newly scanned paths in this run."),
+					muted("Unchanged files were skipped and are not listed."),
+				)
+			} else {
+				rows := make([]fyne.CanvasObject, 0, len(s.items)+2)
+				rows = append(rows, muted(fmt.Sprintf(
+					"Newly scanned paths in this run (%d shown). Malware shows rule + engine.",
+					len(s.items))))
+				rows = append(rows, vspace(6))
+				for _, it := range s.items {
+					infected := strings.EqualFold(it.result, "infected")
+					accent := colorSuccess
+					resultTag := "CLEAN"
+					if infected {
+						accent = colorError
+						resultTag = "MALWARE"
+					}
+					engine := strings.TrimSpace(it.engine)
+					if engine == "" {
+						engine = "—"
+					} else {
+						engine = strings.ToUpper(engine)
+					}
+					rule := strings.TrimSpace(it.rule)
+					if rule == "" {
+						if infected {
+							rule = "(unknown rule)"
+						} else {
+							rule = "—"
+						}
+					}
+					titleLine := fmt.Sprintf("[%s]  %s", resultTag, clip(filepath.Base(it.path), 42))
+					detailLine := fmt.Sprintf("engine %s  ·  rule %s", engine, rule)
+					if it.score != "" && it.score != "0" {
+						detailLine += "  ·  score " + it.score
+					}
+					detailLine += "  ·  " + it.path
+					rows = append(rows, container.NewVBox(
+						heading(titleLine, 12, accent),
+						muted(clip(detailLine, 110)),
+						vspace(6),
+					))
+				}
+				if s.fileTotal > len(s.items) {
+					rows = append(rows, muted(fmt.Sprintf("Showing %d of %d newly scanned files", len(s.items), s.fileTotal)))
+				}
+				detail = container.NewVBox(rows...)
+			}
+			acc.Append(widget.NewAccordionItem(title, container.NewPadded(detail)))
+		}
+		return acc, lastTotal, lastNew, lastMalware
 	}
 
 	stop := make(chan struct{})
@@ -481,62 +689,46 @@ func (r *Router) showReports(setPage func(fyne.CanvasObject)) {
 		qItems, _ := r.client.Quarantine(r.ctx)
 		rules, _ := r.client.RulesInfo(r.ctx)
 		st, _ := r.client.GetSettings(r.ctx)
-		scan, _ := r.client.ScanStatus(r.ctx)
-		hist, _ := r.client.History(r.ctx, 120)
+		hist, _ := r.client.History(r.ctx, 250)
 
-		threats := scan.Threats
-		for _, e := range hist {
-			if e.Kind == "scan.end" {
-				if !scan.Scanning {
-					threats = scan.Threats
-				}
-				break
-			}
-		}
-
-		newDet := make([]dashRow, 0, 8)
+		newDet := make([]dashRow, 0, 12)
 		for _, it := range qItems {
-			if len(newDet) >= 8 {
+			if len(newDet) >= 12 {
 				break
 			}
 			newDet = append(newDet, dashRow{
 				Time:   shortTime(it.IsolatedAt),
 				Title:  clip(it.FileName, 40),
-				Detail: clip(it.ThreatType+"  ·  "+it.OriginalPath, 64),
+				Detail: clip("quarantine  ·  "+it.ThreatType+"  ·  "+it.OriginalPath, 72),
 				Accent: colorError,
 			})
 		}
 		for _, e := range hist {
-			if len(newDet) >= 8 {
+			if len(newDet) >= 12 {
 				break
 			}
-			if !isDetectKind(e.Kind) {
+			if e.Kind != "scan.threat" {
 				continue
 			}
-			if strings.HasPrefix(e.Kind, "scan.item") && !strings.Contains(strings.ToLower(e.Message), "threat") {
-				continue
+			path := metaStr(e.Meta, "path")
+			if path == "" {
+				path = e.Message
 			}
+			rule := metaStr(e.Meta, "rule")
+			engine := metaStr(e.Meta, "engine")
+			if engine == "" {
+				engine = "yara"
+			}
+			detail := fmt.Sprintf("engine %s", strings.ToUpper(engine))
+			if rule != "" {
+				detail += "  ·  rule " + rule
+			}
+			detail += "  ·  " + path
 			newDet = append(newDet, dashRow{
 				Time:   shortTime(e.Time),
-				Title:  clip(e.Kind, 36),
-				Detail: clip(e.Message, 64),
-				Accent: kindColor(e.Kind),
-			})
-		}
-
-		newAlerts := make([]dashRow, 0, 8)
-		for _, e := range hist {
-			if len(newAlerts) >= 8 {
-				break
-			}
-			if e.Kind != "ui.notify" {
-				continue
-			}
-			newAlerts = append(newAlerts, dashRow{
-				Time:   shortTime(e.Time),
-				Title:  "Mailbox",
-				Detail: clip(humanizeNotifyMessage(e.Message), 72),
-				Accent: colorPrimary,
+				Title:  clip(filepath.Base(path), 40),
+				Detail: clip(detail, 90),
+				Accent: colorError,
 			})
 		}
 
@@ -551,18 +743,22 @@ func (r *Router) showReports(setPage func(fyne.CanvasObject)) {
 			}
 		}
 
+		histUI, lastTotal, lastNew, lastMalware := buildScanHistory(hist)
+
 		fyne.Do(func() {
+			kpiLastFiles.Text = fmtCount(lastTotal)
+			kpiLastNew.Text = fmtCount(lastNew)
+			kpiLastMalware.Text = fmtCount(lastMalware)
 			kpiQuarantine.Text = fmtCount(len(qItems))
-			kpiThreats.Text = fmtCount(threats)
 			kpiRules.Text = fmtCount(rules.Count)
 			kpiSsdeep.Text = ssdeepLabel
 			kpiSsdeep.Color = ssdeepColor
-			kpiSync.Text = shortTime(st.LastTISyncRun)
+			kpiLastFiles.Refresh()
+			kpiLastNew.Refresh()
+			kpiLastMalware.Refresh()
 			kpiQuarantine.Refresh()
-			kpiThreats.Refresh()
 			kpiRules.Refresh()
 			kpiSsdeep.Refresh()
-			kpiSync.Refresh()
 
 			formatOnOff(st.RealtimeShield, protRT)
 			formatOnOff(st.USBProtection, protUSB)
@@ -570,9 +766,10 @@ func (r *Router) showReports(setPage func(fyne.CanvasObject)) {
 			formatOnOff(st.QuarantineOnDetect, protQuar)
 
 			detRows = newDet
-			alertRows = newAlerts
 			detList.Refresh()
-			alertList.Refresh()
+
+			scanHistBox.Objects = []fyne.CanvasObject{histUI}
+			scanHistBox.Refresh()
 		})
 	}
 

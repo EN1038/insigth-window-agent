@@ -25,4 +25,5 @@ type Service interface {
 	RulesInfo() RulesInfoResponse
 	SsdeepInfo() SsdeepInfoResponse
 	QuarantineList() []QuarantineItem
+	ScanRunFiles(runID string, offset, limit int) (rows []ScanRunFile, total int)
 }

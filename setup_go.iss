@@ -7,8 +7,8 @@
 [Setup]
 AppId={{A3C8F2E1-9B4D-4E7A-8C1F-2D5E6A9B0C3D}
 AppName=SOSECURE Threat inSight
-AppVersion=5.6.0.0
-AppVerName=SOSECURE Threat inSight 5.6 (Go)
+AppVersion=5.7.1.0
+AppVerName=SOSECURE Threat inSight 5.7.1 (Go)
 AppPublisher=SOSECURE
 AppPublisherURL=https://sosecure.co.th/
 DefaultDirName={autopf}\SOSECURE\Threat inSight
@@ -20,7 +20,7 @@ UninstallDisplayIcon={app}\app.ico
 WizardStyle=modern
 LicenseFile=LICENSE.txt
 OutputDir=Output
-OutputBaseFilename=SOSECURE_Threat_inSight_Go_Setup_v5.6.0
+OutputBaseFilename=SOSECURE_Threat_inSight_Go_Setup_v5.7.1
 Compression=lzma2/ultra64
 SolidCompression=no
 MinVersion=6.3

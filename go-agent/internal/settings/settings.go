@@ -22,6 +22,9 @@ const (
 	// KeyYaraTimeoutSec aborts a yara64 invocation after N seconds (-a). 0 = disabled.
 	KeyYaraTimeoutSec = "yara_timeout_sec"
 	KeyRulesVersion     = "rules_version"
+	// Disabled YARA catalog entries from Center getRule (status!=Y) for this agent.
+	KeyDisabledRuleFiles = "disabled_rule_files" // basename list, ";"
+	KeyDisabledRuleNames = "disabled_rule_names" // rule identifiers, ";"
 	// YARA catalog counts from Center getRule vs local encrypted store.
 	KeyServerRulesCount = "server_rules_count"
 	KeyLocalRulesCount  = "local_rules_count"
@@ -38,7 +41,7 @@ const (
 	KeyAutoScanOnLogin  = "auto_scan_on_login"
 	KeyUSBProtection    = "usb_protection"
 	KeyRealtimeShield   = "realtime_shield"
-	// Daily / interval schedule keys (minutes as decimal string; legacy HH:mm normalized on read).
+	// Daily batch (HH:mm) / interval schedule keys (TI sync + agent update as minutes).
 	KeyBatchJobEveryDay = "batchjob_everydate"
 	KeyLastBatchJobRun  = "last_batchjob_run"
 	KeyTISyncEveryDay   = "ti_sync_everydate"
@@ -95,12 +98,11 @@ const DefaultScanExtensions = "" +
 	".img,.iso"
 
 // LegacyExclusionPaths is the pre–market-AV default that blanked most of the disk
-// from Full scan. Installs still on this list are upgraded once on load.
+// from Full scan. Installs still on this list are cleared once on load (operator adds paths).
 const LegacyExclusionPaths = `\windows;\$recycle.bin;\system volume information;\program files;\program files (x86);\programdata`
 
-// DefaultExclusionPaths follows consumer AV practice: Full scan covers user data
-// and Program Files, while skipping only high-churn / dangerous system areas.
-const DefaultExclusionPaths = "" +
+// MarketExclusionPaths was the previous built-in default; cleared so operators start empty.
+const MarketExclusionPaths = "" +
 	`\$recycle.bin;` +
 	`\system volume information;` +
 	`\windows\winsxs;` +
@@ -110,6 +112,9 @@ const DefaultExclusionPaths = "" +
 	`\windows\installer;` +
 	`\programdata\microsoft\windows defender;` +
 	`\programdata\microsoft\windows\wer`
+
+// DefaultExclusionPaths is empty — operators add exclusions themselves.
+const DefaultExclusionPaths = ""
 
 // HardExclusions are always applied (even if the operator clears exclusion_paths).
 func HardExclusions() []string {
@@ -122,7 +127,7 @@ func HardExclusions() []string {
 	}
 }
 
-// DefaultQuickScanPaths matches typical AV "quick/fast" coverage.
+// DefaultQuickScanPaths is built-in path-limited coverage for schedule/login scans.
 const DefaultQuickScanPaths = `%USERPROFILE%\Downloads;%USERPROFILE%\Desktop;%USERPROFILE%\Documents;%TEMP%;%APPDATA%`
 
 // LegacyQuickScanPaths is upgraded once when still at the older default.
@@ -161,6 +166,8 @@ func (s *Store) setDefaults() {
 	def(KeyYaraFastScan, "true")
 	def(KeyYaraTimeoutSec, "0")
 	def(KeyRulesVersion, "1.1")
+	def(KeyDisabledRuleFiles, "")
+	def(KeyDisabledRuleNames, "")
 	def(KeyServerRulesCount, "0")
 	def(KeyLocalRulesCount, "0")
 	def(KeyServerRuleFilesCount, "0")
@@ -175,15 +182,15 @@ func (s *Store) setDefaults() {
 	def(KeyAutoScanOnLogin, "false")
 	def(KeyUSBProtection, "true")
 	def(KeyRealtimeShield, "true")
-	def(KeyBatchJobEveryDay, strconv.Itoa(DefaultBatchIntervalMinutes))
+	def(KeyBatchJobEveryDay, DefaultBatchDailyHHmm)
 	def(KeyTISyncEveryDay, strconv.Itoa(DefaultTISyncIntervalMinutes))
 	def(KeyAPISecret, "")
-	def(KeySsdeepEnabled, "true")
+	def(KeySsdeepEnabled, forcedBoolStr(ForcedSsdeepEnabled))
 	def(KeySsdeepThreshold, "85")
-	def(KeySsdeepReportAPI, "true")
+	def(KeySsdeepReportAPI, forcedBoolStr(ForcedSsdeepReportAPI))
 	def(KeySsdeepDBVersion, "")
-	def(KeySendSsdeepCandidate, "false")
-	def(KeyQuarantineOnDetect, "true")
+	def(KeySendSsdeepCandidate, forcedBoolStr(ForcedSendSsdeepCandidate))
+	def(KeyQuarantineOnDetect, forcedBoolStr(ForcedQuarantineOnDetect))
 	def(KeyAuthorizedServiceStop, "false")
 	def(KeyStandaloneScan, "false")
 	def(KeyConfigUpdatedAt, "0")
@@ -239,6 +246,9 @@ func (s *Store) Load() error {
 	}
 	s.mu.Unlock()
 	if changed {
+		_ = s.Save()
+	}
+	if s.ApplyForcedPolicy() {
 		_ = s.Save()
 	}
 	return nil
@@ -325,9 +335,12 @@ func (s *Store) migrateMarketScanDefaultsLocked() bool {
 		v = strings.ReplaceAll(v, " ", "")
 		return v
 	}
-	if cur, ok := s.Values[KeyExclusionPaths]; ok && norm(cur) == norm(LegacyExclusionPaths) {
-		s.Values[KeyExclusionPaths] = DefaultExclusionPaths
-		changed = true
+	if cur, ok := s.Values[KeyExclusionPaths]; ok {
+		ncur := norm(cur)
+		if ncur == norm(LegacyExclusionPaths) || ncur == norm(MarketExclusionPaths) {
+			s.Values[KeyExclusionPaths] = DefaultExclusionPaths
+			changed = true
+		}
 	}
 	if cur, ok := s.Values[KeyQuickScanPaths]; ok && norm(cur) == norm(LegacyQuickScanPaths) {
 		s.Values[KeyQuickScanPaths] = DefaultQuickScanPaths
@@ -406,10 +419,42 @@ func (s *Store) mergeDefaultScanExtensionsLocked() bool {
 	return true
 }
 
-func (s *Store) QuickScanPaths() []string {
-	raw := s.Get(KeyQuickScanPaths, "")
-	if raw == "" {
-		return nil
+// ApplyForcedPolicy locks product-policy ssdeep flags (UI is hidden).
+func (s *Store) ApplyForcedPolicy() bool {
+	if s == nil {
+		return false
+	}
+	changed := false
+	set := func(key string, want bool) {
+		cur := strings.ToLower(strings.TrimSpace(s.Get(key, "")))
+		wantStr := forcedBoolStr(want)
+		if cur != wantStr {
+			s.Set(key, wantStr)
+			changed = true
+		}
+	}
+	set(KeySsdeepEnabled, ForcedSsdeepEnabled)
+	set(KeySsdeepReportAPI, ForcedSsdeepReportAPI)
+	set(KeyQuarantineOnDetect, ForcedQuarantineOnDetect)
+	set(KeySendSsdeepCandidate, ForcedSendSsdeepCandidate)
+	return changed
+}
+
+func forcedBoolStr(v bool) string {
+	if v {
+		return "true"
+	}
+	return "false"
+}
+
+// TargetedScanPaths returns path-limited coverage used by schedule and login scans.
+// Built-in defaults always apply; optional custom list only when FeatureTargetedScanCustomPaths.
+func (s *Store) TargetedScanPaths() []string {
+	raw := DefaultQuickScanPaths
+	if FeatureTargetedScanCustomPaths {
+		if v := strings.TrimSpace(s.Get(KeyQuickScanPaths, "")); v != "" {
+			raw = v
+		}
 	}
 	parts := strings.Split(raw, ";")
 	seen := map[string]struct{}{}

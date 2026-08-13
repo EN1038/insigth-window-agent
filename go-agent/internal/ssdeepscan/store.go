@@ -222,6 +222,28 @@ func (s *Store) MergeSignatures(incoming []Signature) (int, error) {
 	return countMap(byBlock), nil
 }
 
+// HasExactHash reports whether the exact fuzzy hash is already in the local store.
+func (s *Store) HasExactHash(hash string) bool {
+	h := strings.TrimSpace(hash)
+	if h == "" {
+		return false
+	}
+	bs, ok := parseBlockSize(h)
+	if !ok {
+		return false
+	}
+	list, err := s.LoadShard(bs)
+	if err != nil {
+		return false
+	}
+	for _, sig := range list {
+		if strings.TrimSpace(sig.Hash) == h {
+			return true
+		}
+	}
+	return false
+}
+
 func (s *Store) Total() (int, error) {
 	idx, err := s.LoadIndex()
 	if err != nil {

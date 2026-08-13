@@ -336,7 +336,7 @@ func (r *Runner) startPostApproval(ctx context.Context) {
 			if needBootstrap {
 				r.runThreatIntelBootstrap(ctx)
 			}
-			// Scan engine only after TI is ready so Quick/Full Scan do not hit empty stores.
+			// Scan engine only after TI is ready so Full/Custom Scan do not hit empty stores.
 			r.startScanSubsystem(ctx)
 			go r.configSyncLoop(ctx)
 			go r.tiSyncScheduleLoop(ctx)
@@ -532,20 +532,29 @@ func (r *Runner) ensureAutoScheduleDefaults() {
 		r.Settings.Set(settings.KeyAgentUpdateSchedule, strconv.Itoa(settings.DefaultAgentUpdateIntervalMinutes))
 		changed = true
 	} else {
-		n := settings.NormalizeIntervalMinutes(upd, settings.DefaultAgentUpdateIntervalMinutes)
+		n := settings.NormalizeAgentUpdateMinutes(upd, settings.DefaultAgentUpdateIntervalMinutes)
 		if strconv.Itoa(n) != upd {
 			r.Settings.Set(settings.KeyAgentUpdateSchedule, strconv.Itoa(n))
 			changed = true
 		}
 	}
 	batch := strings.TrimSpace(r.Settings.Get(settings.KeyBatchJobEveryDay, ""))
-	if batch == "" || strings.Contains(batch, ":") {
-		r.Settings.Set(settings.KeyBatchJobEveryDay, strconv.Itoa(settings.DefaultBatchIntervalMinutes))
+	if batch == "" || !strings.Contains(batch, ":") {
+		r.Settings.Set(settings.KeyBatchJobEveryDay, settings.DefaultBatchDailyHHmm)
 		changed = true
+	} else {
+		n := settings.NormalizeDailyHHmm(batch, settings.DefaultBatchDailyHHmm)
+		if n != batch {
+			r.Settings.Set(settings.KeyBatchJobEveryDay, n)
+			changed = true
+		}
 	}
 	if changed {
 		_ = r.Settings.Save()
-		_ = r.History.Append("config.ok", "auto schedules normalized (TI/rules+ssdeep, agent update, batch)", nil)
+		_ = r.History.Append("config.ok", "auto schedules normalized (TI/rules+ssdeep, agent update, batch daily time)", nil)
+	}
+	if r.Settings.ApplyForcedPolicy() {
+		_ = r.Settings.Save()
 	}
 }
 

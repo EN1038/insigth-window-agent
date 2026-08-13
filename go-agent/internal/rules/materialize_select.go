@@ -41,7 +41,7 @@ type ruleCandidate struct {
 	skipWhy  string
 }
 
-func buildScanIncludeList(destRoot string, written []string) []string {
+func buildScanIncludeList(destRoot string, written []string, denyFiles, denyNames map[string]bool) []string {
 	cands := make([]ruleCandidate, 0, len(written))
 	for _, rel := range written {
 		rel = normalizeRel(rel)
@@ -104,6 +104,21 @@ func buildScanIncludeList(destRoot string, written []string) []string {
 			continue
 		}
 		base := strings.ToLower(filepath.Base(c.rel))
+		if denyFiles != nil && (denyFiles[base] || denyFiles[strings.TrimSuffix(base, filepath.Ext(base))]) {
+			continue
+		}
+		if denyNames != nil {
+			denied := false
+			for _, id := range c.ruleIDs {
+				if denyNames[strings.ToLower(id)] {
+					denied = true
+					break
+				}
+			}
+			if denied {
+				continue
+			}
+		}
 		if prev, ok := seenBase[base]; ok {
 			_ = prev
 			continue

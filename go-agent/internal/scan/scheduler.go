@@ -2,7 +2,6 @@ package scan
 
 import (
 	"context"
-	"strings"
 	"time"
 
 	"github.com/sosecure/insite-agent/internal/settings"
@@ -34,26 +33,19 @@ func (s *Scheduler) tick() {
 	if s.Manager == nil || s.Settings == nil || s.Manager.IsScanning() {
 		return
 	}
-	mins := settings.NormalizeIntervalMinutes(
+	schedule := settings.NormalizeDailyHHmm(
 		s.Settings.Get(settings.KeyBatchJobEveryDay, ""),
-		settings.DefaultBatchIntervalMinutes,
+		settings.DefaultBatchDailyHHmm,
 	)
 	last := s.Settings.Get(settings.KeyLastBatchJobRun, "")
 	now := time.Now()
-	// First boot / empty stamp: IntervalDue("") == true. Arm the clock without
-	// scanning so install + first login does not look like "auto scan on login".
-	if strings.TrimSpace(last) == "" {
-		s.Settings.Set(settings.KeyLastBatchJobRun, settings.FormatIntervalRunStamp(now))
-		_ = s.Settings.Save()
-		return
-	}
-	if !settings.IntervalDue(last, mins, now) {
+	if !settings.DailyDue(schedule, last, now) {
 		return
 	}
 	// Only stamp last-run after the scan actually starts.
-	if !s.Manager.StartScheduledQuickScan() {
+	if !s.Manager.StartScheduledScan() {
 		return
 	}
-	s.Settings.Set(settings.KeyLastBatchJobRun, settings.FormatIntervalRunStamp(now))
+	s.Settings.Set(settings.KeyLastBatchJobRun, settings.FormatDailyRunStamp(now))
 	_ = s.Settings.Save()
 }

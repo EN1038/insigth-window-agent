@@ -40,7 +40,7 @@ type LoginResponse struct {
 }
 
 type ScanStartRequest struct {
-	Type string `json:"type"` // quick|full|custom|auto
+	Type string `json:"type"` // full|custom
 	Path string `json:"path,omitempty"`
 }
 
@@ -107,9 +107,10 @@ type UpdateSettingsRequest struct {
 }
 
 type HistoryEvent struct {
-	Time    string `json:"time"`
-	Kind    string `json:"kind"`
-	Message string `json:"message"`
+	Time    string         `json:"time"`
+	Kind    string         `json:"kind"`
+	Message string         `json:"message"`
+	Meta    map[string]any `json:"meta,omitempty"`
 }
 
 type RulesInfoResponse struct {
@@ -136,6 +137,23 @@ type QuarantineItem struct {
 	OriginalPath string `json:"original_path"`
 	ThreatType   string `json:"threat_type"`
 	IsolatedAt   string `json:"isolated_at"`
+}
+
+type ScanRunFile struct {
+	Path      string  `json:"path"`
+	Result    string  `json:"result"`
+	Rule      string  `json:"rule,omitempty"`
+	Engine    string  `json:"engine,omitempty"`
+	Score     float64 `json:"score,omitempty"`
+	ScannedAt string  `json:"scanned_at,omitempty"`
+}
+
+type ScanRunFilesResponse struct {
+	RunID  string        `json:"run_id"`
+	Total  int           `json:"total"`
+	Offset int           `json:"offset"`
+	Limit  int           `json:"limit"`
+	Rows   []ScanRunFile `json:"rows"`
 }
 
 type OKResponse struct {

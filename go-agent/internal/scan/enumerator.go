@@ -40,8 +40,8 @@ func (e *Enumerator) Stop() {
 	e.stop = true
 }
 
-func (e *Enumerator) EnumerateQuick() {
-	for _, p := range e.settings.QuickScanPaths() {
+func (e *Enumerator) EnumerateTargeted() {
+	for _, p := range e.settings.TargetedScanPaths() {
 		if e.stop {
 			return
 		}

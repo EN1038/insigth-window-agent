@@ -45,6 +45,7 @@ func (s *Server) Listen(ctx context.Context, addr string) error {
 	mux.HandleFunc("/v1/ssdeep/info", s.auth(s.handleSsdeepInfo))
 	mux.HandleFunc("/v1/quarantine", s.auth(s.handleQuarantine))
 	mux.HandleFunc("/v1/history", s.auth(s.handleHistory))
+	mux.HandleFunc("/v1/scan/files", s.auth(s.handleScanFiles))
 	mux.HandleFunc("/v1/service/install", s.auth(s.handleServiceInstall))
 
 	ln, err := net.Listen("tcp", addr)
@@ -249,18 +250,17 @@ func (s *Server) handleScanStart(w http.ResponseWriter, r *http.Request) {
 	mgr := sr.Manager
 	started := false
 	switch strings.ToLower(req.Type) {
-	case "quick":
-		started = mgr.StartQuickScan()
 	case "full":
 		started = mgr.StartFullScan()
-	case "auto":
-		started = mgr.StartAutoScan()
 	case "custom":
 		if strings.TrimSpace(req.Path) == "" {
 			writeJSON(w, OKResponse{OK: false, Message: "path required"})
 			return
 		}
 		started = mgr.StartCustomScan(req.Path)
+	case "quick", "auto":
+		writeJSON(w, OKResponse{OK: false, Message: "quick/auto scan removed; use full or custom"})
+		return
 	default:
 		writeJSON(w, OKResponse{OK: false, Message: "unknown scan type"})
 		return
@@ -477,13 +477,57 @@ func (s *Server) handleHistory(w http.ResponseWriter, r *http.Request) {
 	}
 	out := make([]HistoryEvent, 0, len(events))
 	for _, ev := range events {
-		out = append(out, HistoryEvent{
+		he := HistoryEvent{
 			Time:    ev.TimeRFC3339,
 			Kind:    ev.Kind,
 			Message: ev.Message,
-		})
+		}
+		if m, ok := ev.Meta.(map[string]any); ok {
+			he.Meta = m
+		} else if ev.Meta != nil {
+			// JSON round-trip often yields map[string]interface{} already;
+			// if Meta was rehydrated from stored JSON it may be map[string]any.
+			if raw, err := json.Marshal(ev.Meta); err == nil {
+				var mm map[string]any
+				if json.Unmarshal(raw, &mm) == nil {
+					he.Meta = mm
+				}
+			}
+		}
+		out = append(out, he)
 	}
 	writeJSON(w, out)
+}
+
+func (s *Server) handleScanFiles(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	runID := strings.TrimSpace(r.URL.Query().Get("run_id"))
+	offset := 0
+	limit := 200
+	if v := r.URL.Query().Get("offset"); v != "" {
+		if n, err := strconv.Atoi(v); err == nil && n >= 0 {
+			offset = n
+		}
+	}
+	if v := r.URL.Query().Get("limit"); v != "" {
+		if n, err := strconv.Atoi(v); err == nil && n > 0 {
+			limit = n
+		}
+	}
+	rows, total := s.svc.ScanRunFiles(runID, offset, limit)
+	if rows == nil {
+		rows = []ScanRunFile{}
+	}
+	writeJSON(w, ScanRunFilesResponse{
+		RunID:  runID,
+		Total:  total,
+		Offset: offset,
+		Limit:  limit,
+		Rows:   rows,
+	})
 }
 
 func (s *Server) handleServiceInstall(w http.ResponseWriter, r *http.Request) {
@@ -509,20 +553,20 @@ func settingsView(st *settings.Store) SettingsView {
 		RealtimeShield:      st.GetBool(settings.KeyRealtimeShield),
 		USBProtection:       st.GetBool(settings.KeyUSBProtection),
 		AutoScanOnLogin:     st.GetBool(settings.KeyAutoScanOnLogin),
-		BatchJobEveryDay:    strconv.Itoa(settings.NormalizeIntervalMinutes(st.Get(settings.KeyBatchJobEveryDay, ""), settings.DefaultBatchIntervalMinutes)),
+		BatchJobEveryDay:    settings.NormalizeDailyHHmm(st.Get(settings.KeyBatchJobEveryDay, ""), settings.DefaultBatchDailyHHmm),
 		TISyncEveryDay:      strconv.Itoa(settings.NormalizeIntervalMinutes(st.Get(settings.KeyTISyncEveryDay, ""), settings.DefaultTISyncIntervalMinutes)),
-		AgentUpdateSchedule: strconv.Itoa(settings.NormalizeIntervalMinutes(st.Get(settings.KeyAgentUpdateSchedule, ""), settings.DefaultAgentUpdateIntervalMinutes)),
+		AgentUpdateSchedule: strconv.Itoa(settings.NormalizeAgentUpdateMinutes(st.Get(settings.KeyAgentUpdateSchedule, ""), settings.DefaultAgentUpdateIntervalMinutes)),
 		AgentVersionCurrent: st.Get(settings.KeyAgentVersionCurrent, ""),
 		AgentVersionTarget:  st.Get(settings.KeyAgentVersionTarget, ""),
 		AgentUpdateStatus:   st.Get(settings.KeyAgentUpdateStatus, ""),
 		ExclusionPaths:      strings.ReplaceAll(st.Get(settings.KeyExclusionPaths, ""), ";", "\n"),
 		ScanExtensions:      st.Get(settings.KeyScanExtensions, ""),
 		QuickScanPaths:      strings.ReplaceAll(st.Get(settings.KeyQuickScanPaths, ""), ";", "\n"),
-		SsdeepEnabled:       st.GetBool(settings.KeySsdeepEnabled),
+		SsdeepEnabled:       settings.ForcedSsdeepEnabled,
 		SsdeepThreshold:     st.Get(settings.KeySsdeepThreshold, "85"),
-		SsdeepReportAPI:     st.GetBool(settings.KeySsdeepReportAPI),
-		QuarantineOnDetect:  st.GetBool(settings.KeyQuarantineOnDetect),
-		SendSsdeepCandidate: st.GetBool(settings.KeySendSsdeepCandidate),
+		SsdeepReportAPI:     settings.ForcedSsdeepReportAPI,
+		QuarantineOnDetect:  settings.ForcedQuarantineOnDetect,
+		SendSsdeepCandidate: settings.ForcedSendSsdeepCandidate,
 		LogLevel:            st.Get(settings.KeyLogLevel, "info"),
 		CacheExpiryHours:    st.Get(settings.KeyCacheExpiryHours, "168"),
 		RulesVersion:        st.Get(settings.KeyRulesVersion, ""),
@@ -544,13 +588,13 @@ func applySettings(st *settings.Store, req UpdateSettingsRequest) {
 		st.Set(settings.KeyAutoScanOnLogin, boolStr(*req.AutoScanOnLogin))
 	}
 	if req.BatchJobEveryDay != "" {
-		st.Set(settings.KeyBatchJobEveryDay, strconv.Itoa(settings.NormalizeIntervalMinutes(req.BatchJobEveryDay, settings.DefaultBatchIntervalMinutes)))
+		st.Set(settings.KeyBatchJobEveryDay, settings.NormalizeDailyHHmm(req.BatchJobEveryDay, settings.DefaultBatchDailyHHmm))
 	}
 	if req.TISyncEveryDay != "" {
 		st.Set(settings.KeyTISyncEveryDay, strconv.Itoa(settings.NormalizeIntervalMinutes(req.TISyncEveryDay, settings.DefaultTISyncIntervalMinutes)))
 	}
 	if req.AgentUpdateSchedule != "" {
-		st.Set(settings.KeyAgentUpdateSchedule, strconv.Itoa(settings.NormalizeIntervalMinutes(req.AgentUpdateSchedule, settings.DefaultAgentUpdateIntervalMinutes)))
+		st.Set(settings.KeyAgentUpdateSchedule, strconv.Itoa(settings.NormalizeAgentUpdateMinutes(req.AgentUpdateSchedule, settings.DefaultAgentUpdateIntervalMinutes)))
 	}
 	// Path lists are pointers so partial updates (e.g. Overview TYPE SCAN) do not wipe them.
 	if req.ExclusionPaths != nil {
@@ -593,6 +637,7 @@ func applySettings(st *settings.Store, req UpdateSettingsRequest) {
 	}
 	// Local Settings save wins until a newer Center edit arrives.
 	st.Set(settings.KeyConfigUpdatedAt, strconv.FormatInt(time.Now().Unix(), 10))
+	_ = st.ApplyForcedPolicy()
 }
 
 func boolStr(v bool) string {

@@ -16,6 +16,7 @@ import (
 	"github.com/sosecure/insite-agent/internal/quarantine"
 	"github.com/sosecure/insite-agent/internal/reportq"
 	"github.com/sosecure/insite-agent/internal/rules"
+	"github.com/sosecure/insite-agent/internal/scanrun"
 	"github.com/sosecure/insite-agent/internal/settings"
 	"github.com/sosecure/insite-agent/internal/snapshot"
 	"github.com/sosecure/insite-agent/internal/ssdeepscan"
@@ -31,6 +32,7 @@ type Manager struct {
 	Rules      *rules.Store
 	Quarantine *quarantine.Store
 	ReportQ    *reportq.Queue
+	ScanRuns   *scanrun.Store
 
 	// OnScanIdle runs after a scan completes or is stopped (async, may be nil).
 	OnScanIdle func()
@@ -51,7 +53,7 @@ type Manager struct {
 	status   StatusInfo
 
 	// Realtime (silent) session totals — accumulate across file events until a
-	// FULL / QUICK / CUSTOM / AUTO on-demand scan starts (then reset to 0).
+	// FULL / CUSTOM / TARGETED (schedule|login) on-demand scan starts (then reset to 0).
 	rtSessionMu      sync.Mutex
 	rtSessionScanned int
 	rtSessionThreats int
@@ -138,6 +140,7 @@ func NewManager(baseDir string, st *settings.Store, snap *snapshot.Store, apiCli
 		Rules:      ruleStore,
 		Quarantine: quar,
 		ReportQ:    rq,
+		ScanRuns:   scanrun.New(baseDir),
 		scanner:    NewScannerFromSettings(yaraPath, st),
 		ssdeep:     ssdeepscan.NewMatcher(baseDir, threshold),
 	}
@@ -163,22 +166,15 @@ const maxPendingSilent = 200
 // Start* methods return false when a scan is already running (except silent,
 // which is queued). Callers must not assume work started on a false return.
 
-func (m *Manager) StartQuickScan() bool {
-	// Always force a full pass for quick paths. Snapshot skip made QUICK SCAN
-	// finish immediately (scanned=0) when files were previously scanned.
-	return m.start(ScanQuick, "", true, SourceManual)
+func (m *Manager) StartScheduledScan() bool {
+	return m.start(ScanTargeted, "", true, SourceSchedule)
 }
 
-func (m *Manager) StartScheduledQuickScan() bool {
-	return m.start(ScanQuick, "", true, SourceSchedule)
-}
-
-func (m *Manager) StartLoginQuickScan() bool {
-	return m.start(ScanQuick, "", true, SourceLogin)
+func (m *Manager) StartLoginScan() bool {
+	return m.start(ScanTargeted, "", true, SourceLogin)
 }
 
 func (m *Manager) StartFullScan() bool { return m.start(ScanFull, "", true, SourceManual) }
-func (m *Manager) StartAutoScan() bool { return m.start(ScanAuto, "", true, SourceManual) }
 
 func (m *Manager) StartSilentScan(path string) bool {
 	return m.start(ScanSilent, path, false, SourceRealtime)
@@ -310,7 +306,9 @@ func (m *Manager) scanWork(scanType ScanType, customPath string, scanAll bool, s
 		m.setStatus(func(s *StatusInfo) { s.Source = source })
 	}
 
+	runID := newScanRunID()
 	_ = m.History.Append("scan.start", fmt.Sprintf("scan started: %s", scanType), map[string]any{
+		"run_id": runID,
 		"mode":   APIMode(scanType, source),
 		"source": source,
 	})
@@ -334,7 +332,6 @@ func (m *Manager) scanWork(scanType ScanType, customPath string, scanAll bool, s
 	rulePaths := append([]string(nil), m.rulePaths...)
 	m.mu.Unlock()
 
-	runID := newScanRunID()
 	if verbose {
 		m.setStatus(func(s *StatusInfo) {
 			s.Status = "discovering"
@@ -365,9 +362,10 @@ func (m *Manager) scanWork(scanType ScanType, customPath string, scanAll bool, s
 			return
 		}
 		skipN := int(skipped.Load())
+		proc := int(sc) + skipN
 		base := filepath.Base(pathOrDir)
 		m.setStatus(func(s *StatusInfo) {
-			m.paintCounts(s, int(sc), int(n), int(threats.Load()))
+			m.paintCounts(s, proc, int(n), int(threats.Load()))
 			s.Skipped = skipN
 			s.DiscoveryDone = false
 			// Keep status as discovering until enumerator finishes so UI does not
@@ -378,8 +376,8 @@ func (m *Manager) scanWork(scanType ScanType, customPath string, scanAll bool, s
 			if base != "" && base != "." {
 				s.CurrentFile = base
 			}
-			if sc > 0 {
-				s.Message = fmt.Sprintf("Discovering… found %d · scanned %d", s.Total, s.Scanned)
+			if proc > 0 {
+				s.Message = fmt.Sprintf("Discovering… found %d · processed %d", s.Total, s.Scanned)
 			} else {
 				s.Message = fmt.Sprintf("Discovering files… %d found", s.Total)
 			}
@@ -396,8 +394,8 @@ func (m *Manager) scanWork(scanType ScanType, customPath string, scanAll bool, s
 
 	go func() {
 		defer queue.Complete()
-		// Full/Auto ignore extension filters so the pass is not artificially narrow.
-		allExt := scanType == ScanFull || scanType == ScanAuto
+		// Full scan ignores extension filters so the pass is not artificially narrow.
+		allExt := scanType == ScanFull
 		enum := NewEnumerator(m.Settings, scanAll, allExt)
 		enum.OnDirectory = func(dir string) {
 			if stopped() {
@@ -424,7 +422,24 @@ func (m *Manager) scanWork(scanType ScanType, customPath string, scanAll bool, s
 			if !scanAll && scanType != ScanSilent {
 				if rec, ok := m.Snapshot.Get(item.Path); ok {
 					if !rec.NeedsRescan(item.Size, item.LastWriteUnix, result.RulesVersion) {
-						skipped.Add(1)
+						sk := skipped.Add(1)
+						// Skipped files still count toward progress (processed = scanned+skipped).
+						proc := int(scanned.Load()) + int(sk)
+						tot := int(totalFound.Load())
+						m.setStatus(func(s *StatusInfo) {
+							m.paintCounts(s, proc, tot, int(threats.Load()))
+							s.Skipped = int(sk)
+							if s.DiscoveryDone {
+								s.Status = "scanning"
+								s.Message = fmt.Sprintf("Scanning… %d / %d", s.Scanned, s.Total)
+							} else {
+								s.Status = "discovering"
+								s.Message = fmt.Sprintf("Discovering… found %d · processed %d", s.Total, s.Scanned)
+							}
+							s.CurrentPath = item.Path
+							s.CurrentFile = filepath.Base(item.Path)
+							s.CurrentEngine = "skip"
+						})
 						return
 					}
 				}
@@ -433,8 +448,8 @@ func (m *Manager) scanWork(scanType ScanType, customPath string, scanAll bool, s
 		}
 
 		switch scanType {
-		case ScanQuick:
-			enum.EnumerateQuick()
+		case ScanTargeted:
+			enum.EnumerateTargeted()
 		case ScanCustom:
 			enum.EnumeratePath(customPath)
 		case ScanSilent:
@@ -454,11 +469,11 @@ func (m *Manager) scanWork(scanType ScanType, customPath string, scanAll bool, s
 		}
 		if verbose {
 			n := totalFound.Load()
-			sc := scanned.Load()
+			proc := int(scanned.Load()) + int(skipped.Load())
 			m.setStatus(func(s *StatusInfo) {
 				s.DiscoveryDone = true
 				s.Status = "scanning"
-				m.paintCounts(s, int(sc), int(n), int(threats.Load()))
+				m.paintCounts(s, proc, int(n), int(threats.Load()))
 				s.Skipped = int(skipped.Load())
 				s.Message = fmt.Sprintf("Scanning… %d / %d", s.Scanned, s.Total)
 				if s.CurrentEngine == "discover" {
@@ -472,7 +487,9 @@ func (m *Manager) scanWork(scanType ScanType, customPath string, scanAll bool, s
 			m.setStatus(func(s *StatusInfo) {
 				s.DiscoveryDone = true
 				s.Status = "scanning"
-				m.paintCounts(s, int(scanned.Load()), int(totalFound.Load()), int(threats.Load()))
+				proc := int(scanned.Load()) + int(skipped.Load())
+				m.paintCounts(s, proc, int(totalFound.Load()), int(threats.Load()))
+				s.Skipped = int(skipped.Load())
 			})
 		}
 	}()
@@ -493,7 +510,7 @@ func (m *Manager) scanWork(scanType ScanType, customPath string, scanAll bool, s
 		b := batch
 		go func() {
 			defer active.Add(-1)
-			m.processBatch(b, rulePaths, &result, scanType, &scanned, &totalFound, &threats, stopped)
+			m.processBatch(b, rulePaths, &result, scanType, &scanned, &totalFound, &threats, &skipped, stopped, runID)
 			if yaraFileDelay > 0 && !stopped() {
 				time.Sleep(yaraFileDelay)
 			}
@@ -526,7 +543,8 @@ func (m *Manager) scanWork(scanType ScanType, customPath string, scanAll bool, s
 		if scanType == ScanSilent {
 			m.paintCounts(s, 0, 0, 0)
 		} else {
-			m.paintCounts(s, int(scanned.Load()), int(totalFound.Load()), int(threats.Load()))
+			proc := int(scanned.Load()) + int(skipped.Load())
+			m.paintCounts(s, proc, int(totalFound.Load()), int(threats.Load()))
 		}
 		s.Skipped = int(skipped.Load())
 		s.Status = "finalizing"
@@ -540,6 +558,7 @@ func (m *Manager) scanWork(scanType ScanType, customPath string, scanAll bool, s
 	_ = m.History.Append("scan.end", fmt.Sprintf(
 		"scan %s: scanned=%d skipped=%d total=%d threats=%d",
 		result.Status, result.FilesScanned, result.FilesSkipped, result.TotalFound, result.ThreatsFound), map[string]any{
+		"run_id":  runID,
 		"scanned": result.FilesScanned,
 		"skipped": result.FilesSkipped,
 		"total":   result.TotalFound,
@@ -547,6 +566,8 @@ func (m *Manager) scanWork(scanType ScanType, customPath string, scanAll bool, s
 		"yara":    countThreatsByEngine(result.Threats, "yara"),
 		"ssdeep":  countThreatsByEngine(result.Threats, "ssdeep"),
 		"source":  source,
+		"mode":    APIMode(scanType, source),
+		"status":  result.Status,
 	})
 	// Realtime clean hits would spam mailbox/toasts; only notify when threats
 	// found or the scan was an on-demand / scheduled pass.
@@ -575,7 +596,8 @@ func (m *Manager) scanWork(scanType ScanType, customPath string, scanAll bool, s
 		if scanType == ScanSilent {
 			m.paintCounts(s, 0, 0, 0)
 		} else {
-			m.paintCounts(s, result.FilesScanned, result.TotalFound, result.ThreatsFound)
+			proc := result.FilesScanned + result.FilesSkipped
+			m.paintCounts(s, proc, result.TotalFound, result.ThreatsFound)
 		}
 		s.Skipped = result.FilesSkipped
 		s.Status = result.Status
@@ -601,7 +623,7 @@ func countThreatsByEngine(threats []Threat, engine string) int {
 	return n
 }
 
-func (m *Manager) processBatch(batch []FileItem, rulePaths []string, result *Result, scanType ScanType, scanned, totalFound, threats *atomic.Int64, stopped func() bool) {
+func (m *Manager) processBatch(batch []FileItem, rulePaths []string, result *Result, scanType ScanType, scanned, totalFound, threats, skipped *atomic.Int64, stopped func() bool, runID string) {
 	if len(batch) == 0 || stopped() {
 		return
 	}
@@ -615,7 +637,7 @@ func (m *Manager) processBatch(batch []FileItem, rulePaths []string, result *Res
 		sizes[item.Path] = item.Size
 	}
 
-	already := int(scanned.Load())
+	already := int(scanned.Load()) + int(skipped.Load())
 	totalHint := int(totalFound.Load())
 	m.setStatus(func(s *StatusInfo) {
 		if s.DiscoveryDone {
@@ -624,10 +646,11 @@ func (m *Manager) processBatch(batch []FileItem, rulePaths []string, result *Res
 			s.Status = "discovering"
 		}
 		m.paintCounts(s, already, totalHint, int(threats.Load()))
+		s.Skipped = int(skipped.Load())
 		s.CurrentEngine = "yara"
 		s.CurrentPath = paths[0]
 		s.CurrentFile = filepath.Base(paths[0])
-		s.Message = fmt.Sprintf("Analyzing with YARA… %d files", len(paths))
+		s.Message = fmt.Sprintf("Analyzing with YARAâ€¦ %d files", len(paths))
 	})
 	stopPulse := m.pulseStatus(func(elapsed time.Duration) {
 		m.setStatus(func(s *StatusInfo) {
@@ -637,7 +660,7 @@ func (m *Manager) processBatch(batch []FileItem, rulePaths []string, result *Res
 				s.Status = "discovering"
 			}
 			s.CurrentEngine = "yara"
-			s.Message = fmt.Sprintf("Analyzing with YARA… %d files (%ds)", len(paths), int(elapsed.Seconds()))
+			s.Message = fmt.Sprintf("Analyzing with YARAâ€¦ %d files (%ds)", len(paths), int(elapsed.Seconds()))
 		})
 	}, 500*time.Millisecond)
 
@@ -654,7 +677,6 @@ func (m *Manager) processBatch(batch []FileItem, rulePaths []string, result *Res
 		matchMap[key] = append(matchMap[key], match.Rule)
 	}
 
-	// YARA-first: only miss files go to ssdeep (enabled by default).
 	var cleanPaths []string
 	for _, item := range batch {
 		if _, hit := matchMap[strings.ToLower(item.Path)]; !hit {
@@ -672,7 +694,7 @@ func (m *Manager) processBatch(batch []FileItem, rulePaths []string, result *Res
 			s.CurrentEngine = "ssdeep"
 			s.CurrentPath = cleanPaths[0]
 			s.CurrentFile = filepath.Base(cleanPaths[0])
-			s.Message = fmt.Sprintf("Fuzzy hashing… 0 / %d", len(cleanPaths))
+			s.Message = fmt.Sprintf("Fuzzy hashingâ€¦ 0 / %d", len(cleanPaths))
 		})
 		hits, serr := m.ssdeep.ScanCleanFiles(cleanPaths, sizes, stopped, func(done int, path string) {
 			m.setStatus(func(s *StatusInfo) {
@@ -684,7 +706,7 @@ func (m *Manager) processBatch(batch []FileItem, rulePaths []string, result *Res
 				s.CurrentEngine = "ssdeep"
 				s.CurrentPath = path
 				s.CurrentFile = filepath.Base(path)
-				s.Message = fmt.Sprintf("Fuzzy hashing… %d / %d", done, len(cleanPaths))
+				s.Message = fmt.Sprintf("Fuzzy hashingâ€¦ %d / %d", done, len(cleanPaths))
 			})
 		})
 		if serr != nil {
@@ -697,6 +719,10 @@ func (m *Manager) processBatch(batch []FileItem, rulePaths []string, result *Res
 	}
 
 	var batchThreats []Threat
+	var fileRows []scanrun.FileRecord
+	var apiRows []api.ScanFileItem
+	agentID := m.agentID()
+	ts := time.Now().Format("2006-01-02 15:04:05")
 	now := time.Now()
 	for _, item := range batch {
 		if stopped() {
@@ -705,6 +731,9 @@ func (m *Manager) processBatch(batch []FileItem, rulePaths []string, result *Res
 		key := strings.ToLower(item.Path)
 		rulesMatched, infected := matchMap[key]
 		status := "clean"
+		ruleLabel := ""
+		engineLabel := "yara"
+		var score float64
 		if infected {
 			status = "infected"
 			threats.Add(1)
@@ -713,8 +742,11 @@ func (m *Manager) processBatch(batch []FileItem, rulePaths []string, result *Res
 				result.Threats = append(result.Threats, th)
 				batchThreats = append(batchThreats, th)
 			}
+			if len(rulesMatched) > 0 {
+				ruleLabel = rulesMatched[0]
+			}
+			engineLabel = "yara"
 		} else if hit, ok := ssdeepHits[key]; ok {
-			// Second pass only: YARA clean + ssdeep hit â†’ still one file / one threat count.
 			status = "infected"
 			threats.Add(1)
 			th := Threat{
@@ -727,6 +759,9 @@ func (m *Manager) processBatch(batch []FileItem, rulePaths []string, result *Res
 			}
 			result.Threats = append(result.Threats, th)
 			batchThreats = append(batchThreats, th)
+			ruleLabel = th.Rule
+			engineLabel = "ssdeep"
+			score = float64(hit.Score)
 		}
 
 		m.Snapshot.Upsert(item.Path, snapshot.FileRecord{
@@ -740,54 +775,76 @@ func (m *Manager) processBatch(batch []FileItem, rulePaths []string, result *Res
 		scannedCount := scanned.Add(1)
 		totalN := int(totalFound.Load())
 		threatN := int(threats.Load())
-		engineLabel := "yara"
-		if infected {
-			engineLabel = "yara"
-		} else if _, ok := ssdeepHits[key]; ok {
-			engineLabel = "ssdeep"
-		}
+		proc := int(scannedCount) + int(skipped.Load())
 		m.setStatus(func(s *StatusInfo) {
 			if s.DiscoveryDone {
 				s.Status = "scanning"
 			} else {
 				s.Status = "discovering"
 			}
-			m.paintCounts(s, int(scannedCount), totalN, threatN)
+			m.paintCounts(s, proc, totalN, threatN)
+			s.Skipped = int(skipped.Load())
 			s.CurrentPath = item.Path
 			s.CurrentFile = filepath.Base(item.Path)
 			s.CurrentEngine = engineLabel
 			if s.DiscoveryDone {
-				s.Message = fmt.Sprintf("Scanning… %d / %d", s.Scanned, s.Total)
+				s.Message = fmt.Sprintf("Scanningâ€¦ %d / %d", s.Scanned, s.Total)
 			} else {
-				s.Message = fmt.Sprintf("Discovering… found %d · scanned %d", s.Total, s.Scanned)
+				s.Message = fmt.Sprintf("Discoveringâ€¦ found %d Â· processed %d", s.Total, s.Scanned)
 			}
 		})
-		// Prefer status updates for live UX; history is sparse (encrypted I/O).
+
+		fileRows = append(fileRows, scanrun.FileRecord{
+			Path:      item.Path,
+			Result:    status,
+			Rule:      ruleLabel,
+			Engine:    engineLabel,
+			Score:     score,
+			ScannedAt: ts,
+		})
+		apiRows = append(apiRows, api.ScanFileItem{
+			AgentID:   agentID,
+			RunID:     runID,
+			Path:      item.Path,
+			Result:    status,
+			Rule:      ruleLabel,
+			Engine:    engineLabel,
+			Score:     score,
+			ScannedAt: ts,
+		})
+
 		if status == "infected" || scannedCount == 1 || scannedCount%40 == 0 {
 			_ = m.History.Append("scan.item", fmt.Sprintf("%s  %s", strings.ToUpper(engineLabel), item.Path), map[string]any{
 				"path":    item.Path,
 				"engine":  engineLabel,
+				"result":  status,
 				"scanned": scannedCount,
 				"total":   totalN,
+				"run_id":  runID,
 			})
 		}
+	}
+
+	if len(fileRows) > 0 {
+		_ = m.ScanRuns.Append(runID, fileRows)
+		m.reportScanFiles(apiRows)
 	}
 
 	if len(batchThreats) > 0 {
 		uniq := uniqueThreatPaths(batchThreats)
 		m.setStatus(func(s *StatusInfo) {
 			s.Status = "finalizing"
-			s.Message = fmt.Sprintf("Reporting %d detections…", len(uniq))
+			s.Message = fmt.Sprintf("Reporting %d detectionsâ€¦", len(uniq))
 			s.CurrentFile = ""
 		})
-		_ = m.History.Append("scan.progress", fmt.Sprintf("Reporting %d detections…", len(uniq)), nil)
+		_ = m.History.Append("scan.progress", fmt.Sprintf("Reporting %d detectionsâ€¦", len(uniq)), nil)
 		stopPulse := m.pulseStatus(func(elapsed time.Duration) {
 			m.setStatus(func(s *StatusInfo) {
 				s.Status = "finalizing"
-				s.Message = fmt.Sprintf("Reporting %d detections… (%ds)", len(uniq), int(elapsed.Seconds()))
+				s.Message = fmt.Sprintf("Reporting %d detectionsâ€¦ (%ds)", len(uniq), int(elapsed.Seconds()))
 			})
 		}, 500*time.Millisecond)
-		m.reportThreats(batchThreats)
+		m.reportThreats(batchThreats, runID)
 		stopPulse()
 
 		if m.shouldQuarantine() && m.Quarantine != nil {
@@ -797,7 +854,7 @@ func (m *Manager) processBatch(batch []FileItem, rulePaths []string, result *Res
 				}
 				m.setStatus(func(s *StatusInfo) {
 					s.Status = "finalizing"
-					s.Message = fmt.Sprintf("Quarantining… %d / %d", i+1, len(uniq))
+					s.Message = fmt.Sprintf("Quarantiningâ€¦ %d / %d", i+1, len(uniq))
 					s.CurrentPath = th.Path
 					s.CurrentFile = filepath.Base(th.Path)
 					s.CurrentEngine = ""
@@ -807,7 +864,6 @@ func (m *Manager) processBatch(batch []FileItem, rulePaths []string, result *Res
 		}
 	}
 }
-
 // pulseStatus calls tick on an interval until the returned stop func is called.
 func (m *Manager) pulseStatus(tick func(elapsed time.Duration), every time.Duration) func() {
 	if every <= 0 {
@@ -861,12 +917,12 @@ func (m *Manager) ssdeepReportAPIEnabled() bool {
 }
 
 func (m *Manager) shouldQuarantine() bool {
-	v := strings.ToLower(strings.TrimSpace(m.Settings.Get(settings.KeyQuarantineOnDetect, "true")))
+	v := strings.ToLower(strings.TrimSpace(m.Settings.Get(settings.KeyQuarantineOnDetect, "false")))
 	return v == "true" || v == "1" || v == "yes"
 }
 
 func (m *Manager) shouldSendSsdeepCandidate() bool {
-	v := strings.ToLower(strings.TrimSpace(m.Settings.Get(settings.KeySendSsdeepCandidate, "false")))
+	v := strings.ToLower(strings.TrimSpace(m.Settings.Get(settings.KeySendSsdeepCandidate, "true")))
 	return v == "true" || v == "1" || v == "yes"
 }
 
@@ -878,7 +934,7 @@ func scanStartDescription(m *Manager) string {
 	return fmt.Sprintf("Scan started; engines=%s", engines)
 }
 
-func (m *Manager) reportThreats(threats []Threat) {
+func (m *Manager) reportThreats(threats []Threat, runID string) {
 	agentID := m.agentID()
 	if agentID <= 0 {
 		// Center matches detections by agent_id; 0 means rows land orphaned and
@@ -887,12 +943,26 @@ func (m *Manager) reportThreats(threats []Threat) {
 	}
 	device := sysinfo.Hostname()
 	ts := time.Now().Format("2006-01-02 15:04:05")
+	runID = strings.TrimSpace(runID)
 
 	fuzzyFor := func(th Threat) string {
 		if s := strings.TrimSpace(th.Ssdeep); s != "" {
 			return s
 		}
 		return ssdeepscan.FuzzyHashFile(th.Path)
+	}
+
+	// Persist local structured threats for Agent Reports expand (per run).
+	for _, th := range threats {
+		_ = m.History.Append("scan.threat", th.Path, map[string]any{
+			"run_id":   runID,
+			"path":     th.Path,
+			"rule":     th.Rule,
+			"engine":   th.Engine,
+			"score":    th.Score,
+			"mode":     APIMode(th.ScanType, ""),
+			"detected": ts,
+		})
 	}
 
 	// Legacy web: YARA detections only (unchanged payload).
@@ -910,6 +980,7 @@ func (m *Manager) reportThreats(threats []Threat) {
 			FileText:    "",
 			FirstScan:   ts,
 			LastScan:    ts,
+			RunID:       runID,
 		})
 	}
 	if len(yaraItems) > 0 {
@@ -985,6 +1056,7 @@ func (m *Manager) reportThreats(threats []Threat) {
 			Description: desc,
 			DeviceName:  device,
 			DetectedAt:  ts,
+			RunID:       runID,
 		}
 		if engine == "ssdeep" {
 			item.Score = th.Score
@@ -1006,9 +1078,15 @@ func (m *Manager) reportThreats(threats []Threat) {
 		return
 	}
 	candidates := make([]api.SsdeepCandidateItem, 0, len(threats))
+	skippedKnown := 0
 	for _, th := range threats {
 		fuzzy := fuzzyFor(th)
 		if fuzzy == "" {
+			continue
+		}
+		// Skip hashes already present in the local ssdeep store (exact match).
+		if m.ssdeep != nil && m.ssdeep.HasExactHash(fuzzy) {
+			skippedKnown++
 			continue
 		}
 		engine := th.Engine
@@ -1027,6 +1105,7 @@ func (m *Manager) reportThreats(threats []Threat) {
 			DetectedAt: ts,
 			ScanMode:   APIMode(th.ScanType, ""),
 			Source:     "agent_detection",
+			RunID:      runID,
 		}
 		if engine == "ssdeep" {
 			candidate.Score = th.Score
@@ -1035,6 +1114,9 @@ func (m *Manager) reportThreats(threats []Threat) {
 			candidate.Source = "yara_hit"
 		}
 		candidates = append(candidates, candidate)
+	}
+	if skippedKnown > 0 {
+		_ = m.History.Append("api.ok", fmt.Sprintf("sendSsdeepCandidate skipped %d known local hash(es)", skippedKnown), nil)
 	}
 	if len(candidates) > 0 {
 		if m.API == nil {
@@ -1070,6 +1152,28 @@ func (m *Manager) sendScanLog(mode, desc, typ, runID string) {
 	_ = m.History.Append("api.ok", fmt.Sprintf("sendAgentScanLog %s %s", mode, typ), map[string]any{
 		"mode": mode, "type": typ, "run_id": runID, "agent_id": m.agentID(),
 	})
+}
+
+func (m *Manager) reportScanFiles(items []api.ScanFileItem) {
+	if len(items) == 0 {
+		return
+	}
+	const chunk = 500
+	for i := 0; i < len(items); i += chunk {
+		end := i + chunk
+		if end > len(items) {
+			end = len(items)
+		}
+		batch := items[i:end]
+		if m.API == nil {
+			_ = m.enqueueReport(reportq.KindScanFile, batch)
+			continue
+		}
+		if resp, _, err := m.API.SendScanFileLog(batch); !reportOK(resp, err) {
+			_ = m.History.Append("api.error", "sendScanFileLog: "+errString(err, resp), nil)
+			_ = m.enqueueReport(reportq.KindScanFile, batch)
+		}
+	}
 }
 
 func (m *Manager) enqueueReport(kind string, payload any) error {
@@ -1137,6 +1241,12 @@ func (m *Manager) ensureRules() error {
 	if err != nil {
 		return err
 	}
+	if m.Rules != nil && m.Settings != nil {
+		m.Rules.SetDisabledRules(
+			splitSemiList(m.Settings.Get(settings.KeyDisabledRuleFiles, "")),
+			splitSemiList(m.Settings.Get(settings.KeyDisabledRuleNames, "")),
+		)
+	}
 	entries, err := m.Rules.Materialize(tempDir)
 	if err != nil {
 		_ = rules.WipeMaterializedDir(tempDir)
@@ -1171,4 +1281,20 @@ func (m *Manager) RefreshSsdeep() {
 	}
 	m.ssdeep.SetThreshold(readSsdeepThreshold(m.Settings))
 	m.ssdeep.Reload()
+}
+
+func splitSemiList(raw string) []string {
+	raw = strings.TrimSpace(raw)
+	if raw == "" {
+		return nil
+	}
+	parts := strings.Split(raw, ";")
+	out := make([]string, 0, len(parts))
+	for _, p := range parts {
+		p = strings.TrimSpace(p)
+		if p != "" {
+			out = append(out, p)
+		}
+	}
+	return out
 }

@@ -247,10 +247,16 @@ func (h *Host) PushSettingsToServer() {
 	if h.Settings.GetBool(settings.KeyRealtimeShield) {
 		rtp = 1
 	}
-	batch := strconv.Itoa(settings.NormalizeIntervalMinutes(h.Settings.Get(settings.KeyBatchJobEveryDay, ""), settings.DefaultBatchIntervalMinutes))
+	batch := settings.NormalizeDailyHHmm(h.Settings.Get(settings.KeyBatchJobEveryDay, ""), settings.DefaultBatchDailyHHmm)
 
 	flagInt := func(key string) int {
 		if h.Settings.GetBool(key) {
+			return 1
+		}
+		return 0
+	}
+	boolToInt := func(v bool) int {
+		if v {
 			return 1
 		}
 		return 0
@@ -261,19 +267,19 @@ func (h *Host) PushSettingsToServer() {
 	fmt.Sscanf(strings.TrimSpace(h.Settings.Get(settings.KeyCacheExpiryHours, "168")), "%d", &cacheHours)
 
 	extra := map[string]any{
-		"ssdeep_enabled":        flagInt(settings.KeySsdeepEnabled),
+		"ssdeep_enabled":        boolToInt(settings.ForcedSsdeepEnabled),
 		"ssdeep_threshold":      threshold,
-		"ssdeep_report_api":     flagInt(settings.KeySsdeepReportAPI),
-		"quarantine_on_detect":  flagInt(settings.KeyQuarantineOnDetect),
-		"send_ssdeep_candidate": flagInt(settings.KeySendSsdeepCandidate),
+		"ssdeep_report_api":     boolToInt(settings.ForcedSsdeepReportAPI),
+		"quarantine_on_detect":  boolToInt(settings.ForcedQuarantineOnDetect),
+		"send_ssdeep_candidate": boolToInt(settings.ForcedSendSsdeepCandidate),
 		"auto_scan_on_login":    flagInt(settings.KeyAutoScanOnLogin),
 		"exclusion_paths":       h.Settings.Get(settings.KeyExclusionPaths, ""),
 		"scan_extensions":       h.Settings.Get(settings.KeyScanExtensions, ""),
-		"quick_scan_paths":      h.Settings.Get(settings.KeyQuickScanPaths, ""),
+		"quick_scan_paths":      "",
 		"log_level":             h.Settings.Get(settings.KeyLogLevel, "info"),
 		"cache_expiry_hours":    cacheHours,
 		"ti_sync_everydate":     strconv.Itoa(settings.NormalizeIntervalMinutes(h.Settings.Get(settings.KeyTISyncEveryDay, ""), settings.DefaultTISyncIntervalMinutes)),
-		"agent_update_schedule": strconv.Itoa(settings.NormalizeIntervalMinutes(h.Settings.Get(settings.KeyAgentUpdateSchedule, ""), settings.DefaultAgentUpdateIntervalMinutes)),
+		"agent_update_schedule": strconv.Itoa(settings.NormalizeAgentUpdateMinutes(h.Settings.Get(settings.KeyAgentUpdateSchedule, ""), settings.DefaultAgentUpdateIntervalMinutes)),
 		"config_updated_at":     configUpdatedAtUnix(h.Settings),
 	}
 	_, _, _ = apiClient.UpdateConfig(batch, rtp, usb, extra)

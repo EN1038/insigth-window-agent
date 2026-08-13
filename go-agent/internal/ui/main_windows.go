@@ -220,9 +220,6 @@ func (r *Router) showOverview(setPage func(fyne.CanvasObject)) {
 	fullScan := newScanActionButton(resIconScan, "FULL SCAN", true, 80, func() {
 		startScan("full", "")
 	})
-	quickScan := newScanActionButton(resIconQuick, "QUICK SCAN", false, 50, func() {
-		startScan("quick", "")
-	})
 	customScan := newScanActionButton(resIconSet, "CUSTOM SCAN", false, 50, func() {
 		dialog.ShowFolderOpen(func(u fyne.ListableURI, err error) {
 			if err != nil || u == nil {
@@ -260,8 +257,6 @@ func (r *Router) showOverview(setPage func(fyne.CanvasObject)) {
 
 	leftItems := []fyne.CanvasObject{
 		fullScan,
-		vspace(8),
-		quickScan,
 		vspace(8),
 		customScan,
 		vspace(20),
@@ -400,7 +395,6 @@ func (r *Router) showOverview(setPage func(fyne.CanvasObject)) {
 		fyne.Do(func() {
 			busy := ss.Scanning
 			fullScan.setEnabled(!busy)
-			quickScan.setEnabled(!busy)
 			customScan.setEnabled(!busy)
 			typeGroup.Disable()
 			if !busy {
@@ -408,7 +402,6 @@ func (r *Router) showOverview(setPage func(fyne.CanvasObject)) {
 			}
 			stLower := strings.ToLower(strings.TrimSpace(ss.ScanType))
 			fullScan.setActive(busy && stLower == "full")
-			quickScan.setActive(busy && (stLower == "quick" || stLower == "auto"))
 			customScan.setActive(busy && (stLower == "custom" || stLower == "silent"))
 
 			fileCount.Text = fmtCount(ss.Scanned)
@@ -585,16 +578,18 @@ func (r *Router) showSettings(setPage func(fyne.CanvasObject)) {
 	auto := widget.NewCheck("", nil)
 	auto.SetChecked(st.AutoScanOnLogin)
 
-	batchIdx := settings.IntervalSelectIndex(st.BatchJobEveryDay, settings.DefaultBatchIntervalMinutes)
+	batchIdx := settings.DailyTimeSelectIndex(st.BatchJobEveryDay)
 	tiIdx := settings.IntervalSelectIndex(st.TISyncEveryDay, settings.DefaultTISyncIntervalMinutes)
-	updIdx := settings.IntervalSelectIndex(st.AgentUpdateSchedule, settings.DefaultAgentUpdateIntervalMinutes)
+	updIdx := settings.AgentUpdateSelectIndex(st.AgentUpdateSchedule)
+	batchLabels := settings.DailyTimePresets()
 	labels := settings.IntervalPresetLabels()
+	updLabels := settings.AgentUpdatePresetLabels()
 
-	batch := widget.NewSelect(labels, nil)
+	batch := widget.NewSelect(batchLabels, nil)
 	batch.SetSelectedIndex(batchIdx)
 	tiSync := widget.NewSelect(labels, nil)
 	tiSync.SetSelectedIndex(tiIdx)
-	agentUpdSched := widget.NewSelect(labels, nil)
+	agentUpdSched := widget.NewSelect(updLabels, nil)
 	agentUpdSched.SetSelectedIndex(updIdx)
 
 	excl := widget.NewMultiLineEntry()
@@ -604,19 +599,6 @@ func (r *Router) showSettings(setPage func(fyne.CanvasObject)) {
 	scanExt := widget.NewMultiLineEntry()
 	scanExt.SetText(st.ScanExtensions)
 	scanExt.SetMinRowsVisible(3)
-
-	quick := widget.NewMultiLineEntry()
-	quick.SetText(st.QuickScanPaths)
-	quick.SetMinRowsVisible(2)
-
-	ssdeepOn := widget.NewCheck("", nil)
-	ssdeepOn.SetChecked(st.SsdeepEnabled)
-	ssdeepReport := widget.NewCheck("", nil)
-	ssdeepReport.SetChecked(st.SsdeepReportAPI)
-	quarantine := widget.NewCheck("", nil)
-	quarantine.SetChecked(st.QuarantineOnDetect)
-	sendCand := widget.NewCheck("", nil)
-	sendCand.SetChecked(st.SendSsdeepCandidate)
 
 	threshold := widget.NewEntry()
 	threshold.SetText(st.SsdeepThreshold)
@@ -629,44 +611,34 @@ func (r *Router) showSettings(setPage func(fyne.CanvasObject)) {
 		divider(),
 		toggleRowImg(resIconUSB, "USB protection", "Automatically scan removable drives", usb),
 		divider(),
-		toggleRowImg(resIconConn, "Auto scan on login", "Run a quick scan when a user signs in (not on agent start)", auto),
+		toggleRowImg(resIconConn, "Auto scan on login", "Run a login scan when a user signs in (not on agent start)", auto),
 	))
 
-	schedule := card(container.NewVBox(
+	scheduleItems := []fyne.CanvasObject{
 		sectionHeaderImg(resIconBatch, "Scheduled scan & sync"),
 		vspace(4),
-		fieldLabel("Batch scan interval"),
+		fieldLabel("Batch scan time (once daily)"),
 		batch,
 		vspace(8),
 		fieldLabel("Threat intelligence sync (rules + ssdeep)"),
 		tiSync,
 		vspace(8),
-		fieldLabel("Agent update check interval"),
+		fieldLabel("Agent update check"),
 		agentUpdSched,
 		vspace(8),
-		fieldLabel("Excluded paths (one per line)"),
+		fieldLabel("Excluded paths (one per line, empty by default)"),
 		excl,
 		vspace(8),
 		fieldLabel("Scan extensions (comma-separated)"),
 		scanExt,
-		vspace(8),
-		fieldLabel("Quick scan paths (one per line)"),
-		quick,
-	))
+	}
+	schedule := card(container.NewVBox(scheduleItems...))
 
 	ssdeepCard := card(container.NewVBox(
 		sectionHeaderImg(resIconYara, "Ssdeep"),
 		vspace(4),
-		toggleRowImg(resIconYara, "Ssdeep engine", "Fuzzy-hash secondary scanner", ssdeepOn),
-		divider(),
 		fieldLabel("Match threshold (0–100)"),
 		threshold,
-		vspace(6),
-		toggleRowImg(resIconConn, "Report detections to API", "POST sendLogSsdeep", ssdeepReport),
-		divider(),
-		toggleRowImg(resIconConn, "Quarantine on detect", "Isolate matched files", quarantine),
-		divider(),
-		toggleRowImg(resIconConn, "Send ssdeep candidate", "Send fuzzy hashes to Center for auto pack update (default off)", sendCand),
 	))
 
 	rulesVer := muted(fmt.Sprintf("local=%s  server=%s  ver=%s",
@@ -787,21 +759,37 @@ func (r *Router) showSettings(setPage func(fyne.CanvasObject)) {
 			}
 			return strconv.Itoa(settings.IntervalPresets[idx])
 		}
+		agentUpdateAt := func(sel *widget.Select) string {
+			idx := sel.SelectedIndex()
+			presets := settings.AgentUpdateIntervalPresets()
+			if idx < 0 || idx >= len(presets) {
+				return strconv.Itoa(settings.DefaultAgentUpdateIntervalMinutes)
+			}
+			return strconv.Itoa(presets[idx])
+		}
+		dailyAt := func(sel *widget.Select) string {
+			idx := sel.SelectedIndex()
+			presets := settings.DailyTimePresets()
+			if idx < 0 || idx >= len(presets) {
+				return settings.DefaultBatchDailyHHmm
+			}
+			return presets[idx]
+		}
 		if err := r.client.UpdateSettings(r.ctx, ipc.UpdateSettingsRequest{
 			RealtimeShield:      boolPtr(rt.Checked),
 			USBProtection:       boolPtr(usb.Checked),
 			AutoScanOnLogin:     boolPtr(auto.Checked),
-			BatchJobEveryDay:    intervalAt(batch, settings.DefaultBatchIntervalMinutes),
+			BatchJobEveryDay:    dailyAt(batch),
 			TISyncEveryDay:      intervalAt(tiSync, settings.DefaultTISyncIntervalMinutes),
-			AgentUpdateSchedule: intervalAt(agentUpdSched, settings.DefaultAgentUpdateIntervalMinutes),
+			AgentUpdateSchedule: agentUpdateAt(agentUpdSched),
 			ExclusionPaths:      strPtr(excl.Text),
 			ScanExtensions:      scanExt.Text,
-			QuickScanPaths:      strPtr(quick.Text),
-			SsdeepEnabled:       boolPtr(ssdeepOn.Checked),
+			QuickScanPaths:      nil,
+			SsdeepEnabled:       boolPtr(settings.ForcedSsdeepEnabled),
 			SsdeepThreshold:     threshold.Text,
-			SsdeepReportAPI:     boolPtr(ssdeepReport.Checked),
-			QuarantineOnDetect:  boolPtr(quarantine.Checked),
-			SendSsdeepCandidate: boolPtr(sendCand.Checked),
+			SsdeepReportAPI:     boolPtr(settings.ForcedSsdeepReportAPI),
+			QuarantineOnDetect:  boolPtr(settings.ForcedQuarantineOnDetect),
+			SendSsdeepCandidate: boolPtr(settings.ForcedSendSsdeepCandidate),
 		}); err != nil {
 			dialog.ShowError(err, r.window)
 			return
@@ -1443,19 +1431,19 @@ func overviewScanModeLabel(scanType, source string) string {
 	switch {
 	case strings.EqualFold(src, "Realtime") || st == "silent":
 		return "REALTIME"
-	case strings.EqualFold(src, "Schedule") || strings.EqualFold(src, "Login") || st == "auto":
-		return "AUTO SCAN"
+	case strings.EqualFold(src, "Schedule"):
+		return "SCHEDULE SCAN"
+	case strings.EqualFold(src, "Login"):
+		return "LOGIN SCAN"
 	case strings.EqualFold(src, "USB"):
 		return "USB SCAN"
 	case st == "full":
 		return "FULL SCAN"
-	case st == "quick":
-		return "QUICK SCAN"
 	case st == "custom":
 		return "CUSTOM SCAN"
 	default:
 		if src != "" {
-			return strings.ToUpper(src)
+			return strings.ToUpper(src) + " SCAN"
 		}
 		return "SCAN"
 	}

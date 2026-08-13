@@ -12,6 +12,7 @@ import (
 	"github.com/sosecure/insite-agent/internal/ipc"
 	"github.com/sosecure/insite-agent/internal/quarantine"
 	"github.com/sosecure/insite-agent/internal/runtime"
+	"github.com/sosecure/insite-agent/internal/scanrun"
 	"github.com/sosecure/insite-agent/internal/settings"
 	"github.com/sosecure/insite-agent/internal/ssdeepscan"
 )
@@ -127,4 +128,28 @@ func (h *Host) QuarantineList() []ipc.QuarantineItem {
 		})
 	}
 	return out
+}
+
+func (h *Host) ScanRunFiles(runID string, offset, limit int) (rows []ipc.ScanRunFile, total int) {
+	sr := h.ScanRuntime()
+	if sr == nil || sr.Manager == nil || sr.Manager.ScanRuns == nil {
+		return nil, 0
+	}
+	recs, tot, err := sr.Manager.ScanRuns.List(runID, offset, limit)
+	if err != nil {
+		return nil, 0
+	}
+	recs = scanrun.SortInfectedFirst(recs)
+	out := make([]ipc.ScanRunFile, 0, len(recs))
+	for _, r := range recs {
+		out = append(out, ipc.ScanRunFile{
+			Path:      r.Path,
+			Result:    r.Result,
+			Rule:      r.Rule,
+			Engine:    r.Engine,
+			Score:     r.Score,
+			ScannedAt: r.ScannedAt,
+		})
+	}
+	return out, tot
 }

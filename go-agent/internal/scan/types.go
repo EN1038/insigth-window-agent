@@ -31,11 +31,11 @@ type StatusInfo struct {
 type ScanType string
 
 const (
-	ScanQuick  ScanType = "quick"
-	ScanFull   ScanType = "full"
-	ScanAuto   ScanType = "auto"
-	ScanCustom ScanType = "custom"
-	ScanSilent ScanType = "silent"
+	// ScanTargeted = path-limited coverage (schedule / login). Not a user-facing "Quick Scan".
+	ScanTargeted ScanType = "targeted"
+	ScanFull     ScanType = "full"
+	ScanCustom   ScanType = "custom"
+	ScanSilent   ScanType = "silent"
 )
 
 type FileItem struct {
@@ -78,21 +78,20 @@ func (r Result) Duration() time.Duration {
 
 func APIMode(scanType ScanType, scanSource string) string {
 	switch {
-	case scanSource == SourceSchedule || scanSource == SourceLogin:
-		return "AUTO_SCAN"
-	case scanType == ScanAuto:
-		return "AUTO_SCAN"
+	case scanSource == SourceSchedule:
+		return "SCHEDULE_SCAN"
+	case scanSource == SourceLogin:
+		return "LOGIN_SCAN"
 	case scanType == ScanSilent || scanSource == SourceRealtime:
 		return "REALTIME_SCAN"
 	case scanSource == SourceUSB || scanSource == "USB":
 		return "USB_SCAN"
 	case scanType == ScanCustom:
 		return "CUSTOM_SCAN"
-	case scanType == ScanQuick:
-		return "QUICK_SCAN"
 	case scanType == ScanFull:
 		return "FULL_SCAN"
 	default:
+		// Manual on-demand leftovers (should not appear for schedule/login/USB/realtime).
 		return "MANUAL_SCAN"
 	}
 }

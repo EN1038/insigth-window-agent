@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"sort"
 	"strconv"
 	"strings"
 
@@ -93,6 +94,10 @@ func (r *Runner) syncRulesFromServerResult(fallbackRaw json.RawMessage) (complet
 		}
 		if serverRuleNames == 0 {
 			serverRuleNames = len(catalog)
+		}
+		if r.persistDisabledRulesFromCatalog(catalog) && r.Scan != nil {
+			r.Scan.RefreshRules()
+			_ = r.History.Append("rules.sync", "refreshed local YARA include list after Center ignore changes", nil)
 		}
 	} else if errGetRule != nil {
 		_ = r.History.Append("api.warn", "getRule: "+errGetRule.Error(), nil)
@@ -590,6 +595,53 @@ func filterCatalogItems(items []ruleCatalogItem) []ruleCatalogItem {
 		out = append(out, it)
 	}
 	return out
+}
+
+// persistDisabledRulesFromCatalog stores per-agent ignores (status != Y).
+// Returns true when the local deny list changed.
+func (r *Runner) persistDisabledRulesFromCatalog(catalog []ruleCatalogItem) bool {
+	if r == nil || r.Settings == nil {
+		return false
+	}
+	files := make([]string, 0)
+	names := make([]string, 0)
+	seenF := map[string]bool{}
+	seenN := map[string]bool{}
+	for _, it := range catalog {
+		st := strings.ToUpper(strings.TrimSpace(it.Status))
+		if st == "" || st == "Y" || st == "1" || st == "TRUE" || st == "ON" {
+			continue
+		}
+		if fn := strings.TrimSpace(it.FileName); fn != "" {
+			key := strings.ToLower(filepath.Base(fn))
+			if !seenF[key] {
+				seenF[key] = true
+				files = append(files, key)
+			}
+		}
+		if rn := strings.TrimSpace(it.RuleName); rn != "" {
+			key := strings.ToLower(rn)
+			if !seenN[key] {
+				seenN[key] = true
+				names = append(names, key)
+			}
+		}
+	}
+	sort.Strings(files)
+	sort.Strings(names)
+	filesJoined := strings.Join(files, ";")
+	namesJoined := strings.Join(names, ";")
+	prevF := r.Settings.Get(settings.KeyDisabledRuleFiles, "")
+	prevN := r.Settings.Get(settings.KeyDisabledRuleNames, "")
+	if filesJoined == prevF && namesJoined == prevN {
+		return false
+	}
+	r.Settings.Set(settings.KeyDisabledRuleFiles, filesJoined)
+	r.Settings.Set(settings.KeyDisabledRuleNames, namesJoined)
+	_ = r.Settings.Save()
+	_ = r.History.Append("rules.sync", fmt.Sprintf(
+		"updated disabled YARA list (files=%d names=%d)", len(files), len(names)), nil)
+	return true
 }
 
 func uniqueCatalogByFile(catalog []ruleCatalogItem) []ruleCatalogItem {

@@ -90,7 +90,7 @@ func (s *Store) RealtimeWatchRoots() []string {
 		addProfile(profile)
 	}
 
-	for _, p := range s.QuickScanPaths() {
+	for _, p := range s.TargetedScanPaths() {
 		st, err := os.Stat(p)
 		if err != nil {
 			continue

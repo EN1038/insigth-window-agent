@@ -82,7 +82,7 @@ func applyGetConfig(st *settings.Store, data json.RawMessage) error {
 	}
 	batch := firstNonNil(cfg.BatchJobEveryDate, cfg.Agent.BatchJobEveryDate)
 	if b := stringify(batch); b != "" {
-		st.Set(settings.KeyBatchJobEveryDay, strconv.Itoa(settings.NormalizeIntervalMinutes(b, settings.DefaultBatchIntervalMinutes)))
+		st.Set(settings.KeyBatchJobEveryDay, settings.NormalizeDailyHHmm(b, settings.DefaultBatchDailyHHmm))
 	}
 	tiSync := firstNonNil(cfg.TISyncEveryDate, cfg.Agent.TISyncEveryDate)
 	if t := stringify(tiSync); t != "" {
@@ -90,7 +90,7 @@ func applyGetConfig(st *settings.Store, data json.RawMessage) error {
 	}
 	updSched := firstNonNil(cfg.AgentUpdateSchedule, cfg.Agent.AgentUpdateSchedule)
 	if t := stringify(updSched); t != "" {
-		st.Set(settings.KeyAgentUpdateSchedule, strconv.Itoa(settings.NormalizeIntervalMinutes(t, settings.DefaultAgentUpdateIntervalMinutes)))
+		st.Set(settings.KeyAgentUpdateSchedule, strconv.Itoa(settings.NormalizeAgentUpdateMinutes(t, settings.DefaultAgentUpdateIntervalMinutes)))
 	}
 
 	autoLogin := firstNonNil(cfg.AutoScanOnLogin, cfg.Agent.AutoScanOnLogin)
@@ -157,6 +157,8 @@ func applyGetConfig(st *settings.Store, data json.RawMessage) error {
 	if serverTs > 0 {
 		st.Set(settings.KeyConfigUpdatedAt, fmt.Sprintf("%d", serverTs))
 	}
+
+	_ = st.ApplyForcedPolicy()
 
 	return st.Save()
 }

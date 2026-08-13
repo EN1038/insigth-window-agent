@@ -227,6 +227,19 @@ func (m *Matcher) shardLocked(blockSize int) ([]Signature, error) {
 	return list, nil
 }
 
+// HasExactHash reports whether the exact fuzzy hash is already in the local store.
+func (m *Matcher) HasExactHash(hash string) bool {
+	if strings.TrimSpace(hash) == "" {
+		return false
+	}
+	if err := m.EnsureReady(); err != nil {
+		return false
+	}
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	return m.store.HasExactHash(hash)
+}
+
 // RuleLabel formats a threat rule string for logging/quarantine.
 // Prefer "Name" when already Category.Family.Stem; append family only if missing.
 func RuleLabel(name string, score int) string {

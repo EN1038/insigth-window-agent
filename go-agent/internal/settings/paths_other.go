@@ -13,5 +13,5 @@ func expandQuickPath(tmpl string, _ map[string]string) string {
 }
 
 func (s *Store) RealtimeWatchRoots() []string {
-	return s.QuickScanPaths()
+	return s.TargetedScanPaths()
 }
